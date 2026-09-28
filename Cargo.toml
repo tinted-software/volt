@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [".", "crates/decoder", "crates/aarch64", "crates/aarch64-llvm", "crates/llvm"]
+
+[package]
+name = "volt-jit"
+version = "0.1.0"
+edition = "2024"
+description = "Modular dynamic translation framework for emulating guest ISAs"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+volt-jit-decoder = { path = "crates/decoder" }
+volt-jit-aarch64 = { path = "crates/aarch64" }
+volt-jit-llvm = { path = "crates/llvm" }
+volt-jit-aarch64-llvm = { path = "crates/aarch64-llvm" }
