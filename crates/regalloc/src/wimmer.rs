@@ -1013,7 +1013,6 @@ fn compute_param_hint(
 }
 
 /// TRYALLOCATEFREEREG (Wimmer & Franz Fig 6), without the splitting tail.
-#[allow(clippy::too_many_arguments)]
 fn try_allocate_free_reg<F: Func, D: RegDescription<F>>(
     intervals: &[Interval],
     children: &[Interval],
@@ -1236,7 +1235,6 @@ fn slot_intervals_interfere(a: &Interval, b: &Interval) -> bool {
 
 /// True iff any spilled interval of group `rep_a` interferes with any spilled
 /// interval of group `rep_b` in class `class`.
-#[allow(clippy::too_many_arguments)]
 fn slot_groups_interfere(
     all: &[IvRef],
     intervals: &[Interval],
@@ -1279,7 +1277,6 @@ fn slot_groups_interfere(
 
 /// Attempt to coalesce, for one edge `pred -> edge.target`, each spilled
 /// successor parameter with the spilled argument the predecessor passes.
-#[allow(clippy::too_many_arguments)]
 fn coalesce_edge_params<F: Func, D: RegDescription<F>>(
     all: &[IvRef],
     intervals: &[Interval],
@@ -1327,7 +1324,6 @@ fn coalesce_edge_params<F: Func, D: RegDescription<F>>(
 }
 
 /// Report whether any slot ends up BOTH a move source and destination on one edge.
-#[allow(clippy::too_many_arguments)]
 fn edge_slot_both_src_and_dst<F: Func, D: RegDescription<F>>(
     all: &[IvRef],
     intervals: &[Interval],
@@ -3127,7 +3123,6 @@ fn resolve_data_flow<F: Func, D: RegDescription<F>>(
 }
 
 /// Compute and store the ordered move list for one edge `pred -> edge.target`.
-#[allow(clippy::too_many_arguments)]
 fn add_edge_moves<F: Func, D: RegDescription<F>>(
     func: &F,
     desc: &D,

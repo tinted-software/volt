@@ -145,7 +145,6 @@ fn emit_inst(func: &mut Function, order: &mut Vec<Inst>, ty: Type, op: Opcode) -
     v
 }
 
-#[allow(clippy::too_many_arguments)]
 fn lower_inst(
     func: &mut Function,
     inst: Inst,

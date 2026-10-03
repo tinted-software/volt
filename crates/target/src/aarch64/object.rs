@@ -139,7 +139,6 @@ pub struct DataRelocEntry {
 /// zero-initialized tail of `.bss`. `relocs` apply to `.text` at byte
 /// `offset`s; `data_relocs` apply to their named section at byte `offset`s.
 /// Symbol cross-references use indices into `symbols`.
-#[allow(clippy::too_many_arguments)]
 pub fn write_object(
     symbols: &[Symbol],
     code: &[u32],
