@@ -1,9 +1,0 @@
-[package]
-name = "volt-jit-aarch64-llvm"
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-
-[dependencies]
-volt-jit-aarch64 = { path = "../aarch64" }
-volt-jit-llvm = { path = "../llvm" }

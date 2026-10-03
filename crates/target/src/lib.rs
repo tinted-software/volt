@@ -1,4 +1,8 @@
 //! ISA-neutral decoder interface shared by architecture-specific frontend crates.
+extern crate alloc;
+
+#[cfg(feature = "aarch64")]
+pub mod aarch64;
 
 use core::fmt::Debug;
 

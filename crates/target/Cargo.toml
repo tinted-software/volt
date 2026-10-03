@@ -1,0 +1,18 @@
+[package]
+name = "volt-target"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+object.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["aarch64"]
+aarch64 = []

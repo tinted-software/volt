@@ -1,16 +1,32 @@
 [workspace]
 resolver = "3"
-members = [".", "crates/decoder", "crates/aarch64", "crates/aarch64-llvm", "crates/llvm"]
+members = [
+    "crates/*"
+]
 
-[package]
-name = "volt-jit"
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "Modular dynamic translation framework for emulating guest ISAs"
 license = "MIT OR Apache-2.0"
 
-[dependencies]
-volt-jit-decoder = { path = "crates/decoder" }
-volt-jit-aarch64 = { path = "crates/aarch64" }
-volt-jit-llvm = { path = "crates/llvm" }
-volt-jit-aarch64-llvm = { path = "crates/aarch64-llvm" }
+[workspace.dependencies]
+object = { version = "0.40.0", default-features = false, features = ["read_core", "write_core", "elf"] }
+
+[workspace.lints.clippy]
+std_instead_of_core = "deny"
+std_instead_of_alloc = "warn"
+alloc_instead_of_core = "warn"
+too_many_arguments = "allow"
+
+[profile.dev]
+opt-level = 1
+split-debuginfo = "packed"
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+opt-level = "s"
+strip = true

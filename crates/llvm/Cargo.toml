@@ -1,9 +1,0 @@
-[package]
-name = "volt-jit-llvm"
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-
-[dependencies]
-pliron = { version = "=0.18.0", features = ["std"] }
-pliron-llvm = { version = "=0.18.0", features = ["std"] }
