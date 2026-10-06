@@ -1,16 +1,24 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/*"
+    "src/target",
+    "src/ir",
+    "src/emulator",
+    "src/emulator/cli",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [workspace.dependencies]
+volt-ir = { path = "src/ir" }
+volt-target = { path = "src/target" }
+volt-emulator = { path = "src/emulator" }
+
 object = { version = "0.40.0", default-features = false, features = ["read_core", "write_core", "elf"] }
+libc = "0.2"
 
 [workspace.lints.clippy]
 std_instead_of_core = "deny"

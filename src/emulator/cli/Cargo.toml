@@ -1,0 +1,20 @@
+[package]
+name = "volt-emulator-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "volt-aarch64"
+
+[dependencies]
+volt-emulator = { workspace = true, features = ["system", "user"] }
+
+[[bin]]
+name = "volt-aarch64"
+path = "src/user.rs"
+
+[[bin]]
+name = "volt-boot"
+path = "src/boot.rs"
+
+[lints]
+workspace = true

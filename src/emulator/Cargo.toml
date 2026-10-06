@@ -1,0 +1,18 @@
+[package]
+name = "volt-emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+volt-ir.workspace = true
+volt-target.workspace = true
+libc = { workspace = true, optional = true }
+
+[features]
+default = ["system"]
+system = []
+user = ["dep:libc"]
+
+[lints]
+workspace = true
