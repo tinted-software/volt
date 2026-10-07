@@ -19,6 +19,36 @@ impl core::fmt::Display for Error {
     }
 }
 impl core::error::Error for Error {}
+pub trait DeviceIo {
+    fn read_uart(&mut self, offset: u64, size: u8) -> u64;
+    fn write_uart(&mut self, offset: u64, size: u8, value: u64);
+    fn read_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64;
+    fn write_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64);
+    fn read_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64;
+    fn write_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64);
+}
+
+impl DeviceIo for (&mut Pl011, &mut Gicv2) {
+    fn read_uart(&mut self, offset: u64, size: u8) -> u64 {
+        self.0.read(offset, size)
+    }
+    fn write_uart(&mut self, offset: u64, size: u8, value: u64) {
+        self.0.write(offset, size, value);
+    }
+    fn read_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64 {
+        self.1.read_distributor_for(cpu_id, offset, size)
+    }
+    fn write_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64) {
+        self.1.write_distributor_for(cpu_id, offset, size, value);
+    }
+    fn read_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64 {
+        self.1.read_cpu_for(cpu_id, offset, size)
+    }
+    fn write_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64) {
+        self.1.write_cpu_for(cpu_id, offset, size, value);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Exit {
     Interrupted,
@@ -32,11 +62,81 @@ pub struct TraceEntry {
     pub sp: u64,
 }
 
+/// Instruction fetch through the guest MMU, with code-page write tracking.
+struct SystemFetch<'a, M> {
+    tlb: &'a mut translate::Tlb,
+    memory: &'a mut M,
+    /// Address and permission-ness of the last failed fetch, for abort reporting.
+    fault: Option<(u64, bool)>,
+}
+impl<M: GuestMemory> crate::aarch64::cache::Fetch for SystemFetch<'_, M> {
+    fn fetch(
+        &mut self,
+        cpu: &Cpu,
+        address: u64,
+        bytes: &mut [u8],
+    ) -> Result<usize, crate::aarch64::compile::Error> {
+        let physical = match translate::translate(
+            self.tlb,
+            cpu,
+            self.memory,
+            address,
+            translate::Access::Execute,
+        ) {
+            Ok(physical) => physical,
+            Err(error) => {
+                self.fault = Some((
+                    address,
+                    matches!(error, translate::TranslateError::PermissionFault),
+                ));
+                return Err(crate::aarch64::compile::Error::Memory(
+                    MemoryError::AccessFault {
+                        address,
+                        length: bytes.len(),
+                    },
+                ));
+            }
+        };
+        if let Err(error) = self.memory.read(physical, bytes) {
+            self.fault = Some((address, false));
+            return Err(crate::aarch64::compile::Error::Memory(error));
+        }
+        Ok(bytes.len())
+    }
+    fn code_key(&mut self, cpu: &mut Cpu, pc: u64, watch: bool) -> Option<(u64, u32)> {
+        self.memory.code_tracker()?;
+        // Faults here are not reported: the caller falls back to `fetch`, which
+        // repeats the translation and records the fault.
+        let physical =
+            translate::translate(self.tlb, &*cpu, self.memory, pc, translate::Access::Execute)
+                .ok()?;
+        let page = physical >> 12;
+        let tracker = self.memory.code_tracker()?;
+        let version = if watch {
+            let (version, newly_watched) = tracker.watch_tracked(page)?;
+            if newly_watched {
+                // This vCPU may hold inline write permission for the page. Drop
+                // it now: the block compiled next could store to its own page.
+                cpu.dtlb.purge_writes();
+            }
+            version
+        } else {
+            tracker.version(page)?
+        };
+        Some((page, version))
+    }
+}
+
 pub struct Machine<M> {
+    pub cpu_id: u32,
     pub memory: M,
     pub cache: Cache,
     pub cpu: Cpu,
     pub tlb: translate::Tlb,
+    /// `tlb.generation` the inline data TLB (`cpu.dtlb`) was last synced to.
+    dtlb_generation: u64,
+    /// `CodeTracker::epoch` the inline data TLB's write permissions reflect.
+    watch_epoch: u64,
     pub irq_line: bool,
     timer_fired: bool,
     pub stalled_at: u64,
@@ -50,10 +150,19 @@ pub struct Machine<M> {
 impl<M: GuestMemory> Machine<M> {
     pub fn new(memory: M) -> Self {
         Self {
+            cpu_id: 0,
             memory,
-            cache: Cache::new(),
+            // `VOLT_INLINE_MEMORY=0` turns the inline data-TLB fast path off, for
+            // A/B comparisons and for bisecting suspected emulation bugs.
+            cache: if std::env::var_os("VOLT_INLINE_MEMORY").is_some_and(|v| v == "0") {
+                Cache::new()
+            } else {
+                Cache::with_inline_memory()
+            },
             cpu: Cpu::default(),
             tlb: translate::Tlb::default(),
+            dtlb_generation: 0,
+            watch_epoch: 0,
             irq_line: false,
             timer_fired: false,
             stalled_at: 0,
@@ -63,6 +172,23 @@ impl<M: GuestMemory> Machine<M> {
             blocks_run: 0,
             faulted: false,
             device_access: false,
+        }
+    }
+    /// A vCPU whose translated blocks are shared with other vCPUs.
+    pub fn with_shared_blocks(
+        memory: M,
+        cpu_id: u32,
+        blocks: std::sync::Arc<crate::aarch64::cache::SharedBlocks>,
+    ) -> Self {
+        Self {
+            cache: Cache::with_shared(blocks),
+            ..Self::with_cpu_id(memory, cpu_id)
+        }
+    }
+    pub fn with_cpu_id(memory: M, cpu_id: u32) -> Self {
+        Self {
+            cpu_id,
+            ..Self::new(memory)
         }
     }
     pub fn recent_trace(&self, count: usize) -> Vec<TraceEntry> {
@@ -88,6 +214,9 @@ impl<M: GuestMemory> Machine<M> {
         true
     }
     pub fn run(&mut self, serial: &mut Pl011, gic: &mut Gicv2) -> Result<Exit, Error> {
+        self.run_with_devices(&mut (serial, gic))
+    }
+    pub fn run_with_devices(&mut self, devices: &mut impl DeviceIo) -> Result<Exit, Error> {
         self.stalled = None;
         for _ in 0..64 {
             if self.timer_edge() {
@@ -104,41 +233,18 @@ impl<M: GuestMemory> Machine<M> {
                     pc,
                 );
             }
+            self.sync_dtlb();
             self.trace[self.blocks_run as usize % self.trace.len()] = TraceEntry {
                 pc: self.cpu.pc,
                 sp: self.cpu.sp,
             };
-            let tlb = &mut self.tlb;
-            let memory = &mut self.memory;
-            let mut fetch_fault = None;
-            let result = self.cache.run_block(&mut self.cpu, |cpu, address, bytes| {
-                let physical = match translate::translate(
-                    tlb,
-                    cpu,
-                    memory,
-                    address,
-                    translate::Access::Execute,
-                ) {
-                    Ok(physical) => physical,
-                    Err(error) => {
-                        fetch_fault = Some((
-                            address,
-                            matches!(error, translate::TranslateError::PermissionFault),
-                        ));
-                        return Err(crate::aarch64::compile::Error::Memory(
-                            MemoryError::AccessFault {
-                                address,
-                                length: bytes.len(),
-                            },
-                        ));
-                    }
-                };
-                if let Err(error) = memory.read(physical, bytes) {
-                    fetch_fault = Some((address, false));
-                    return Err(crate::aarch64::compile::Error::Memory(error));
-                }
-                Ok(bytes.len())
-            });
+            let mut source = SystemFetch {
+                tlb: &mut self.tlb,
+                memory: &mut self.memory,
+                fault: None,
+            };
+            let result = self.cache.run_block_with(&mut self.cpu, &mut source);
+            let fetch_fault = source.fault;
             if let Err(error) = result {
                 if let (Some((address, permission)), crate::aarch64::compile::Error::Memory(_)) =
                     (fetch_fault, &error)
@@ -157,6 +263,7 @@ impl<M: GuestMemory> Machine<M> {
             match self.cpu.trap {
                 Trap::None => {}
                 Trap::Wfi => {
+                    self.cpu.trap = Trap::None;
                     return Ok(if self.timer_edge() {
                         Exit::Timer
                     } else {
@@ -248,32 +355,49 @@ impl<M: GuestMemory> Machine<M> {
                 Trap::Load | Trap::Store => {
                     self.faulted = false;
                     self.device_access = false;
-                    let exclusive = self.cpu.exclusive;
+                    let (width, dest, _, exclusive) = self.cpu.memory_request();
                     self.cpu.exclusive = Exclusive::None;
                     let held = self.cpu.monitor_valid
                         && self.cpu.monitor_address == self.cpu.address
-                        && self.cpu.monitor_width == self.cpu.width;
+                        && self.cpu.monitor_width == width;
                     if exclusive == Exclusive::Load {
                         self.cpu.monitor_valid = true;
                         self.cpu.monitor_address = self.cpu.address;
-                        self.cpu.monitor_width = self.cpu.width;
+                        self.cpu.monitor_width = width;
                     }
                     if exclusive == Exclusive::Store {
                         self.cpu.monitor_valid = false;
                     }
-                    if exclusive != Exclusive::Store || held {
-                        self.access(
-                            self.cpu.address,
-                            self.cpu.width,
-                            self.cpu.dest,
-                            self.cpu.value,
-                            serial,
-                            gic,
-                        )?;
+                    let mut success = held;
+                    if exclusive == Exclusive::Store {
+                        if held {
+                            success = self.store_exclusive(
+                                self.cpu.address,
+                                width,
+                                self.cpu.value,
+                                devices,
+                            )?;
+                        }
+                    } else {
+                        self.access(self.cpu.address, width, dest, self.cpu.value, devices)?;
+                    }
+                    if exclusive == Exclusive::Load && !self.faulted {
+                        let mask = if width >= 8 {
+                            u64::MAX
+                        } else {
+                            (1u64 << (width * 8)) - 1
+                        };
+                        self.cpu.monitor_value = if dest == 31 {
+                            0
+                        } else {
+                            self.cpu.x[dest as usize] & mask
+                        };
+                        // `ldxr xzr` discards the value, so it cannot be compared later.
+                        self.cpu.monitor_valid = dest != 31;
                     }
                     if exclusive == Exclusive::Store && !self.faulted && self.cpu.status_dest != 31
                     {
-                        self.cpu.x[self.cpu.status_dest as usize] = u64::from(!held);
+                        self.cpu.x[self.cpu.status_dest as usize] = u64::from(!success);
                     }
                     if self.faulted {
                         self.cpu.second_pending = false;
@@ -282,15 +406,16 @@ impl<M: GuestMemory> Machine<M> {
                     }
                     if self.cpu.second_pending {
                         self.cpu.second_pending = false;
-                        self.cpu.load_signed = self.cpu.second_signed;
+                        let (second_width, second_dest, second_signed) =
+                            self.cpu.second_memory_request();
+                        self.cpu.load_signed = second_signed;
                         self.cpu.second_signed = SignExtend::None;
                         self.access(
                             self.cpu.second_address,
-                            self.cpu.second_width,
-                            self.cpu.second_dest,
+                            second_width,
+                            second_dest,
                             self.cpu.second_value,
-                            serial,
-                            gic,
+                            devices,
                         )?;
                     }
                     if self.cpu.writeback && !self.faulted {
@@ -308,6 +433,55 @@ impl<M: GuestMemory> Machine<M> {
             }
         }
         Ok(Exit::Interrupted)
+    }
+    /// Bring the inline data TLB in line with the translation state. Generated
+    /// code hits it without calling `translate`, so every reason an entry could
+    /// have become wrong must be handled here, before the next block runs.
+    fn sync_dtlb(&mut self) {
+        // Context changes (TTBR/TCR/SCTLR writes, exception entry and return)
+        // are noticed lazily by `translate`; do it eagerly instead.
+        self.tlb.update_context(&self.cpu);
+        if self.tlb.generation != self.dtlb_generation {
+            self.dtlb_generation = self.tlb.generation;
+            self.cpu.dtlb.flush();
+        }
+        // Pages that just became code must stop accepting inline writes, which
+        // would bypass the code-page write tracking.
+        if let Some(tracker) = self.memory.code_tracker() {
+            let epoch = tracker.epoch();
+            if epoch != self.watch_epoch {
+                self.watch_epoch = epoch;
+                self.cpu.dtlb.purge_writes();
+            }
+        }
+    }
+    /// Remember a completed RAM access in the inline data TLB so later accesses
+    /// to the same page skip the machine entirely.
+    fn fill_dtlb(&mut self, address: u64, physical: u64, write: bool) {
+        let page = address & !0xfff;
+        let physical_page = physical & !0xfff;
+        let Some(host) = self.memory.host_page(physical_page) else {
+            return;
+        };
+        let addend = (host as u64).wrapping_sub(page);
+        let writable = write
+            && self
+                .memory
+                .code_tracker()
+                .and_then(|tracker| tracker.version(physical_page >> 12))
+                .is_none_or(|version| version & 1 == 0);
+        let entry = &mut self.cpu.dtlb.entries[crate::aarch64::cpu::Dtlb::index(address)];
+        if entry.addend != addend || (entry.read != page && entry.write != page) {
+            *entry = Default::default();
+        }
+        entry.addend = addend;
+        if write {
+            if writable {
+                entry.write = page;
+            }
+        } else {
+            entry.read = page;
+        }
     }
     fn abort(&mut self, address: u64, permission: bool, instruction: bool, write: bool) {
         let ec = if instruction {
@@ -341,20 +515,89 @@ impl<M: GuestMemory> Machine<M> {
         }
         self.faulted = true;
     }
+    /// Store-exclusive: succeeds only if the location still holds the value the
+    /// paired load-exclusive saw. RAM uses a host compare-exchange, so it is
+    /// atomic against every other vCPU (and against their inline stores).
+    /// Returns whether the store happened; a fault aborts and returns `false`.
+    fn store_exclusive(
+        &mut self,
+        address: u64,
+        width: u8,
+        value: u64,
+        devices: &mut impl DeviceIo,
+    ) -> Result<bool, Error> {
+        use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering::SeqCst};
+        if !matches!(width, 1 | 2 | 4 | 8) {
+            return Err(Error::InvalidAccessWidth(width));
+        }
+        let physical = match translate::translate(
+            &mut self.tlb,
+            &self.cpu,
+            &mut self.memory,
+            address,
+            translate::Access::Write,
+        ) {
+            Ok(physical) => physical,
+            Err(error) => {
+                self.abort(
+                    address,
+                    matches!(error, translate::TranslateError::PermissionFault),
+                    false,
+                    true,
+                );
+                return Ok(false);
+            }
+        };
+        if physical % u64::from(width) == 0
+            && let Some(page) = self.memory.host_page(physical & !0xfff)
+        {
+            let mask = if width == 8 {
+                u64::MAX
+            } else {
+                (1u64 << (width * 8)) - 1
+            };
+            let (expected, new) = (self.cpu.monitor_value & mask, value & mask);
+            // SAFETY: `page` is a live RAM page; the offset stays inside it and
+            // is aligned to `width`.
+            let stored = unsafe {
+                let at = page.add((physical & 0xfff) as usize);
+                match width {
+                    1 => AtomicU8::from_ptr(at)
+                        .compare_exchange(expected as u8, new as u8, SeqCst, SeqCst)
+                        .is_ok(),
+                    2 => AtomicU16::from_ptr(at.cast())
+                        .compare_exchange(expected as u16, new as u16, SeqCst, SeqCst)
+                        .is_ok(),
+                    4 => AtomicU32::from_ptr(at.cast())
+                        .compare_exchange(expected as u32, new as u32, SeqCst, SeqCst)
+                        .is_ok(),
+                    _ => AtomicU64::from_ptr(at.cast())
+                        .compare_exchange(expected, new, SeqCst, SeqCst)
+                        .is_ok(),
+                }
+            };
+            if stored && let Some(tracker) = self.memory.code_tracker() {
+                tracker.note_write(physical, width as usize);
+            }
+            return Ok(stored);
+        }
+        // Device memory or a misaligned address: an ordinary store.
+        self.access(address, width, 31, value, devices)?;
+        Ok(!self.faulted)
+    }
     fn access(
         &mut self,
         address: u64,
         width: u8,
         dest: u8,
         value: u64,
-        serial: &mut Pl011,
-        gic: &mut Gicv2,
+        devices: &mut impl DeviceIo,
     ) -> Result<(), Error> {
         if !matches!(width, 1 | 2 | 4 | 8) {
             return Err(Error::InvalidAccessWidth(width));
         }
         let load = self.cpu.trap == Trap::Load;
-        let signed = self.cpu.load_signed;
+        let signed = self.cpu.memory_request().2;
         self.cpu.load_signed = SignExtend::None;
         let access = if load {
             translate::Access::Read
@@ -432,23 +675,37 @@ impl<M: GuestMemory> Machine<M> {
                     |base, length| physical >= base && end.is_some_and(|end| end <= base + length);
                 let read = if window(fdt::UART_BASE, crate::devices::pl011::LEN) {
                     if load {
-                        Some(serial.read(physical - fdt::UART_BASE, width))
+                        Some(devices.read_uart(physical - fdt::UART_BASE, width))
                     } else {
-                        serial.write(physical - fdt::UART_BASE, width, value);
+                        devices.write_uart(physical - fdt::UART_BASE, width, value);
                         None
                     }
                 } else if window(fdt::GICD_BASE, crate::devices::gicv2::DISTRIBUTOR_SIZE) {
                     if load {
-                        Some(gic.read_distributor(physical - fdt::GICD_BASE, width))
+                        Some(devices.read_gic_distributor(
+                            self.cpu_id,
+                            physical - fdt::GICD_BASE,
+                            width,
+                        ))
                     } else {
-                        gic.write_distributor(physical - fdt::GICD_BASE, width, value);
+                        devices.write_gic_distributor(
+                            self.cpu_id,
+                            physical - fdt::GICD_BASE,
+                            width,
+                            value,
+                        );
                         None
                     }
                 } else if window(fdt::GIC_CPU_BASE, crate::devices::gicv2::CPU_SIZE) {
                     if load {
-                        Some(gic.read_cpu(physical - fdt::GIC_CPU_BASE, width))
+                        Some(devices.read_gic_cpu(self.cpu_id, physical - fdt::GIC_CPU_BASE, width))
                     } else {
-                        gic.write_cpu(physical - fdt::GIC_CPU_BASE, width, value);
+                        devices.write_gic_cpu(
+                            self.cpu_id,
+                            physical - fdt::GIC_CPU_BASE,
+                            width,
+                            value,
+                        );
                         None
                     }
                 } else {
@@ -461,6 +718,9 @@ impl<M: GuestMemory> Machine<M> {
                 }
             }
             Err(error) => return Err(Error::Memory(error)),
+        }
+        if first == width as usize && !self.device_access && self.cache.inline_memory() {
+            self.fill_dtlb(address, physical, !load);
         }
         if load && dest != 31 {
             let value = u64::from_le_bytes(bytes);
@@ -520,12 +780,12 @@ mod tests {
         machine.cpu.trap = Trap::Load;
         machine.cpu.load_signed = SignExtend::To64;
         machine
-            .access(0x40000000, 1, 0, 0, &mut serial, &mut gic)
+            .access(0x40000000, 1, 0, 0, &mut (&mut serial, &mut gic))
             .unwrap();
         assert_eq!(machine.cpu.x[0], 0xffff_ffff_ffff_ff80);
         machine.cpu.load_signed = SignExtend::To32;
         machine
-            .access(0x40000000, 1, 1, 0, &mut serial, &mut gic)
+            .access(0x40000000, 1, 1, 0, &mut (&mut serial, &mut gic))
             .unwrap();
         assert_eq!(machine.cpu.x[1], 0xffff_ff80);
         assert_eq!(machine.cpu.load_signed, SignExtend::None);
@@ -540,7 +800,7 @@ mod tests {
         let mut serial = Pl011::new(|_| {});
         let mut gic = Gicv2::default();
         machine
-            .access(0x0b000000, 4, 31, 123, &mut serial, &mut gic)
+            .access(0x0b000000, 4, 31, 123, &mut (&mut serial, &mut gic))
             .unwrap();
         assert_eq!(machine.cpu.system.elr_el1, 0x40000000);
         assert_eq!(machine.cpu.system.far_el1, 0x0b000000);
@@ -572,5 +832,67 @@ mod tests {
         assert_eq!(machine.cpu.system.far_el1, 0x40001000);
         assert_eq!(machine.cpu.system.esr_el1 >> 26, 0x21);
         assert_eq!(machine.cpu.system.cntvct_el0, 2);
+    }
+
+    /// Run guest code at `0x40000000` until it hits the `hvc` that ends it.
+    fn run_to_hvc(machine: &mut Machine<PhysicalMemory>, words: &[u32]) {
+        for (i, word) in words.iter().enumerate() {
+            machine
+                .memory
+                .write(0x40000000 + 4 * i as u64, &word.to_le_bytes())
+                .unwrap();
+        }
+        machine.cpu.pc = 0x40000000;
+        let mut serial = Pl011::new(|_| {});
+        let mut gic = Gicv2::default();
+        assert!(matches!(
+            machine.run(&mut serial, &mut gic).unwrap(),
+            Exit::Psci { .. }
+        ));
+    }
+    const LDXR_X1_X0: u32 = 0xc85f7c01;
+    const STXR_W2_X3_X0: u32 = 0xc8027c03;
+    const HVC: u32 = 0xd4000002;
+
+    #[test]
+    fn store_exclusive_succeeds_when_memory_is_unchanged() {
+        let mut machine = machine();
+        machine.cpu.x[0] = 0x40000800;
+        machine.cpu.x[3] = 7;
+        machine
+            .memory
+            .write(0x40000800, &5u64.to_le_bytes())
+            .unwrap();
+        run_to_hvc(&mut machine, &[LDXR_X1_X0, STXR_W2_X3_X0, HVC]);
+        assert_eq!(machine.cpu.x[1], 5, "ldxr loaded the old value");
+        assert_eq!(machine.cpu.x[2], 0, "stxr reports success");
+        let mut now = [0u8; 8];
+        machine.memory.read(0x40000800, &mut now).unwrap();
+        assert_eq!(u64::from_le_bytes(now), 7);
+    }
+
+    #[test]
+    fn store_exclusive_fails_after_another_cpu_writes_the_location() {
+        let mut machine = machine();
+        machine.cpu.x[0] = 0x40000800;
+        machine.cpu.x[3] = 7;
+        machine
+            .memory
+            .write(0x40000800, &5u64.to_le_bytes())
+            .unwrap();
+        run_to_hvc(&mut machine, &[LDXR_X1_X0, HVC]);
+        // Another vCPU (or an inline store) changes the word before our stxr.
+        machine
+            .memory
+            .write(0x40000800, &9u64.to_le_bytes())
+            .unwrap();
+        run_to_hvc(&mut machine, &[STXR_W2_X3_X0, HVC]);
+        assert_eq!(machine.cpu.x[2], 1, "stxr reports failure");
+        let mut now = [0u8; 8];
+        machine.memory.read(0x40000800, &mut now).unwrap();
+        assert_eq!(u64::from_le_bytes(now), 9, "a failed stxr must not store");
+        // The reservation is consumed: a second stxr cannot succeed either.
+        run_to_hvc(&mut machine, &[STXR_W2_X3_X0, HVC]);
+        assert_eq!(machine.cpu.x[2], 1);
     }
 }

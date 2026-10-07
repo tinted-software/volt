@@ -477,6 +477,15 @@ pub enum Instruction {
     Wfi,
 }
 impl Instruction {
+    /// Whether this instruction ends a translated block. With `inline_memory`,
+    /// plain loads and stores are compiled with an inline fast path and no
+    /// longer end the block (their slow path exits mid-block instead).
+    pub fn terminates_with(&self, inline_memory: bool) -> bool {
+        if inline_memory && matches!(self, Instruction::Memory(_) | Instruction::Literal(_)) {
+            return false;
+        }
+        self.terminates()
+    }
     pub fn terminates(&self) -> bool {
         use Instruction::*;
         matches!(

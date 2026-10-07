@@ -1,9 +1,13 @@
 use super::{
-    cpu::{Cpu, Exclusive as CpuExclusive, System as CpuSystem, Trap},
+    cpu::{Cpu, DTLB_ENTRIES, Exclusive as CpuExclusive, System as CpuSystem, Trap},
     decode::*,
 };
 use crate::memory::MemoryError;
-use std::{cell::RefCell, fmt, mem::offset_of};
+use std::{
+    cell::{Cell, RefCell},
+    fmt,
+    mem::offset_of,
+};
 use volt_ir::{
     function::{self as ir, BinOp as B, CmpOp as C, Function, Opcode, Value},
     types::{IntDesc, Type, TypeKind},
@@ -67,7 +71,8 @@ impl Block {
 }
 struct Lower {
     f: RefCell<Function>,
-    block: ir::Block,
+    /// Block currently being emitted into. Memory fast paths switch it.
+    block: Cell<ir::Block>,
     cpu: Value,
     u64: Type,
     u32: Type,
@@ -96,7 +101,7 @@ impl Lower {
         let cpu = f.append_block_param(block, ptr);
         Self {
             f: RefCell::new(f),
-            block,
+            block: Cell::new(block),
             cpu,
             u64,
             u32,
@@ -106,7 +111,7 @@ impl Lower {
         }
     }
     fn emit(&self, t: Type, op: Opcode) -> Value {
-        self.f.borrow_mut().append_inst(self.block, t, op)
+        self.f.borrow_mut().append_inst(self.block.get(), t, op)
     }
     fn k(&self, t: Type, n: u64) -> Value {
         self.emit(t, Opcode::Iconst(n as i64))
@@ -157,7 +162,7 @@ impl Lower {
         self.load_ptr(t, self.addr(at))
     }
     fn store_ptr(&self, p: Value, v: Value) {
-        self.f.borrow_mut().append_store(self.block, v, p)
+        self.f.borrow_mut().append_store(self.block.get(), v, p)
     }
     fn store(&self, at: usize, v: Value) {
         self.store_ptr(self.addr(at), v)
@@ -199,7 +204,7 @@ impl Lower {
     fn ret(&self, v: Value) {
         self.f
             .borrow_mut()
-            .set_terminator(self.block, ir::Terminator::Ret(ir::Ret::one(v)))
+            .set_terminator(self.block.get(), ir::Terminator::Ret(ir::Ret::one(v)))
     }
     fn not(&self, v: Value) -> Value {
         self.imm(self.boolean, B::BitXor, v, 1)
@@ -379,6 +384,119 @@ impl Lower {
             self.k(self.u64, pc.wrapping_add(4)),
         ))
     }
+    fn uint(&self, bits: u16) -> Type {
+        self.f.borrow_mut().types.intern(TypeKind::Int(IntDesc {
+            signed: false,
+            bits,
+        }))
+    }
+    fn new_block(&self) -> ir::Block {
+        self.f.borrow_mut().append_block()
+    }
+    fn branch_if(&self, c: Value, then: ir::Block, otherwise: ir::Block) {
+        self.f.borrow_mut().append_if(
+            self.block.get(),
+            c,
+            ir::EdgeDesc::bare(then),
+            ir::EdgeDesc::bare(otherwise),
+        )
+    }
+    /// Like `address`, but a post-index writeback is returned instead of being
+    /// scheduled for the machine, so each path can apply it its own way.
+    fn address_split(&self, rn: u8, a: Addressing) -> (Value, Option<(u8, Value)>) {
+        match a {
+            Addressing::PostIndex(n) => {
+                let base = self.reg(self.u64, rn, false);
+                (base, Some((rn, self.imm(self.u64, B::Add, base, n as u64))))
+            }
+            other => (self.address(rn, other), None),
+        }
+    }
+    /// Probe the inline data TLB for `address`. Returns `(hit, host_pointer)`;
+    /// the pointer is only meaningful when `hit`. A hit requires the page to be
+    /// cached for this access kind and the access to be naturally aligned (so it
+    /// cannot cross a page), because the tag compare covers the low `size - 1`
+    /// address bits too.
+    fn dtlb_probe(&self, address: Value, size: Size, write: bool) -> (Value, Value) {
+        let n = size as u64;
+        // Entry offset = ((address >> 12) & (ENTRIES - 1)) * 32 = (address >> 7) & mask.
+        let index = self.imm(
+            self.u64,
+            B::BitAnd,
+            self.imm(self.u64, B::Shr, address, 7),
+            (DTLB_ENTRIES as u64 - 1) << 5,
+        );
+        let entry = self.bin(
+            self.ptr,
+            B::Add,
+            self.cpu,
+            self.imm(self.u64, B::Add, index, offset_of!(Cpu, dtlb) as u64),
+        );
+        let field = |at: u64| {
+            self.load_ptr(
+                self.u64,
+                self.bin(self.ptr, B::Add, entry, self.k(self.u64, at)),
+            )
+        };
+        let tag = field(if write { 8 } else { 0 });
+        let addend = field(16);
+        let want = self.imm(self.u64, B::BitAnd, address, !0xfffu64 | (n - 1));
+        let hit = self.cmp(C::Eq, tag, want);
+        let host = self.cv(self.ptr, self.bin(self.u64, B::Add, address, addend));
+        (hit, host)
+    }
+    fn fast_load(&self, host: Value, size: Size, rt: u8, signed: SignExtend) {
+        let bits = size as u16 * 8;
+        let raw = self.load_ptr(self.uint(bits), host);
+        if rt == 31 {
+            return;
+        }
+        let mut v = self.cv(self.u64, raw);
+        if signed != SignExtend::None && bits < 64 {
+            let n = 64 - bits as u64;
+            let extended = self.shift(Width::X64, self.imm(self.u64, B::Shl, v, n), Shift::Asr, n);
+            v = if signed == SignExtend::To32 {
+                self.imm(self.u64, B::BitAnd, extended, 0xffff_ffff)
+            } else {
+                extended
+            };
+        }
+        self.put(rt, v);
+    }
+    fn fast_store(&self, host: Value, size: Size, rt: u8) {
+        let t = self.uint(size as u16 * 8);
+        self.store_ptr(host, self.cv(t, self.reg(self.u64, rt, true)));
+    }
+    /// Emit a load or store with an inline fast path. On a data-TLB hit the
+    /// access happens in place and emission continues in a fresh block; on a
+    /// miss control goes to a slow block that hands the access to the machine
+    /// (`slow` fills in the request) and returns.
+    fn memory_access(
+        &self,
+        address: Value,
+        size: Size,
+        op: MemoryOp,
+        rt: u8,
+        signed: SignExtend,
+        post: Option<(u8, Value)>,
+        slow: impl FnOnce(&Lower),
+    ) {
+        let write = op == MemoryOp::Store;
+        let (hit, host) = self.dtlb_probe(address, size, write);
+        let (fast_block, slow_block) = (self.new_block(), self.new_block());
+        self.branch_if(hit, fast_block, slow_block);
+        self.block.set(slow_block);
+        slow(self);
+        self.block.set(fast_block);
+        if write {
+            self.fast_store(host, size, rt);
+        } else {
+            self.fast_load(host, size, rt, signed);
+        }
+        if let Some((rn, value)) = post {
+            self.put_sp(rn, value);
+        }
+    }
     fn trap(&self, pc: u64, t: Trap) {
         self.byte(offset_of!(Cpu, trap), t as u64);
         self.ret(self.k(self.u64, pc))
@@ -399,6 +517,13 @@ fn low_mask(n: u8) -> u64 {
 }
 
 pub fn compile(guest_pc: u64, bytes: &[u8]) -> Result<Block, Error> {
+    compile_with(guest_pc, bytes, false)
+}
+
+/// Compile a block. With `inline_memory`, plain loads and stores get an inline
+/// data-TLB fast path and do not end the block; the caller's block scan must
+/// use `Instruction::terminates_with(true)` to match.
+pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<Block, Error> {
     if bytes.is_empty() {
         return Err(Error::EmptyBlock);
     }
@@ -415,7 +540,7 @@ pub fn compile(guest_pc: u64, bytes: &[u8]) -> Result<Block, Error> {
             l.imm(l.u64, B::Add, l.load(l.u64, counter_at), 1),
         );
         let instruction = decode(u32::from_le_bytes(chunk.try_into().unwrap()))?;
-        ended = instruction.terminates();
+        ended = instruction.terminates_with(inline_memory);
         match instruction {
             Instruction::Movz(a) | Instruction::Movn(a) => {
                 let t = l.ty(a.width);
@@ -663,27 +788,54 @@ pub fn compile(guest_pc: u64, bytes: &[u8]) -> Result<Block, Error> {
             }
             Instruction::System(a) => lower_system(&l, a),
             Instruction::Memory(a) => {
-                let address = l.address(a.rn, a.addressing);
-                setup_memory(&l, address, a.size, a.rt, a.signed, a.op);
-                l.trap(
-                    pc.wrapping_add(4),
-                    if a.op == MemoryOp::Store {
-                        Trap::Store
-                    } else {
-                        Trap::Load
-                    },
-                );
+                let trap = if a.op == MemoryOp::Store {
+                    Trap::Store
+                } else {
+                    Trap::Load
+                };
+                if inline_memory {
+                    let (address, post) = l.address_split(a.rn, a.addressing);
+                    l.memory_access(address, a.size, a.op, a.rt, a.signed, post, |l| {
+                        setup_memory(l, address, a.size, a.rt, a.signed, a.op);
+                        if let Some((rn, value)) = post {
+                            l.store(offset_of!(Cpu, writeback_value), value);
+                            l.byte(offset_of!(Cpu, writeback_dest), rn as u64);
+                            l.byte(offset_of!(Cpu, writeback), 1);
+                        }
+                        l.trap(pc.wrapping_add(4), trap);
+                    });
+                } else {
+                    let address = l.address(a.rn, a.addressing);
+                    setup_memory(&l, address, a.size, a.rt, a.signed, a.op);
+                    l.trap(pc.wrapping_add(4), trap);
+                }
             }
             Instruction::Literal(a) => {
-                setup_memory(
-                    &l,
-                    l.k(l.u64, pc.wrapping_add(a.offset as u64)),
-                    a.size,
-                    a.rt,
-                    SignExtend::None,
-                    MemoryOp::Load,
-                );
-                l.trap(pc.wrapping_add(4), Trap::Load);
+                let address = l.k(l.u64, pc.wrapping_add(a.offset as u64));
+                if inline_memory {
+                    l.memory_access(
+                        address,
+                        a.size,
+                        MemoryOp::Load,
+                        a.rt,
+                        SignExtend::None,
+                        None,
+                        |l| {
+                            setup_memory(
+                                l,
+                                address,
+                                a.size,
+                                a.rt,
+                                SignExtend::None,
+                                MemoryOp::Load,
+                            );
+                            l.trap(pc.wrapping_add(4), Trap::Load);
+                        },
+                    );
+                } else {
+                    setup_memory(&l, address, a.size, a.rt, SignExtend::None, MemoryOp::Load);
+                    l.trap(pc.wrapping_add(4), Trap::Load);
+                }
             }
             Instruction::Exclusive(a) => {
                 setup_memory(
@@ -1254,5 +1406,130 @@ mod tests {
         // CBZ XZR,+8 must take the branch independently of SP.
         let branch = compile(0x2000, &bytes(&[0xb400005f])).unwrap();
         assert_eq!(branch.run(&mut cpu), 0x2008);
+    }
+    // ---- inline data-TLB fast path ----
+    use super::super::cpu::{DTLB_INVALID, Dtlb};
+    const SVC: u32 = 0xd4000001;
+    /// Guest page 0x10000 backed by `ram`, readable and (optionally) writable.
+    fn map_page(cpu: &mut Cpu, ram: &mut [u8; 4096], writable: bool) {
+        let page = 0x10000u64;
+        let entry = &mut cpu.dtlb.entries[Dtlb::index(page)];
+        entry.read = page;
+        entry.write = if writable { page } else { DTLB_INVALID };
+        entry.addend = (ram.as_mut_ptr() as u64).wrapping_sub(page);
+    }
+    fn run_inline(cpu: &mut Cpu, words: &[u32]) {
+        let block = compile_with(0x2000, &bytes(words), true).unwrap();
+        block.run(cpu);
+    }
+    #[test]
+    fn inline_load_hits_without_leaving_the_block() {
+        let mut ram = [0u8; 4096];
+        ram[8..16].copy_from_slice(&0x1122334455667788u64.to_le_bytes());
+        let mut cpu = Cpu::default();
+        map_page(&mut cpu, &mut ram, false);
+        cpu.x[0] = 0x10008;
+        run_inline(&mut cpu, &[0xf9400001, SVC]); // ldr x1,[x0]; svc
+        assert_eq!(cpu.x[1], 0x1122334455667788);
+        assert_eq!(cpu.trap, Trap::Svc, "continued past the load");
+    }
+    #[test]
+    fn inline_load_miss_defers_to_the_machine() {
+        let mut cpu = Cpu::default();
+        cpu.x[0] = 0x10008;
+        run_inline(&mut cpu, &[0xf9400001, SVC]);
+        assert_eq!(cpu.trap, Trap::Load);
+        assert_eq!(cpu.address, 0x10008);
+        assert_eq!((cpu.width, cpu.dest), (8, 1));
+        assert_eq!(cpu.pc, 0x2004, "resumes after the load");
+    }
+    #[test]
+    fn inline_store_needs_write_permission() {
+        let mut ram = [0u8; 4096];
+        let mut cpu = Cpu::default();
+        cpu.x[0] = 0x10000;
+        cpu.x[1] = 0xdead_beef_cafe_f00d;
+        map_page(&mut cpu, &mut ram, true);
+        run_inline(&mut cpu, &[0xf9000401, SVC]); // str x1,[x0,#8]
+        assert_eq!(&ram[8..16], &0xdead_beef_cafe_f00du64.to_le_bytes());
+        assert_eq!(cpu.trap, Trap::Svc);
+        // Read-only entry: the store must go to the machine and leave RAM alone.
+        let mut ram = [0u8; 4096];
+        let mut cpu = Cpu::default();
+        cpu.x[0] = 0x10000;
+        cpu.x[1] = 1;
+        map_page(&mut cpu, &mut ram, false);
+        run_inline(&mut cpu, &[0xf9000401, SVC]);
+        assert_eq!(cpu.trap, Trap::Store);
+        assert_eq!(ram[8], 0);
+    }
+    #[test]
+    fn inline_sizes_and_sign_extension() {
+        let mut ram = [0u8; 4096];
+        ram[0..8].copy_from_slice(&0xffff_ffff_8765_f0f1u64.to_le_bytes());
+        let mut cpu = Cpu::default();
+        map_page(&mut cpu, &mut ram, true);
+        let cases: [(u32, u64); 7] = [
+            (0x39400001, 0xf1),                  // ldrb w1
+            (0x39800001, 0xffff_ffff_ffff_fff1), // ldrsb x1
+            (0x39c00001, 0xffff_fff1),           // ldrsb w1
+            (0x79400001, 0xf0f1),                // ldrh w1
+            (0x79800001, 0xffff_ffff_ffff_f0f1), // ldrsh x1
+            (0xb9400001, 0x8765_f0f1),           // ldr w1
+            (0xb9800001, 0xffff_ffff_8765_f0f1), // ldrsw x1
+        ];
+        for (word, want) in cases {
+            cpu.x[0] = 0x10000;
+            cpu.x[1] = 0x5555_5555_5555_5555;
+            run_inline(&mut cpu, &[word, SVC]);
+            assert_eq!(cpu.x[1], want, "{word:#x}");
+            assert_eq!(cpu.trap, Trap::Svc, "{word:#x} should hit");
+        }
+        // Narrow stores touch only their own bytes.
+        ram.fill(0xaa);
+        cpu.x[0] = 0x10010;
+        cpu.x[1] = 0x1122_3344_5566_7788;
+        run_inline(&mut cpu, &[0x39000001, SVC]); // strb
+        run_inline(&mut cpu, &[0x79000001, SVC]); // strh at same address
+        assert_eq!(&ram[0x10..0x13], &[0x88, 0x77, 0xaa]);
+        cpu.x[0] = 0x10020;
+        run_inline(&mut cpu, &[0xb9000001, SVC]); // str w1
+        assert_eq!(&ram[0x20..0x25], &[0x88, 0x77, 0x66, 0x55, 0xaa]);
+    }
+    #[test]
+    fn inline_post_index_updates_the_base_on_both_paths() {
+        let mut ram = [0u8; 4096];
+        ram[0..8].copy_from_slice(&7u64.to_le_bytes());
+        let mut cpu = Cpu::default();
+        map_page(&mut cpu, &mut ram, false);
+        cpu.x[0] = 0x10000;
+        run_inline(&mut cpu, &[0xf8408401, SVC]); // ldr x1,[x0],#8
+        assert_eq!((cpu.x[1], cpu.x[0]), (7, 0x10008));
+        assert_eq!(cpu.trap, Trap::Svc);
+        // Miss: the machine applies the writeback after the access.
+        let mut cpu = Cpu::default();
+        cpu.x[0] = 0x10000;
+        run_inline(&mut cpu, &[0xf8408401, SVC]);
+        assert_eq!(cpu.trap, Trap::Load);
+        assert!(cpu.writeback);
+        assert_eq!((cpu.writeback_dest, cpu.writeback_value), (0, 0x10008));
+        assert_eq!(
+            cpu.x[0], 0x10000,
+            "base untouched until the access completes"
+        );
+    }
+    #[test]
+    fn inline_misaligned_and_wrong_page_accesses_miss() {
+        let mut ram = [0u8; 4096];
+        let mut cpu = Cpu::default();
+        map_page(&mut cpu, &mut ram, true);
+        cpu.x[0] = 0x10004; // 8-byte load, 4-byte aligned only
+        run_inline(&mut cpu, &[0xf9400001, SVC]);
+        assert_eq!(cpu.trap, Trap::Load);
+        let mut cpu2 = Cpu::default();
+        map_page(&mut cpu2, &mut ram, true);
+        cpu2.x[0] = 0x10000 + 0x1000 * 256; // same dtlb index, different page
+        run_inline(&mut cpu2, &[0xf9400001, SVC]);
+        assert_eq!(cpu2.trap, Trap::Load);
     }
 }

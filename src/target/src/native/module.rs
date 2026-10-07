@@ -378,6 +378,7 @@ fn map_module(
         address,
         mapped_len,
         code_len,
+        chunk: None,
     };
     // Anonymous mappings start zeroed, including BSS and padding.
     let memory = unsafe { core::slice::from_raw_parts_mut(address.as_ptr(), mapped_len) };

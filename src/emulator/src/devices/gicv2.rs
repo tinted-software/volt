@@ -58,9 +58,9 @@ impl Default for Gicv2 {
 }
 
 impl Gicv2 {
-    fn acting_index(&self) -> usize {
-        if self.acting < self.cpus && (self.acting as usize) < MAX_CPUS {
-            self.acting as usize
+    pub fn cpu_index(&self, cpu: u32) -> usize {
+        if cpu < self.cpus && (cpu as usize) < MAX_CPUS {
+            cpu as usize
         } else {
             0
         }
@@ -113,6 +113,13 @@ impl Gicv2 {
         if !own.interface_on || own.active != 0 || own.holding.is_some() {
             return None;
         }
+        // Almost always nothing is pending. Rule that out with one pass over the
+        // bitmaps before scanning every interrupt individually.
+        let shared_ready =
+            (PRIVATE / 32..WORDS).any(|w| self.enabled[w] & self.pending[w] & !self.active[w] != 0);
+        if own.enabled & own.pending == 0 && !shared_ready {
+            return None;
+        }
         let mut best = None;
         let mut priority = 0xff;
         for intid in 0..INTERRUPTS {
@@ -139,21 +146,24 @@ impl Gicv2 {
     pub fn signalled(&self, cpu: u32) -> bool {
         self.highest_for(cpu).is_some()
     }
-    fn send_message(&mut self, value: u32) {
+    pub fn send_message_from(&mut self, sender: u32, value: u32) -> u8 {
         let intid = value & 15;
         let filter = (value >> 24) & 3;
         let listed = ((value >> 16) & 0xff) as u8;
+        let mut targets = 0u8;
         for cpu in 0..self.cpus.min(MAX_CPUS as u32) {
             let wanted = match filter {
                 0 => listed & (1 << cpu) != 0,
-                1 => cpu != self.acting,
-                2 => cpu == self.acting,
+                1 => cpu != sender,
+                2 => cpu == sender,
                 _ => false,
             };
             if wanted {
                 self.banked[cpu as usize].pending |= 1 << intid;
+                targets |= 1 << cpu;
             }
         }
+        targets
     }
     fn word_at(offset: u64, base: u64, words: usize) -> Option<usize> {
         if (base..base + words as u64 * 4).contains(&offset) {
@@ -163,7 +173,10 @@ impl Gicv2 {
         }
     }
     pub fn read_distributor(&mut self, offset: u64, size: u8) -> u64 {
-        let own = self.acting_index();
+        self.read_distributor_for(self.acting, offset, size)
+    }
+    pub fn read_distributor_for(&mut self, cpu: u32, offset: u64, size: u8) -> u64 {
+        let own = self.cpu_index(cpu);
         // Priority and target registers are byte-addressable, including word accesses.
         if (0x400..0x900).contains(&offset) && ((offset < 0x500) || offset >= 0x800) {
             let base = if offset < 0x500 { 0x400 } else { 0x800 };
@@ -215,7 +228,10 @@ impl Gicv2 {
         }
     }
     pub fn write_distributor(&mut self, offset: u64, size: u8, value: u64) {
-        let own = self.acting_index();
+        self.write_distributor_for(self.acting, offset, size, value);
+    }
+    pub fn write_distributor_for(&mut self, cpu: u32, offset: u64, size: u8, value: u64) -> u8 {
+        let own = self.cpu_index(cpu);
         if (0x400..0x500).contains(&offset) || (0x800..0x900).contains(&offset) {
             let base = if offset < 0x500 { 0x400 } else { 0x800 };
             for byte in 0..size.min(8) {
@@ -234,7 +250,7 @@ impl Gicv2 {
                     self.target[intid] = part;
                 }
             }
-            return;
+            return 0;
         }
         let word = value as u32;
         for (base, set, which) in [
@@ -259,7 +275,7 @@ impl Gicv2 {
                 } else {
                     *destination &= !word;
                 }
-                return;
+                return 0;
             }
         }
         if let Some(index) = Self::word_at(offset, 0xc00, INTERRUPTS / 16) {
@@ -269,16 +285,20 @@ impl Gicv2 {
             } else {
                 word & 0xaaaa_aaaa
             };
-            return;
+            return 0;
         }
         match offset {
             0 => self.distributor_on = word & 1 != 0,
-            0xf00 => self.send_message(word),
+            0xf00 => return self.send_message_from(cpu, word),
             _ => {}
         }
+        0
     }
-    pub fn read_cpu(&mut self, offset: u64, _size: u8) -> u64 {
-        let own = self.acting_index();
+    pub fn read_cpu(&mut self, offset: u64, size: u8) -> u64 {
+        self.read_cpu_for(self.acting, offset, size)
+    }
+    pub fn read_cpu_for(&mut self, cpu: u32, offset: u64, _size: u8) -> u64 {
+        let own = self.cpu_index(cpu);
         match offset {
             0 => self.banked[own].interface_on as u64,
             4 => self.banked[own].mask as u64,
@@ -303,8 +323,11 @@ impl Gicv2 {
             _ => 0,
         }
     }
-    pub fn write_cpu(&mut self, offset: u64, _size: u8, value: u64) {
-        let own = self.acting_index();
+    pub fn write_cpu(&mut self, offset: u64, size: u8, value: u64) {
+        self.write_cpu_for(self.acting, offset, size, value);
+    }
+    pub fn write_cpu_for(&mut self, cpu: u32, offset: u64, _size: u8, value: u64) {
+        let own = self.cpu_index(cpu);
         match offset {
             0 => self.banked[own].interface_on = value & 1 != 0,
             4 => self.banked[own].mask = value as u8,

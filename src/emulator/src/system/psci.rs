@@ -11,6 +11,9 @@ pub const CPU_ON: u32 = 0xc400_0003;
 pub const CPU_SUSPEND: u32 = 0xc400_0001;
 pub const NOT_SUPPORTED: u64 = u64::MAX;
 pub const SUCCESS: u64 = 0;
+pub const INVALID_PARAMETERS: u64 = (-2i64) as u64;
+pub const DENIED: u64 = (-3i64) as u64;
+pub const ALREADY_ON: u64 = (-4i64) as u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Value(u64),

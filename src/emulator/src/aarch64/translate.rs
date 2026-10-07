@@ -18,6 +18,7 @@ impl core::fmt::Display for TranslateError {
     }
 }
 impl std::error::Error for TranslateError {}
+const PAGE_MASK: u64 = 0xfff;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Entry {
     pub virtual_address: u64,
@@ -74,7 +75,9 @@ impl Tlb {
     fn slot(virtual_address: u64) -> usize {
         ((virtual_address >> 12) & 255) as usize
     }
-    fn update_context(&mut self, cpu: &Cpu) {
+    /// Flush if the translation context (regime, tables, EL) changed. Called
+    /// eagerly each dispatch because inline data-TLB hits never reach `translate`.
+    pub fn update_context(&mut self, cpu: &Cpu) {
         let context = Context::of(cpu);
         if self.context != Some(context) {
             self.flush();
@@ -136,14 +139,18 @@ pub fn translate<M: GuestMemory + ?Sized>(
         return Err(TranslateError::TranslationFault);
     };
     tlb.update_context(cpu);
+    // Entries are per 4 KiB page: every address in a page resolves through the
+    // same descriptors, and a 4 KiB piece of any larger granule or block maps
+    // contiguously. `Entry::virtual_address` and `physical` hold page bases.
+    let page = virtual_address & !PAGE_MASK;
     let slot = Tlb::slot(virtual_address);
     let entry = &tlb.entries[slot];
-    if entry.generation == tlb.generation && entry.virtual_address == virtual_address {
+    if entry.generation == tlb.generation && entry.virtual_address == page {
         if entry.faulted {
             return Err(TranslateError::TranslationFault);
         }
         permitted(entry.ap, entry.executable, access, cpu.system.el)?;
-        return Ok(entry.physical);
+        return Ok(entry.physical | (virtual_address & PAGE_MASK));
     }
     let found = match walk(cpu, memory, virtual_address, access, upper) {
         Ok(found) => found,
@@ -151,7 +158,7 @@ pub fn translate<M: GuestMemory + ?Sized>(
             // Only access-independent failures may be cached as unmapped.
             if fault != TranslateError::PermissionFault {
                 tlb.entries[slot] = Entry {
-                    virtual_address,
+                    virtual_address: page,
                     generation: tlb.generation,
                     faulted: true,
                     ..Entry::default()
@@ -161,7 +168,8 @@ pub fn translate<M: GuestMemory + ?Sized>(
         }
     };
     tlb.entries[slot] = Entry {
-        virtual_address,
+        virtual_address: page,
+        physical: found.physical & !PAGE_MASK,
         generation: tlb.generation,
         ..found
     };
@@ -441,6 +449,25 @@ mod tests {
             Err(TranslateError::PermissionFault)
         );
         assert_eq!(memory.get(0x3000) & (1 << 10), 0);
+    }
+    #[test]
+    fn tlb_hits_for_any_offset_within_a_cached_page() {
+        let cpu = cpu();
+        let mut memory = Memory::new();
+        let mut tlb = Tlb::new();
+        memory.chain(0, 0, 12, 4, 0, 0x8000_0003 | (1 << 6));
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, 0x10, Access::Read),
+            Ok(0x8000_0010)
+        );
+        let reads = memory.reads.get();
+        for offset in [0x0, 0x8, 0x123, 0xfff] {
+            assert_eq!(
+                translate(&mut tlb, &cpu, &mut memory, offset, Access::Read),
+                Ok(0x8000_0000 + offset)
+            );
+        }
+        assert_eq!(memory.reads.get(), reads, "same page must not walk again");
     }
     #[test]
     fn invalid_descriptors_and_malformed_tables_fail_closed() {

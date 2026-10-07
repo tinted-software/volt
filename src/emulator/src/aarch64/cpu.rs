@@ -28,6 +28,63 @@ pub enum Trap {
     Undefined,
 }
 
+/// Number of data-TLB entries. The JIT indexes with `(va >> 12) & (DTLB_ENTRIES - 1)`.
+pub const DTLB_ENTRIES: usize = 256;
+/// Tag that never matches a lookup: real tags are page aligned, and a lookup
+/// value is `va & (!0xfff | (size - 1))`, which is never `u64::MAX`.
+pub const DTLB_INVALID: u64 = u64::MAX;
+
+/// One inline data-TLB entry, read directly by generated code (hence `repr(C)`
+/// and the 32-byte stride, which turns indexing into a shift).
+///
+/// A tag is the guest virtual page base if that page may be read (or written)
+/// through `addend`, else `DTLB_INVALID`. The host address of a byte is
+/// `va.wrapping_add(addend)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct DtlbEntry {
+    pub read: u64,
+    pub write: u64,
+    pub addend: u64,
+    pub _pad: u64,
+}
+impl Default for DtlbEntry {
+    fn default() -> Self {
+        Self {
+            read: DTLB_INVALID,
+            write: DTLB_INVALID,
+            addend: 0,
+            _pad: 0,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct Dtlb {
+    pub entries: [DtlbEntry; DTLB_ENTRIES],
+}
+impl Default for Dtlb {
+    fn default() -> Self {
+        Self {
+            entries: [DtlbEntry::default(); DTLB_ENTRIES],
+        }
+    }
+}
+impl Dtlb {
+    pub fn index(address: u64) -> usize {
+        ((address >> 12) as usize) & (DTLB_ENTRIES - 1)
+    }
+    pub fn flush(&mut self) {
+        self.entries = [DtlbEntry::default(); DTLB_ENTRIES];
+    }
+    /// Drop write permission everywhere, keeping read entries.
+    pub fn purge_writes(&mut self) {
+        for entry in &mut self.entries {
+            entry.write = DTLB_INVALID;
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 #[repr(C)]
 pub struct Cpu {
@@ -46,6 +103,11 @@ pub struct Cpu {
     pub monitor_valid: bool,
     pub monitor_address: u64,
     pub monitor_width: u8,
+    /// Value the last exclusive load observed. A store-exclusive succeeds only
+    /// if memory still holds it (checked with a host compare-exchange), which
+    /// stays correct with other vCPUs and inline stores that never touch a
+    /// shared monitor.
+    pub monitor_value: u64,
     pub event_set: bool,
     pub second_pending: bool,
     pub second_address: u64,
@@ -59,6 +121,8 @@ pub struct Cpu {
     pub system: System,
     pub fault_address: u64,
     pub fault_status: u64,
+    /// Inline data TLB for generated loads and stores. Filled by the machine.
+    pub dtlb: Dtlb,
 }
 
 #[derive(Clone, Debug)]
@@ -151,5 +215,38 @@ mod tests {
         assert_eq!(cpu.system.sp_el, [0; 4]);
         assert_eq!(cpu.system.sctlr_el1, 0);
         assert_eq!(cpu.system.cntvct_el0, 0);
+    }
+}
+
+impl Cpu {
+    /// Reads the byte-sized memory-request fields JIT code stores one byte at a
+    /// time. Plain reads of these adjacent bytes get merged into a single wide
+    /// load, which cannot be store-forwarded from several narrow stores and
+    /// stalls the pipeline on every guest load and store. Volatile keeps each
+    /// read a byte load that matches its store.
+    #[inline(always)]
+    pub fn memory_request(&self) -> (u8, u8, SignExtend, Exclusive) {
+        // SAFETY: each pointer is derived from a live field reference.
+        unsafe {
+            (
+                core::ptr::read_volatile(&self.width),
+                core::ptr::read_volatile(&self.dest),
+                core::ptr::read_volatile(&self.load_signed),
+                core::ptr::read_volatile(&self.exclusive),
+            )
+        }
+    }
+    /// The second access of a pair, with the same byte-load rationale as
+    /// `memory_request`.
+    #[inline(always)]
+    pub fn second_memory_request(&self) -> (u8, u8, SignExtend) {
+        // SAFETY: each pointer is derived from a live field reference.
+        unsafe {
+            (
+                core::ptr::read_volatile(&self.second_width),
+                core::ptr::read_volatile(&self.second_dest),
+                core::ptr::read_volatile(&self.second_signed),
+            )
+        }
     }
 }

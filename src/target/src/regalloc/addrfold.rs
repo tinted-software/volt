@@ -29,6 +29,10 @@ pub struct Analysis {
     /// ops. They become dead once the fold is applied and the backend stops
     /// reading the add's result.
     pub dead_adds: Vec<Inst>,
+    /// Dense lookup tables indexed by `Inst` index so per-instruction queries
+    /// are O(1) instead of scanning `folds` / `dead_adds`.
+    fold_slot: Vec<u32>,
+    dead: Vec<bool>,
 }
 
 impl Analysis {
@@ -39,16 +43,42 @@ impl Analysis {
         Self {
             folds: Vec::new(),
             dead_adds: Vec::new(),
+            fold_slot: Vec::new(),
+            dead: Vec::new(),
+        }
+    }
+
+    fn index(folds: Vec<(Inst, Addr)>, dead_adds: Vec<Inst>) -> Self {
+        let max = folds
+            .iter()
+            .map(|(i, _)| i.0)
+            .chain(dead_adds.iter().map(|i| i.0))
+            .max();
+        let len = max.map_or(0, |m| m as usize + 1);
+        let mut fold_slot = alloc::vec![u32::MAX; if folds.is_empty() { 0 } else { len }];
+        for (n, (inst, _)) in folds.iter().enumerate() {
+            // First fold wins, matching the previous linear search.
+            if fold_slot[inst.0 as usize] == u32::MAX {
+                fold_slot[inst.0 as usize] = n as u32;
+            }
+        }
+        let mut dead = alloc::vec![false; if dead_adds.is_empty() { 0 } else { len }];
+        for inst in &dead_adds {
+            dead[inst.0 as usize] = true;
+        }
+        Self {
+            folds,
+            dead_adds,
+            fold_slot,
+            dead,
         }
     }
 
     fn fold_of(&self, mem_inst: Inst) -> Option<Addr> {
-        for (inst, addr) in &self.folds {
-            if *inst == mem_inst {
-                return Some(*addr);
-            }
+        match self.fold_slot.get(mem_inst.0 as usize) {
+            Some(&n) if n != u32::MAX => Some(self.folds[n as usize].1),
+            _ => None,
         }
-        None
     }
 
     /// The pointer VALUE the mem op addresses after folding: the fold base if
@@ -71,7 +101,7 @@ impl Analysis {
     /// Whether `inst` (an `arith_imm.add`) is dead because every one of its
     /// uses folded away.
     pub fn is_dead_add(&self, inst: Inst) -> bool {
-        self.dead_adds.contains(&inst)
+        self.dead.get(inst.0 as usize).copied().unwrap_or(false)
     }
 }
 
@@ -153,7 +183,7 @@ pub fn analyze<F: Func>(func: &F, fold_offset: impl Fn(&F, Inst) -> Option<i64>)
         }
     }
 
-    Analysis { folds, dead_adds }
+    Analysis::index(folds, dead_adds)
 }
 
 /// Count every use of every value across the whole function: every
