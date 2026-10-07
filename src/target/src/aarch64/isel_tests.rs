@@ -1,8 +1,6 @@
 // Rust selector boundary tests for the Vulcan-derived AArch64 port (Apache-2.0).
 use super::*;
-use volt_ir::function::{
-    Arith, BinOp, CmpOp, Compare, EdgeDesc, Function, Load, Opcode, Ret, Terminator,
-};
+use volt_ir::function::{Arith, BinOp, Function, Opcode, Ret, Terminator};
 use volt_ir::types::{FloatKind, IntDesc, Type, TypeKind};
 
 fn integer(f: &mut Function, signed: bool, bits: u16) -> Type {

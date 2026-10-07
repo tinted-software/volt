@@ -17,7 +17,7 @@ impl core::fmt::Display for TranslateError {
         write!(f, "{self:?}")
     }
 }
-impl std::error::Error for TranslateError {}
+impl core::error::Error for TranslateError {}
 const PAGE_MASK: u64 = 0xfff;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Entry {

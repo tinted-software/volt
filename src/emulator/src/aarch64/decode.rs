@@ -7,7 +7,7 @@ impl core::fmt::Display for DecodeError {
         f.write_str("unsupported AArch64 instruction")
     }
 }
-impl std::error::Error for DecodeError {}
+impl core::error::Error for DecodeError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Width {
@@ -254,6 +254,7 @@ pub enum SystemRegister {
     DaifSet,
     DaifClear,
     Nzcv,
+    RazWi,
 }
 impl SystemRegister {
     pub fn read_only(self) -> bool {
@@ -608,8 +609,17 @@ fn bitmask(word: u32, width: Width) -> Result<u64, DecodeError> {
     }
     Ok(immediate)
 }
-fn system_register(op1: u32, crn: u32, crm: u32, op2: u32) -> Result<SystemRegister, DecodeError> {
+fn system_register(
+    op0: u32,
+    op1: u32,
+    crn: u32,
+    crm: u32,
+    op2: u32,
+) -> Result<SystemRegister, DecodeError> {
     use SystemRegister::*;
+    if op0 == 2 && op1 == 0 && crn == 0 && (4..=7).contains(&op2) {
+        return Ok(RazWi);
+    }
     if op1 == 3 && crn == 4 {
         if op2 == 6 {
             return Ok(DaifSet);
@@ -958,7 +968,7 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
         } else {
             let offset = sign_extend(word >> 12, 9);
             match (word >> 10) & 3 {
-                0 => Addressing::Offset(offset),
+                0 | 2 => Addressing::Offset(offset),
                 1 => Addressing::PostIndex(offset),
                 3 => Addressing::PreIndex(offset),
                 _ => return Err(UnsupportedInstruction),
@@ -1013,6 +1023,7 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
     if word & 0xffc0_0000 == 0xd500_0000 {
         let read = word & 0x0020_0000 != 0;
         let register = system_register(
+            (word >> 19) & 3,
             (word >> 16) & 7,
             (word >> 12) & 15,
             (word >> 8) & 15,
@@ -1026,7 +1037,8 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             SystemRegister::MdscrEl1
             | SystemRegister::OslarEl1
             | SystemRegister::OsdlrEl1
-            | SystemRegister::OslsrEl1 => 2,
+            | SystemRegister::OslsrEl1
+            | SystemRegister::RazWi => 2,
             _ => 3,
         };
         if (word >> 19) & 3 != expected || (read && expected == 0) {
@@ -1505,7 +1517,6 @@ mod tests {
             0x3dc00000,              // SIMD single memory
             0x6d000000,              // SIMD pair memory
             0xb8c00000,              // reserved signed word to W load
-            0xf8400800,              // unprivileged load
             0xf8620800,              // unsupported index extension
             0x5ac00c00,              // W REV64
             0x1ac00400,              // unsupported variable opcode

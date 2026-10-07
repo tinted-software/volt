@@ -9,8 +9,9 @@ pub mod psci;
 pub mod smp;
 
 use crate::aarch64::{Cpu, decode, translate};
+use crate::devices::bus::Device;
 use crate::devices::{gicv2::Gicv2, pl011::Pl011};
-use crate::memory::{GuestMemory, PhysicalMemory, Region};
+use crate::memory::{GuestMemory, PhysicalMemory, Region, SharedMemory};
 use alloc::sync::Arc;
 use core::{
     sync::atomic::{AtomicBool, Ordering},
@@ -172,6 +173,67 @@ impl core::fmt::Display for BootReport {
         )
     }
 }
+#[derive(Debug, Clone)]
+pub struct SystemConfig<B = Vec<u8>> {
+    pub timeout: Duration,
+    pub cmdline: String,
+    pub idle_mode: IdleMode,
+    pub ram_size: usize,
+    pub initrd: Option<Vec<u8>>,
+    pub disk: Option<B>,
+}
+
+impl<B> Default for SystemConfig<B> {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(20),
+            cmdline: DEFAULT_CMDLINE.into(),
+            idle_mode: IdleMode::default(),
+            ram_size: RAM_SIZE,
+            initrd: None,
+            disk: None,
+        }
+    }
+}
+
+struct SystemDevices<'a, V> {
+    serial: &'a mut Pl011,
+    gic: &'a mut Gicv2,
+    virtio: Option<&'a mut V>,
+}
+
+impl<V: crate::devices::VirtioIo> machine::DeviceIo for SystemDevices<'_, V> {
+    fn read_uart(&mut self, offset: u64, size: u8) -> u64 {
+        self.serial.read(offset, size)
+    }
+    fn write_uart(&mut self, offset: u64, size: u8, value: u64) {
+        self.serial.write(offset, size, value);
+    }
+    fn read_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64 {
+        self.gic.read_distributor_for(cpu_id, offset, size)
+    }
+    fn write_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64) {
+        self.gic.write_distributor_for(cpu_id, offset, size, value);
+    }
+    fn read_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64 {
+        self.gic.read_cpu_for(cpu_id, offset, size)
+    }
+    fn write_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64) {
+        self.gic.write_cpu_for(cpu_id, offset, size, value);
+    }
+    fn read_virtio(&mut self, offset: u64, size: u8) -> u64 {
+        if let Some(v) = &mut self.virtio {
+            v.read(offset, size)
+        } else {
+            0
+        }
+    }
+    fn write_virtio(&mut self, offset: u64, size: u8, value: u64) {
+        if let Some(v) = &mut self.virtio {
+            v.write(offset, size, value);
+        }
+    }
+}
 
 /// Boot a raw Linux Image with live serial output on stdout and a bounded wall-clock run.
 /// Execution faults are returned in the report with the full guest state, not discarded.
@@ -212,12 +274,50 @@ pub fn boot_with_options(
     timeout: Duration,
     cmdline: &str,
     idle_mode: IdleMode,
+    sink: impl FnMut(u8) + Send + 'static,
+) -> Result<BootReport, Error> {
+    boot_system(
+        image,
+        SystemConfig::<Vec<u8>> {
+            timeout,
+            cmdline: cmdline.to_string(),
+            idle_mode,
+            ram_size: RAM_SIZE,
+            initrd: None,
+            disk: None,
+        },
+        sink,
+    )
+}
+
+/// Boot with full system configuration including optional initrd and configurable RAM size.
+pub fn boot_system<B: crate::devices::BlockBackend>(
+    image: &[u8],
+    config: SystemConfig<B>,
     mut sink: impl FnMut(u8) + Send + 'static,
 ) -> Result<BootReport, Error> {
-    let region = Region::ram(RAM_BASE, vec![0; RAM_SIZE]).map_err(Error::Memory)?;
-    let mut memory = PhysicalMemory::new(vec![region]).map_err(Error::Memory)?;
-    let layout = boot::prepare(&mut memory, image, cmdline, RAM_BASE, RAM_SIZE as u64)
-        .map_err(Error::Boot)?;
+    let ram_size = if config.ram_size > 0 {
+        config.ram_size
+    } else {
+        RAM_SIZE
+    };
+    let timeout = config.timeout;
+    let idle_mode = config.idle_mode;
+    let region = Region::ram(RAM_BASE, vec![0; ram_size]).map_err(Error::Memory)?;
+    let memory = PhysicalMemory::new(vec![region]).map_err(Error::Memory)?;
+    let mut shared_mem = SharedMemory::new(memory);
+    let has_virtio = config.disk.is_some();
+    let layout = boot::prepare_boot(
+        &mut shared_mem,
+        image,
+        config.initrd.as_deref(),
+        &config.cmdline,
+        RAM_BASE,
+        ram_size as u64,
+        1,
+        has_virtio,
+    )
+    .map_err(Error::Boot)?;
     let console = Arc::new(Mutex::new(Vec::new()));
     let serial_console = console.clone();
     let uart_line = Arc::new(AtomicBool::new(false));
@@ -228,7 +328,13 @@ pub fn boot_with_options(
     })
     .with_line(move |level| serial_line.store(level, Ordering::Release));
     let mut gic = Gicv2::default();
-    let mut machine = machine::Machine::new(memory);
+    let virtio_line = Arc::new(AtomicBool::new(false));
+    let virtio_notify = virtio_line.clone();
+    let mut virtio = config.disk.map(|backend| {
+        crate::devices::VirtioBlock::new(backend, shared_mem.clone())
+            .with_line(move |level| virtio_notify.store(level, Ordering::Release))
+    });
+    let mut machine = machine::Machine::new(shared_mem);
     machine.cpu.pc = layout.entry;
     machine.cpu.x[0] = layout.device_tree;
     machine.cpu.x[1..4].fill(0);
@@ -244,8 +350,18 @@ pub fn boot_with_options(
         } else {
             gic.lower(fdt::UART_INTID);
         }
+        if virtio_line.load(Ordering::Acquire) {
+            gic.raise(fdt::VIRTIO_INTID);
+        } else {
+            gic.lower(fdt::VIRTIO_INTID);
+        }
         machine.irq_line = gic.signalled(0);
-        match machine.run(&mut serial, &mut gic) {
+        let mut dev = SystemDevices {
+            serial: &mut serial,
+            gic: &mut gic,
+            virtio: virtio.as_mut(),
+        };
+        match machine.run_with_devices(&mut dev) {
             Ok(machine::Exit::Timer) => {
                 gic.raise_on(0, fdt::VIRTUAL_TIMER_INTID);
                 timer_interrupts += 1;
@@ -309,7 +425,10 @@ pub fn boot_with_options(
         }
         exits += 1;
         let sp = machine.cpu.sp;
-        if sp != 0 && !(RAM_BASE..=RAM_BASE + RAM_SIZE as u64).contains(&sp) && sp >> 48 != 0xffff {
+        if machine.cpu.system.sctlr_el1 & 1 == 0
+            && sp != 0
+            && !(RAM_BASE..=RAM_BASE + ram_size as u64).contains(&sp)
+        {
             break StopReason::LostStack;
         }
     };
@@ -537,5 +656,59 @@ mod tests {
         assert!(report.cpu.system.cntvct_el0 >= 48_000);
         assert!(report.timer_interrupts >= 1);
         assert!(report.elapsed >= Duration::from_millis(2));
+    }
+    #[test]
+    fn boot_system_with_custom_ram_and_initrd() {
+        let image = create_test_image(&[
+            0xd2a12001u32, // movz x1, #0x900, lsl #16 (PL011)
+            0x52800842,    // movz w2, #66 ('B')
+            0x39000022,    // strb w2, [x1]
+            0xd2b08000,    // movz x0, #0x8400, lsl #16
+            0xf2800100,    // movk x0, #8 (PSCI_SYSTEM_OFF)
+            0xd4000002,    // hvc #0
+        ]);
+        let report = boot_system(
+            &image,
+            SystemConfig::<Vec<u8>> {
+                timeout: Duration::from_secs(5),
+                cmdline: DEFAULT_CMDLINE.to_string(),
+                idle_mode: IdleMode::Paced,
+                ram_size: 256 << 20,
+                initrd: Some(b"test initrd".to_vec()),
+                disk: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.reason, StopReason::Shutdown);
+        assert_eq!(report.console, b"B");
+        assert!(report.layout.initrd.is_some());
+    }
+    #[test]
+    fn boot_system_with_disk_image() {
+        let image = create_test_image(&[
+            0xd2a12001u32, // movz x1, #0x900, lsl #16 (PL011)
+            0x52800862,    // movz w2, #67 ('C')
+            0x39000022,    // strb w2, [x1]
+            0xd2b08000,    // movz x0, #0x8400, lsl #16
+            0xf2800100,    // movk x0, #8 (PSCI_SYSTEM_OFF)
+            0xd4000002,    // hvc #0
+        ]);
+        let disk = vec![0u8; 1024 * 1024]; // 1 MiB disk
+        let report = boot_system(
+            &image,
+            SystemConfig {
+                timeout: Duration::from_secs(5),
+                cmdline: DEFAULT_CMDLINE.to_string(),
+                idle_mode: IdleMode::Paced,
+                ram_size: 128 << 20,
+                initrd: None,
+                disk: Some(disk),
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.reason, StopReason::Shutdown);
+        assert_eq!(report.console, b"C");
     }
 }

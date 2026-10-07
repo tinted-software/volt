@@ -7,7 +7,8 @@ default-run = "volt-aarch64"
 
 [dependencies]
 volt-emulator = { workspace = true, features = ["system", "user"] }
-
+winnow-args = { workspace = true }
+zrip = { workspace = true }
 [[bin]]
 name = "volt-aarch64"
 path = "src/user.rs"
