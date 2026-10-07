@@ -223,6 +223,11 @@ pub fn movk64(rd: Reg, imm: u16, shift: u8) -> u32 {
     0xF2800000 | ((shift as u32) << 21) | ((imm as u32) << 5) | n(rd)
 }
 
+/// `movn rd, #imm, lsl #(16 * shift)`: `rd = !(imm << (16 * shift))`.
+pub fn movn64(rd: Reg, imm: u16, shift: u8) -> u32 {
+    0x9280_0000 | ((shift as u32) << 21) | ((imm as u32) << 5) | n(rd)
+}
+
 pub fn add_imm(rd: Reg, rn: Reg, imm: u16) -> u32 {
     debug_assert!(imm <= 0xFFF);
     0x11000000 | ((imm as u32) << 10) | (n(rn) << 5) | n(rd)
@@ -798,9 +803,218 @@ pub fn str_hfp(rt: Reg, rn: Reg, off: u16) -> u32 {
     0x7D000000 | (((off as u32) >> 1) << 10) | (n(rn) << 5) | n(rt)
 }
 
+fn is_shifted_mask(x: u64) -> bool {
+    // A single run of ones, anywhere: x | (x - 1) is then a low mask.
+    x != 0 && {
+        let filled = x | (x - 1);
+        filled & filled.wrapping_add(1) == 0
+    }
+}
+
+/// Encode `value` as the 13-bit `N:immr:imms` field of an AArch64 logical
+/// immediate (`and`/`orr`/`eor` with an immediate) for a 32- or 64-bit
+/// operation, or `None` if it has no such encoding (all zeros, all ones, or not
+/// a repeated, rotated run of ones). A 32-bit encoding always has `N == 0`.
+pub fn logical_imm(value: u64, is64: bool) -> Option<u32> {
+    let width: u32 = if is64 { 64 } else { 32 };
+    let all = u64::MAX >> (64 - width);
+    if value & !all != 0 || value == 0 || value == all {
+        return None;
+    }
+    // Smallest power-of-two element size the value repeats with.
+    let mut size = width;
+    while size > 2 {
+        let half = size / 2;
+        let mask = (1u64 << half) - 1;
+        if value & mask != (value >> half) & mask {
+            break;
+        }
+        size = half;
+    }
+    let mask = u64::MAX >> (64 - size);
+    let mut element = value & mask;
+    let (rotation, ones) = if is_shifted_mask(element) {
+        (
+            element.trailing_zeros(),
+            (element >> element.trailing_zeros()).trailing_ones(),
+        )
+    } else {
+        // The run wraps around the element: view the inverse instead.
+        element |= !mask;
+        if !is_shifted_mask(!element) {
+            return None;
+        }
+        let leading = element.leading_ones();
+        (
+            64 - leading,
+            leading + element.trailing_ones() - (64 - size),
+        )
+    };
+    let immr = (size - rotation) & (size - 1);
+    // The element size is encoded in the leading bits of `imms`, the run
+    // length (minus one) in the rest; `N` is set only for 64-bit elements.
+    let size_and_ones = (!(u64::from(size) - 1) << 1) | u64::from(ones - 1);
+    let n_bit = ((size_and_ones >> 6) & 1) ^ 1;
+    Some(((n_bit << 12) | (u64::from(immr) << 6) | (size_and_ones & 0x3f)) as u32)
+}
+
+fn logical_imm_word(base: u32, rd: Reg, rn: Reg, encoded: u32, is64: bool) -> u32 {
+    debug_assert!(is64 || encoded & (1 << 12) == 0);
+    (if is64 { SF64 } else { 0 }) | base | (encoded << 10) | (n(rn) << 5) | n(rd)
+}
+
+/// `and rd, rn, #imm` with `encoded` from [`logical_imm`]. `rd` may not be `Zr`
+/// (that encoding means `sp`).
+pub fn and_imm(rd: Reg, rn: Reg, encoded: u32, is64: bool) -> u32 {
+    logical_imm_word(0x1200_0000, rd, rn, encoded, is64)
+}
+
+pub fn orr_imm(rd: Reg, rn: Reg, encoded: u32, is64: bool) -> u32 {
+    logical_imm_word(0x3200_0000, rd, rn, encoded, is64)
+}
+
+pub fn eor_imm(rd: Reg, rn: Reg, encoded: u32, is64: bool) -> u32 {
+    logical_imm_word(0x5200_0000, rd, rn, encoded, is64)
+}
+
+fn bitfield_word(signed: bool, rd: Reg, rn: Reg, immr: u32, imms: u32, is64: bool) -> u32 {
+    let base = if signed { 0x1300_0000 } else { 0x5300_0000 };
+    let wide = if is64 { SF64 | (1 << 22) } else { 0 };
+    wide | base | (immr << 16) | (imms << 10) | (n(rn) << 5) | n(rd)
+}
+
+/// `lsl rd, rn, #amount` (`amount` below the operand width).
+pub fn lsl_imm(rd: Reg, rn: Reg, amount: u32, is64: bool) -> u32 {
+    let width = if is64 { 64 } else { 32 };
+    debug_assert!(amount < width);
+    bitfield_word(
+        false,
+        rd,
+        rn,
+        (width - amount) & (width - 1),
+        width - 1 - amount,
+        is64,
+    )
+}
+
+/// `lsr rd, rn, #amount` (`amount` below the operand width).
+pub fn lsr_imm(rd: Reg, rn: Reg, amount: u32, is64: bool) -> u32 {
+    let width = if is64 { 64 } else { 32 };
+    debug_assert!(amount < width);
+    bitfield_word(false, rd, rn, amount, width - 1, is64)
+}
+
+/// `asr rd, rn, #amount` (`amount` below the operand width).
+pub fn asr_imm(rd: Reg, rn: Reg, amount: u32, is64: bool) -> u32 {
+    let width = if is64 { 64 } else { 32 };
+    debug_assert!(amount < width);
+    bitfield_word(true, rd, rn, amount, width - 1, is64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Reference decoder for the logical-immediate field (ARM `DecodeBitMasks`).
+    fn decode_logical_imm(field: u32, is64: bool) -> Option<u64> {
+        let n_bit = (field >> 12) & 1;
+        let immr = (field >> 6) & 0x3f;
+        let imms = field & 0x3f;
+        if !is64 && n_bit == 1 {
+            return None;
+        }
+        let combined = (n_bit << 6) | (!imms & 0x3f);
+        let len = 31 - combined.leading_zeros().min(31);
+        if combined == 0 || len < 1 {
+            return None;
+        }
+        let size = 1u32 << len;
+        let s = imms & (size - 1);
+        let r = immr & (size - 1);
+        if s == size - 1 {
+            return None;
+        }
+        let run = (1u64 << (s + 1)) - 1;
+        let mask = if size == 64 {
+            u64::MAX
+        } else {
+            (1u64 << size) - 1
+        };
+        let rotated = ((run >> r) | (run << (size - r))) & mask;
+        let mut value = 0u64;
+        let mut at = 0;
+        while at < if is64 { 64 } else { 32 } {
+            value |= rotated << at;
+            at += size;
+        }
+        Some(value)
+    }
+
+    #[test]
+    fn logical_immediates_round_trip_through_the_reference_decoder() {
+        for is64 in [false, true] {
+            let width = if is64 { 64 } else { 32 };
+            for size in [2u32, 4, 8, 16, 32, 64] {
+                if size > width {
+                    continue;
+                }
+                for ones in 1..size {
+                    for rotate in 0..size {
+                        let run = (1u64 << ones) - 1;
+                        let mask = if size == 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << size) - 1
+                        };
+                        let element = ((run << rotate) | (run >> (size - rotate).min(63))) & mask;
+                        let element = if rotate == 0 { run } else { element };
+                        let mut value = 0u64;
+                        let mut at = 0;
+                        while at < width {
+                            value |= element << at;
+                            at += size;
+                        }
+                        let field = logical_imm(value, is64)
+                            .unwrap_or_else(|| panic!("{value:#x} must encode (64={is64})"));
+                        assert_eq!(decode_logical_imm(field, is64), Some(value), "{value:#x}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logical_immediate_rejects_what_the_instruction_cannot_express() {
+        for (value, is64) in [
+            (0u64, true),
+            (u64::MAX, true),
+            (0xffff_ffff, false),
+            (0x1_0000_0000, false),
+            (0b101, true),
+            (0x1234_5678, true),
+        ] {
+            assert_eq!(logical_imm(value, is64), None, "{value:#x}");
+        }
+    }
+
+    #[test]
+    fn immediate_instructions_match_assembler_output() {
+        // Checked against GNU as: and x0, x1, #0xfffffffffffff007 / orr w2, w3, #0xff / eor x4, x5, #1
+        let page_mask = logical_imm(0xffff_ffff_ffff_f007, true).unwrap();
+        assert_eq!(and_imm(Reg::X0, Reg::X1, page_mask, true), 0x9274_d820);
+        assert_eq!(
+            orr_imm(Reg::X2, Reg::X3, logical_imm(0xff, false).unwrap(), false),
+            0x3200_1c62
+        );
+        assert_eq!(
+            eor_imm(Reg::X4, Reg::X5, logical_imm(1, true).unwrap(), true),
+            0xd240_00a4
+        );
+        // lsl x0, x1, #7 / lsr w2, w3, #5 / asr x4, x5, #12 / lsl w6, w7, #3
+        assert_eq!(lsl_imm(Reg::X0, Reg::X1, 7, true), 0xd379_e020);
+        assert_eq!(lsr_imm(Reg::X2, Reg::X3, 5, false), 0x5305_7c62);
+        assert_eq!(asr_imm(Reg::X4, Reg::X5, 12, true), 0x934c_fca4);
+        assert_eq!(lsl_imm(Reg::X6, Reg::X7, 3, false), 0x531d_70e6);
+    }
 
     #[test]
     fn cmp64_golden() {

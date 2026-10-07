@@ -1,3 +1,4 @@
+pub mod ahead;
 pub mod cache;
 pub mod compile;
 pub mod cpu;

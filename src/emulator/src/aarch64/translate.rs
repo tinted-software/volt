@@ -52,6 +52,8 @@ pub struct Tlb {
     pub entries: [Entry; 256],
     pub generation: u64,
     context: Option<Context>,
+    /// Some entry caches a translation fault.
+    has_faulted: bool,
 }
 impl Default for Tlb {
     fn default() -> Self {
@@ -59,6 +61,7 @@ impl Default for Tlb {
             entries: [Entry::default(); 256],
             generation: 1,
             context: None,
+            has_faulted: false,
         }
     }
 }
@@ -68,8 +71,25 @@ impl Tlb {
     }
     pub fn flush(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.has_faulted = false;
         if self.generation <= 1 {
             self.entries = [Entry::default(); 256];
+        }
+    }
+    /// Drop cached translation faults, keeping every valid translation (and so
+    /// the generation that code and data fast paths are validated against).
+    /// A context-synchronization event (ISB) makes earlier page-table writes
+    /// visible to the walker, which can turn a fault into a mapping. It does
+    /// not invalidate valid translations; only TLBI does.
+    pub fn purge_faults(&mut self) {
+        if !self.has_faulted {
+            return;
+        }
+        self.has_faulted = false;
+        for entry in &mut self.entries {
+            if entry.faulted {
+                *entry = Entry::default();
+            }
         }
     }
     fn slot(virtual_address: u64) -> usize {
@@ -149,8 +169,12 @@ pub fn translate<M: GuestMemory + ?Sized>(
         if entry.faulted {
             return Err(TranslateError::TranslationFault);
         }
-        permitted(entry.ap, entry.executable, access, cpu.system.el)?;
-        return Ok(entry.physical | (virtual_address & PAGE_MASK));
+        // A cached entry that denies the access is re-walked below: the
+        // descriptor may have been upgraded since it was cached, which
+        // hardware also resolves by retrying the walk.
+        if permitted(entry.ap, entry.executable, access, cpu.system.el).is_ok() {
+            return Ok(entry.physical | (virtual_address & PAGE_MASK));
+        }
     }
     let found = match walk(cpu, memory, virtual_address, access, upper) {
         Ok(found) => found,
@@ -163,6 +187,7 @@ pub fn translate<M: GuestMemory + ?Sized>(
                     faulted: true,
                     ..Entry::default()
                 };
+                tlb.has_faulted = true;
             }
             return Err(fault);
         }

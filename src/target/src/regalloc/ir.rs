@@ -15,7 +15,7 @@ pub trait Func {
     fn block_insts(&self, block: Block) -> &[Inst];
     fn block_params(&self, block: Block) -> &[Value];
     fn terminator(&self, block: Block) -> Option<Terminator>;
-    fn opcode(&self, inst: Inst) -> Opcode;
+    fn opcode(&self, inst: Inst) -> &Opcode;
     fn defining_inst(&self, value: Value) -> Option<Inst>;
     fn inst_result(&self, inst: Inst) -> Option<Value>;
     fn value_list(&self, list: ValueList) -> &[Value];
@@ -39,8 +39,8 @@ impl Func for Function {
     fn terminator(&self, block: Block) -> Option<Terminator> {
         self.terminator(block)
     }
-    fn opcode(&self, inst: Inst) -> Opcode {
-        self.opcode(inst)
+    fn opcode(&self, inst: Inst) -> &Opcode {
+        self.opcode_ref(inst)
     }
     fn defining_inst(&self, value: Value) -> Option<Inst> {
         self.defining_inst(value)

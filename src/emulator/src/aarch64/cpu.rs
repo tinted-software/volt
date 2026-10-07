@@ -21,7 +21,10 @@ pub enum Trap {
     Store,
     Svc,
     Brk,
-    Sync,
+    /// Context synchronization (`ISB`): page-table writes become visible to the walker.
+    Isb,
+    /// TLB invalidation (`TLBI`).
+    Tlbi,
     Translation,
     DcZva,
     Eret,
@@ -98,6 +101,8 @@ pub struct Cpu {
     pub width: u8,
     pub dest: u8,
     pub load_signed: SignExtend,
+    pub vector_dest: bool,
+
     pub exclusive: Exclusive,
     pub status_dest: u8,
     pub monitor_valid: bool,
@@ -112,15 +117,18 @@ pub struct Cpu {
     pub second_pending: bool,
     pub second_address: u64,
     pub second_value: u64,
+
     pub second_width: u8,
     pub second_dest: u8,
     pub second_signed: SignExtend,
+    pub second_vector: bool,
     pub writeback: bool,
     pub writeback_value: u64,
     pub writeback_dest: u8,
     pub system: System,
     pub fault_address: u64,
     pub fault_status: u64,
+    pub v: [[u64; 2]; 32],
     /// Inline data TLB for generated loads and stores. Filled by the machine.
     pub dtlb: Dtlb,
 }

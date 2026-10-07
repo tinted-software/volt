@@ -2,6 +2,7 @@
 // Rust Function-based lowering and executable/object integration modifications.
 use super::super::{encode as e, peephole};
 use super::{Abi, Compiled, Error, Fixup, LineEntry, ModelCaps, Reloc, RelocKind};
+use crate::regalloc::forward;
 use crate::regalloc::wimmer::{
     self, Allocation, CallSite, ClassRegs, FixedAssign, Location, Move, RegClass, RegDescription,
     UseKind,
@@ -46,6 +47,17 @@ fn bits(f: &Function, v: Value) -> u16 {
         TypeKind::Int(i) => i.bits,
         TypeKind::Bool => 1,
         _ => 64,
+    }
+}
+/// `n` as `Emitter::normalize` would leave a value of `v`'s type in a register.
+fn canonical_constant(f: &Function, v: Value, n: u64) -> u64 {
+    let bits = u32::from(bits(f, v));
+    if bits >= 64 {
+        n
+    } else if signed(f, v) {
+        (((n << (64 - bits)) as i64) >> (64 - bits)) as u64
+    } else {
+        n & ((1u64 << bits) - 1)
     }
 }
 fn wide(f: &Function, v: Value) -> bool {
@@ -136,7 +148,10 @@ struct Model {
     classes: Vec<RegClass>,
     calls: Vec<CallSite>,
     fused: Vec<(Inst, Fusion)>,
-    skipped: Vec<Inst>,
+    /// Instruction index -> position in `fused` (`u32::MAX` if not fused).
+    fused_at: Vec<u32>,
+    /// Instruction index -> true when a fusion absorbed it and nothing is emitted.
+    skipped: Vec<bool>,
 }
 impl Model {
     fn new(f: &Function, caps: &ModelCaps) -> Self {
@@ -161,7 +176,7 @@ impl Model {
         for bi in 0..f.block_count() {
             pos += 1;
             for i in f.block_insts(Block(bi as u32)) {
-                if matches!(f.opcode(*i), Opcode::Call(_) | Opcode::CallIndirect(_)) {
+                if matches!(f.opcode_ref(*i), Opcode::Call(_) | Opcode::CallIndirect(_)) {
                     calls.push(CallSite {
                         pos,
                         clobbered: vec![
@@ -200,7 +215,7 @@ impl Model {
                     continue;
                 };
                 if caps.fuse_cmp_arith && uses[v.index()] == 1 {
-                    if let (Opcode::Icmp(c), Opcode::If(cf)) = (f.opcode(p), f.opcode(i)) {
+                    if let (Opcode::Icmp(c), Opcode::If(cf)) = (f.opcode_ref(p), f.opcode_ref(i)) {
                         if cf.cond == v
                             && class(f, c.lhs) == 0
                             && f.block_args(cf.then).len() + f.block_args(cf.else_).len() <= 2
@@ -218,7 +233,7 @@ impl Model {
                         }
                     }
                 }
-                let Opcode::Arith(a) = f.opcode(i) else {
+                let Opcode::Arith(a) = f.opcode_ref(i) else {
                     continue;
                 };
                 if uses[v.index()] != 1
@@ -227,7 +242,7 @@ impl Model {
                 {
                     continue;
                 }
-                let fusion = match f.opcode(p) {
+                let fusion = match f.opcode_ref(p) {
                     Opcode::Arith(m)
                         if m.op == BinOp::Mul && class(f, v) == 1 && !half(f, v) && !quad(f, v) =>
                     {
@@ -271,11 +286,32 @@ impl Model {
                 fused.push((i, fusion));
             }
         }
+        let mut fused_at = vec![u32::MAX; f.inst_count()];
+        for (n, (i, _)) in fused.iter().enumerate() {
+            // First fusion for an instruction wins.
+            if fused_at[i.index()] == u32::MAX {
+                fused_at[i.index()] = n as u32;
+            }
+        }
+        let mut skipped_mask = vec![false; f.inst_count()];
+        for i in &skipped {
+            skipped_mask[i.index()] = true;
+        }
         Self {
             classes,
             calls,
             fused,
-            skipped,
+            fused_at,
+            skipped: skipped_mask,
+        }
+    }
+    fn is_skipped(&self, i: Inst) -> bool {
+        self.skipped.get(i.index()).copied().unwrap_or(false)
+    }
+    fn fusion(&self, i: Inst) -> Option<Fusion> {
+        match self.fused_at.get(i.index()) {
+            Some(&n) if n != u32::MAX => Some(self.fused[n as usize].1),
+            _ => None,
         }
     }
 }
@@ -316,10 +352,10 @@ impl RegDescription<Function> for Model {
         i: Inst,
         out: &mut [Value; wimmer::MAX_FUSED_OPERANDS],
     ) -> Option<u8> {
-        if self.skipped.contains(&i) {
+        if self.is_skipped(i) {
             return Some(0);
         }
-        match self.fused.iter().find(|(inst, _)| *inst == i)?.1 {
+        match self.fusion(i)? {
             Fusion::Float { a, b, c, .. } => {
                 out[0] = a;
                 out[1] = b;
@@ -335,7 +371,7 @@ impl RegDescription<Function> for Model {
                 out[0] = lhs;
                 out[1] = rhs;
                 let mut n = 2;
-                if let Opcode::If(cf) = f.opcode(i) {
+                if let Opcode::If(cf) = f.opcode_ref(i) {
                     for v in f.block_args(cf.then).iter().chain(f.block_args(cf.else_)) {
                         out[n] = *v;
                         n += 1;
@@ -412,11 +448,26 @@ impl Emitter<'_> {
         self.code.push(w);
     }
     fn constant(&mut self, r: Reg, v: u64) {
+        let chunk = |x: u64, k: u32| (x >> (k * 16)) as u16;
+        let nonzero = |x: u64| (0..4).filter(|k| chunk(x, *k) != 0).count();
+        if nonzero(v) > 1 {
+            // One instruction instead of a movz/movk run: a lone non-0xffff
+            // chunk (movn) or a repeated, rotated bit run (logical immediate).
+            if nonzero(!v) == 1 {
+                let k = (0..4).find(|k| chunk(!v, *k) != 0).unwrap_or(0);
+                self.push(e::movn64(r, chunk(!v, k), k as u8));
+                return;
+            }
+            if let Some(encoded) = e::logical_imm(v, true) {
+                self.push(e::orr_imm(r, Reg::Zr, encoded, true));
+                return;
+            }
+        }
         self.push(e::movz64(r, v as u16, 0));
         for k in 1..4 {
-            let p = (v >> (k * 16)) as u16;
+            let p = chunk(v, k);
             if p != 0 {
-                self.push(e::movk64(r, p, k));
+                self.push(e::movk64(r, p, k as u8));
             }
         }
     }
@@ -480,6 +531,11 @@ impl Emitter<'_> {
         Ok((Reg::X8, 0))
     }
     fn loc(&self, v: Value) -> Result<Location, Error> {
+        if let Some(&r) = self.alloc.single_regs.get(v.index())
+            && r != u16::MAX
+        {
+            return Ok(Location::Reg(r));
+        }
         let s = self.alloc.segments_of(v).ok_or(Error::Unsupported)?;
         s.iter()
             .rev()
@@ -519,6 +575,15 @@ impl Emitter<'_> {
         if class(self.f, v) == 0 {
             self.normalize(v, r);
         }
+        self.spill_result(v, r)
+    }
+    /// Like `finish`, for a result already in the canonical form `normalize`
+    /// would produce (so the extension instruction is skipped).
+    fn finish_normal(&mut self, v: Value, r: Reg) -> Result<(), Error> {
+        debug_assert!(class(self.f, v) == 0);
+        self.spill_result(v, r)
+    }
+    fn spill_result(&mut self, v: Value, r: Reg) -> Result<(), Error> {
         if let Location::Slot(s) = self.loc(v)? {
             self.raw_mem(
                 false,
@@ -529,6 +594,54 @@ impl Emitter<'_> {
             )?;
         }
         Ok(())
+    }
+    /// Whether `v = lhs op rhs` (rhs a constant when `imm` is given) is already
+    /// in canonical form, given canonical operands. Values narrower than 64 bits
+    /// are kept zero- (unsigned) or sign-extended (signed) to the full register.
+    /// Operations on 32-bit or narrower types run in 32-bit form, which zeroes
+    /// the upper half, so an unsigned 32-bit result is always canonical; a
+    /// narrower unsigned result only is if the operation cannot set bits above
+    /// the type.
+    fn keeps_canonical_form(&self, v: Value, op: BinOp, imm: Option<i64>) -> bool {
+        let n = bits(self.f, v);
+        if class(self.f, v) != 0 || n >= 64 || signed(self.f, v) || wide(self.f, v) {
+            return false;
+        }
+        if n == 32 {
+            return true;
+        }
+        let in_range = imm.is_none_or(|k| k >= 0 && (k as u64) >> n == 0);
+        matches!(
+            op,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shr | BinOp::Div | BinOp::Rem
+        ) && in_range
+    }
+    /// `rd = rn op imm` as a single instruction, if the operation has an
+    /// immediate form for this operand width.
+    fn immediate_form(&self, v: Value, op: BinOp, rd: Reg, rn: Reg, imm: i64) -> Option<u32> {
+        let is64 = wide(self.f, v);
+        let width = if is64 { 64 } else { 32 };
+        match op {
+            BinOp::Shl | BinOp::Shr if (0..width).contains(&imm) => Some(match op {
+                BinOp::Shl => e::lsl_imm(rd, rn, imm as u32, is64),
+                _ if signed(self.f, v) => e::asr_imm(rd, rn, imm as u32, is64),
+                _ => e::lsr_imm(rd, rn, imm as u32, is64),
+            }),
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                let value = if is64 {
+                    imm as u64
+                } else {
+                    imm as u64 & 0xffff_ffff
+                };
+                let encoded = e::logical_imm(value, is64)?;
+                Some(match op {
+                    BinOp::BitAnd => e::and_imm(rd, rn, encoded, is64),
+                    BinOp::BitOr => e::orr_imm(rd, rn, encoded, is64),
+                    _ => e::eor_imm(rd, rn, encoded, is64),
+                })
+            }
+            _ => None,
+        }
     }
     fn normalize(&mut self, v: Value, r: Reg) {
         let n = bits(self.f, v);
@@ -757,6 +870,9 @@ impl Emitter<'_> {
             }
         } else {
             self.integer_binary(v, op, rd, a, b)?;
+        }
+        if !fp && !vector(self.f, v) && self.keeps_canonical_form(v, op, None) {
+            return self.finish_normal(v, rd);
         }
         self.finish(v, rd)
     }
@@ -1009,16 +1125,10 @@ impl Emitter<'_> {
     }
     fn instruction(&mut self, inst: Inst) -> Result<bool, Error> {
         let result = self.f.inst_result(inst);
-        if self.model.skipped.contains(&inst) {
+        if self.model.is_skipped(inst) {
             return Ok(false);
         }
-        if let Some(fusion) = self
-            .model
-            .fused
-            .iter()
-            .find(|(i, _)| *i == inst)
-            .map(|(_, f)| *f)
-        {
+        if let Some(fusion) = self.model.fusion(inst) {
             if let Fusion::Compare { lhs, rhs, op } = fusion {
                 let a = self.read(lhs, reg(13))?;
                 let b = self.read(rhs, reg(14))?;
@@ -1027,7 +1137,7 @@ impl Emitter<'_> {
                 } else {
                     e::cmp(a, b)
                 });
-                let Opcode::If(cf) = self.f.opcode(inst) else {
+                let Opcode::If(cf) = self.f.opcode_ref(inst) else {
                     return Err(Error::Unsupported);
                 };
                 let other = self.local_label();
@@ -1043,17 +1153,19 @@ impl Emitter<'_> {
             self.fusion(result.ok_or(Error::Unsupported)?, fusion)?;
             return Ok(false);
         }
-        match self.f.opcode(inst) {
+        match self.f.opcode_ref(inst) {
             Opcode::Iconst(n) => {
                 let v = result.ok_or(Error::Unsupported)?;
                 let rd = self.result(v)?;
                 if class(self.f, v) == 1 {
-                    self.constant(reg(16), n as u64);
+                    self.constant(reg(16), *n as u64);
                     self.push(e::fmov_from_gpr(rd, reg(16), double(self.f, v)));
+                    self.finish(v, rd)?;
                 } else {
-                    self.constant(rd, n as u64);
+                    // Canonicalize at compile time instead of emitting an extension.
+                    self.constant(rd, canonical_constant(self.f, v, *n as u64));
+                    self.finish_normal(v, rd)?;
                 }
-                self.finish(v, rd)?;
             }
             Opcode::Fconst(n) => {
                 let v = result.ok_or(Error::Unsupported)?;
@@ -1071,7 +1183,7 @@ impl Emitter<'_> {
                         if double(self.f, v) {
                             n.to_bits()
                         } else {
-                            (n as f32).to_bits() as u64
+                            (*n as f32).to_bits() as u64
                         },
                     );
                     self.push(e::fmov_from_gpr(rd, reg(16), double(self.f, v)));
@@ -1081,7 +1193,7 @@ impl Emitter<'_> {
             Opcode::Fconst128(n) => {
                 let v = result.ok_or(Error::Unsupported)?;
                 let rd = self.result(v)?;
-                self.constant(reg(16), n as u64);
+                self.constant(reg(16), *n as u64);
                 self.push(e::fmov_from_gpr(rd, reg(16), true));
                 self.constant(reg(16), (n >> 64) as u64);
                 self.push(e::ins_d1_from_gpr(rd, reg(16)));
@@ -1107,11 +1219,17 @@ impl Emitter<'_> {
                             e::add_imm(rd, r, a.imm.unsigned_abs() as u16)
                         },
                     );
+                } else if let Some(word) = self.immediate_form(v, a.op, rd, r, a.imm) {
+                    self.push(word);
                 } else {
                     self.constant(reg(14), a.imm as u64);
                     self.integer_binary(v, a.op, rd, r, reg(14))?;
                 }
-                self.finish(v, rd)?;
+                if self.keeps_canonical_form(v, a.op, Some(a.imm)) {
+                    self.finish_normal(v, rd)?;
+                } else {
+                    self.finish(v, rd)?;
+                }
             }
             Opcode::Icmp(c) => {
                 let v = result.ok_or(Error::Unsupported)?;
@@ -1147,7 +1265,12 @@ impl Emitter<'_> {
                     });
                     self.push(e::cset(rd, int_cond(c.op, signed(self.f, c.lhs))));
                 }
-                self.finish(v, rd)?;
+                // `cset` already yields 0 or 1.
+                if !fp && !vector(self.f, c.lhs) && bits(self.f, v) == 1 {
+                    self.finish_normal(v, rd)?;
+                } else {
+                    self.finish(v, rd)?;
+                }
             }
             Opcode::Select(s) => {
                 let v = result.ok_or(Error::Unsupported)?;
@@ -1174,7 +1297,13 @@ impl Emitter<'_> {
                         e::csel(rd, a, b, Cond::Ne) | if wide(self.f, v) { 1 << 31 } else { 0 }
                     });
                 }
-                self.finish(v, rd)?;
+                // `csel` copies one of two canonical operands, so an unsigned
+                // result needs no extension.
+                if class(self.f, v) == 0 && !signed(self.f, v) && !vector(self.f, v) {
+                    self.finish_normal(v, rd)?;
+                } else {
+                    self.finish(v, rd)?;
+                }
             }
             Opcode::Convert(c) => self.convert(result.ok_or(Error::Unsupported)?, c.value)?,
             Opcode::Unary(u) => {
@@ -1245,7 +1374,13 @@ impl Emitter<'_> {
                 let a = self.read(l.ptr, reg(13))?;
                 let rd = self.result(v)?;
                 self.memory(true, v, rd, a, self.fold.off_of(inst) as usize)?;
-                self.finish(v, rd)?;
+                // `ldrb`/`ldrh`/`ldr w` already zero-extend a whole-byte unsigned value.
+                let n = bits(self.f, v);
+                if class(self.f, v) == 0 && !signed(self.f, v) && matches!(n, 8 | 16 | 32 | 64) {
+                    self.finish_normal(v, rd)?;
+                } else {
+                    self.finish(v, rd)?;
+                }
             }
             Opcode::Store(s) => {
                 let a = self.read(
@@ -1511,28 +1646,79 @@ fn float_cond(op: CmpOp) -> Cond {
     }
 }
 
+/// True for a function made only of scalar integer, boolean and pointer
+/// operations with no block parameters past the entry block: what a dynamic
+/// translator emits. None of the float, vector and quantization lowerings or
+/// the critical-edge split (which only matters for edge moves) can change it.
+fn is_plain_integer(f: &Function) -> bool {
+    for bi in 0..f.block_count() {
+        let block = Block(bi as u32);
+        if bi != 0 && !f.block_params(block).is_empty() {
+            return false;
+        }
+        for i in f.block_insts(block) {
+            if !matches!(
+                f.opcode_ref(*i),
+                Opcode::Iconst(_)
+                    | Opcode::Arith(_)
+                    | Opcode::ArithImm(_)
+                    | Opcode::Icmp(_)
+                    | Opcode::Select(_)
+                    | Opcode::Convert(_)
+                    | Opcode::Load(_)
+                    | Opcode::Store(_)
+                    | Opcode::If(_)
+            ) {
+                return false;
+            }
+        }
+    }
+    (0..f.value_count()).all(|v| match kind(f, Value(v as u32)) {
+        TypeKind::Int(i) => i.bits <= 64,
+        TypeKind::Bool | TypeKind::Ptr(_) => true,
+        _ => false,
+    })
+}
+
 pub(super) fn compile(input: &Function, caps: &ModelCaps, native: bool) -> Result<Compiled, Error> {
     if input.block_count() == 0 || volt_ir::function::function_uses_composite_f16(input) {
         return Err(Error::Unsupported);
     }
-    let mut f = input.clone_func();
-    volt_ir::expand::expand_nv_fp4(&mut f);
-    volt_ir::expand::expand_low_float(&mut f);
-    volt_ir::expand::expand_vector_lanes_except(&mut f, &|f, i| match f.opcode(i) {
-        Opcode::Reduce(r) => r.op == BinOp::Add && lane(f, r.vector).is_ok(),
-        Opcode::Splat(_) => f.inst_result(i).is_some_and(|v| lane(f, v).is_ok()),
-        _ => false,
-    });
-    volt_ir::softfp::lower(&mut f);
-    volt_ir::critical_edge::split_critical_edges(&mut f);
-    volt_ir::reachable::neutralize_unreachable(&mut f);
+    compile_owned(input.clone_func(), caps, native)
+}
+
+/// Like `compile`, consuming the function so no copy is needed.
+pub(super) fn compile_owned(
+    mut f: Function,
+    caps: &ModelCaps,
+    native: bool,
+) -> Result<Compiled, Error> {
+    if f.block_count() == 0 {
+        return Err(Error::Unsupported);
+    }
+    let plain = is_plain_integer(&f);
+    if !plain {
+        if volt_ir::function::function_uses_composite_f16(&f) {
+            return Err(Error::Unsupported);
+        }
+        volt_ir::expand::expand_nv_fp4(&mut f);
+        volt_ir::expand::expand_low_float(&mut f);
+        volt_ir::expand::expand_vector_lanes_except(&mut f, &|f, i| match f.opcode_ref(i) {
+            Opcode::Reduce(r) => r.op == BinOp::Add && lane(f, r.vector).is_ok(),
+            Opcode::Splat(_) => f.inst_result(i).is_some_and(|v| lane(f, v).is_ok()),
+            _ => false,
+        });
+        volt_ir::softfp::lower(&mut f);
+        volt_ir::critical_edge::split_critical_edges(&mut f);
+        volt_ir::reachable::neutralize_unreachable(&mut f);
+    }
     let fold = crate::regalloc::addrfold::analyze(&f, |f, i| {
-        let (p, v) = match f.opcode(i) {
+        let (p, v) = match f.opcode_ref(i) {
             Opcode::Load(l) => (l.ptr, f.inst_result(i)?),
             Opcode::Store(s) => (s.ptr, s.value),
             _ => return None,
         };
-        let add = match f.opcode(f.defining_inst(p)?) {
+        let add = match f.opcode_ref(f.defining_inst(p)?) {
             Opcode::ArithImm(a) => a,
             _ => return None,
         };
@@ -1559,13 +1745,37 @@ pub(super) fn compile(input: &Function, caps: &ModelCaps, native: bool) -> Resul
         f.block_insts_mut(Block(bi as u32))
             .retain(|i| !fold.is_dead_add(*i));
     }
-    let model = Model::new(&f, caps);
-    let alloc = wimmer::allocate(&f, &model).map_err(|_| Error::Unsupported)?;
+    let mut model = Model::new(&f, caps);
+    // Straight-line translator output (forward edges, no block parameters,
+    // integer values) skips the general scan. Every register here is free for
+    // allocation in a function without calls: x0 holds the one incoming
+    // argument until the prologue homes it, x8 and x13..x17 are emitter
+    // scratch, and x19..x28 are callee-saved (tried last, saved if used).
+    const FORWARD_POOL: [u16; 21] = [
+        1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    ];
+    let forward = if f.is_variadic || f.sret {
+        None
+    } else {
+        forward::allocate_forward(&f, &model, &FORWARD_POOL)
+    };
+    let alloc = match forward {
+        Some(alloc) => alloc,
+        None => {
+            if plain {
+                // The general allocator wants the CFG normalized first.
+                volt_ir::critical_edge::split_critical_edges(&mut f);
+                volt_ir::reachable::neutralize_unreachable(&mut f);
+                model = Model::new(&f, caps);
+            }
+            wimmer::allocate(&f, &model).map_err(|_| Error::Unsupported)?
+        }
+    };
     let mut outgoing = 0;
     let mut leaf = true;
     for bi in 0..f.block_count() {
         for i in f.block_insts(Block(bi as u32)) {
-            match f.opcode(*i) {
+            match f.opcode_ref(*i) {
                 Opcode::Call(c) => {
                     leaf = false;
                     outgoing =
@@ -1603,7 +1813,7 @@ pub(super) fn compile(input: &Function, caps: &ModelCaps, native: bool) -> Resul
     let mut alloca = vec![None; f.value_count()];
     for bi in 0..f.block_count() {
         for i in f.block_insts(Block(bi as u32)) {
-            if let Opcode::Alloca(a) = f.opcode(*i) {
+            if let Opcode::Alloca(a) = f.opcode_ref(*i) {
                 let (sz, al) = layout(&f, a.elem)?;
                 cursor = align(cursor, al);
                 alloca[f.inst_result(*i).ok_or(Error::Unsupported)?.index()] = Some(cursor);
@@ -1685,7 +1895,7 @@ pub(super) fn compile(input: &Function, caps: &ModelCaps, native: bool) -> Resul
             for pi in bi..f.block_count() {
                 let pb = Block(pi as u32);
                 for i in f.block_insts(pb) {
-                    if let Opcode::If(cf) = f.opcode(*i) {
+                    if let Opcode::If(cf) = f.opcode_ref(*i) {
                         header |= cf.then.target == b || cf.else_.target == b;
                     }
                 }

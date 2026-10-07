@@ -196,6 +196,182 @@ pub struct Address {
     pub offset: i64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdImmediate {
+    pub rd: u8,
+    pub low: u64,
+    pub high: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdPair {
+    pub op: MemoryOp,
+    pub bytes: u8,
+    pub rn: u8,
+    pub rt: u8,
+    pub rt2: u8,
+    pub addressing: Addressing,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdMemory {
+    pub op: MemoryOp,
+    pub bytes: u8,
+    pub rn: u8,
+    pub rt: u8,
+    /// Consecutive vector registers touched, starting at `rt`. The
+    /// multi-structure forms use 2..4; the single-register forms use 1.
+    pub registers: u8,
+    pub addressing: Addressing,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdCompareZero {
+    pub rd: u8,
+    pub rn: u8,
+    /// Log2 of the element width in bytes.
+    pub size: u8,
+    pub q: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdExt {
+    pub rd: u8,
+    pub rn: u8,
+    pub rm: u8,
+    pub imm: u8,
+}
+/// `dup` from an element of a vector register: replicate lane `index` of
+/// `rn` across every lane of the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdDupElement {
+    pub rd: u8,
+    pub rn: u8,
+    /// Log2 of the element width in bytes.
+    pub esize: u8,
+    pub index: u8,
+    pub q: bool,
+}
+/// `mov <Vd>.<T>[index], <R>`: insert a general register's bits into one lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdInsert {
+    pub rd: u8,
+    pub rn: u8,
+    /// Log2 of the element width in bytes.
+    pub esize: u8,
+    pub index: u8,
+}
+/// `mov <R>, <Vn>.<T>[index]` / `umov`: extract one lane into a general register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdExtract {
+    pub rd: u8,
+    pub rn: u8,
+    /// Log2 of the element width in bytes.
+    pub esize: u8,
+    pub index: u8,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdFmov {
+    pub rd: u8,
+    pub rn: u8,
+    /// True for GPR-to-FPR, false for FPR-to-GPR.
+    pub to_fp: bool,
+    /// True for 64-bit (`x`/`d`), false for 32-bit (`w`/`s`).
+    pub double: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermuteOp {
+    Uzp1,
+    Uzp2,
+    Zip1,
+    Zip2,
+    Trn1,
+    Trn2,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdPermute {
+    pub op: PermuteOp,
+    pub rd: u8,
+    pub rn: u8,
+    pub rm: u8,
+    pub size: u8,
+}
+/// Three-registers-same integer vector operation (`U`, `size` and `opcode`
+/// fields verified against `llvm-mc` encodings).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimdAluOp {
+    Add,
+    Sub,
+    Mul,
+    Mla,
+    Mls,
+    And,
+    Bic,
+    Orr,
+    Orn,
+    Eor,
+    Bsl,
+    Bit,
+    Bif,
+    CmEq,
+    CmGt,
+    CmGe,
+    CmHi,
+    CmHs,
+    CmTst,
+    UMin,
+    UMax,
+    SMin,
+    SMax,
+    UAbd,
+    SAbd,
+    SQAdd,
+    UQAdd,
+    SQSub,
+    UQSub,
+    SHAdd,
+    UHAdd,
+    SHSub,
+    UHSub,
+    SRHAdd,
+    URHAdd,
+    SSHl,
+    USHl,
+    SQShl,
+    UQShl,
+    SQRShl,
+    UQRShl,
+    /// Horizontal add of all lanes (only the low byte/half/word of the result
+    /// is meaningful; the rest of the destination is zeroed).
+    AddV,
+    /// Adjacent-lane pair operations between two registers.
+    UMaxP,
+    SMaxP,
+    UMinP,
+    SMinP,
+    AddP,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdAlu {
+    pub op: SimdAluOp,
+    pub rd: u8,
+    pub rn: u8,
+    pub rm: u8,
+    /// Log2 of the element width in bytes.
+    pub size: u8,
+    pub q: bool,
+}
+/// Table vector lookup (`tbl`/`tbx`): byte indices select from one to four
+/// consecutive table registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdTable {
+    pub rd: u8,
+    /// First table register.
+    pub rn: u8,
+    /// Index register.
+    pub rm: u8,
+    /// Number of table registers minus one.
+    pub len: u8,
+    /// True for `tbx`, whose out-of-range lanes keep the destination bytes.
+    pub extend: bool,
+    pub q: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemRegister {
     SpEl0,
     SpEl1,
@@ -473,6 +649,20 @@ pub enum Instruction {
     Unary(Unary),
     Bitfield(Bitfield),
     Extract(Extract),
+    SimdImm(SimdImmediate),
+    SimdPair(SimdPair),
+    SimdMemory(SimdMemory),
+    SimdCompareZero(SimdCompareZero),
+    SimdFmov(SimdFmov),
+    SimdMove { rd: u8, rn: u8 },
+    SimdDup { rd: u8, rn: u8, esize: u8, q: bool },
+    SimdDupElement(SimdDupElement),
+    SimdInsert(SimdInsert),
+    SimdExtract(SimdExtract),
+    SimdExt(SimdExt),
+    SimdPermute(SimdPermute),
+    SimdAlu(SimdAlu),
+    SimdTable(SimdTable),
     Svc,
     Psci,
     Wfi,
@@ -482,7 +672,16 @@ impl Instruction {
     /// plain loads and stores are compiled with an inline fast path and no
     /// longer end the block (their slow path exits mid-block instead).
     pub fn terminates_with(&self, inline_memory: bool) -> bool {
-        if inline_memory && matches!(self, Instruction::Memory(_) | Instruction::Literal(_)) {
+        if inline_memory
+            && matches!(
+                self,
+                Instruction::Memory(_)
+                    | Instruction::Pair(_)
+                    | Instruction::Literal(_)
+                    | Instruction::SimdMemory(_)
+                    | Instruction::SimdPair(_)
+            )
+        {
             return false;
         }
         self.terminates()
@@ -495,6 +694,8 @@ impl Instruction {
                 | Exclusive(_)
                 | Literal(_)
                 | Pair(_)
+                | SimdPair(_)
+                | SimdMemory(_)
                 | B(_)
                 | BCond(_)
                 | TestBranch(_)
@@ -931,9 +1132,142 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             rs,
         }));
     }
-    if word & 0x3e00_0000 == 0x3800_0000 {
-        if word & 0x0400_0000 != 0 {
-            return Err(UnsupportedInstruction);
+    // LD1/ST1 (multiple structures): the opcode field at bits 15:12 selects
+    // how many consecutive vector registers the structure spans, starting at
+    // `rt`: `1010` -> 2, `0110` -> 3, `0010` -> 4. The `0111` opcode is the
+    // single-register form handled below; the remaining encodings are the
+    // interleaved LD2/LD3/LD4 single-structure forms, which spread one
+    // element across registers and are not supported here.
+    if word & 0x3e00_0000 == 0x0c00_0000 && word & 0x0000_f000 != 0x0000_7000 {
+        let registers = match (word >> 12) & 0xf {
+            0b1010 => 2,
+            0b0110 => 3,
+            0b0010 => 4,
+            _ => return Err(UnsupportedInstruction),
+        };
+        // Each register holds the full vector width selected by Q.
+        let bytes = if word & 0x4000_0000 != 0 { 16 } else { 8 };
+        let post_index = word & 0x0080_0000 != 0;
+        let index = (word >> 16) & 0x3f;
+        let span = (registers as u32 * bytes) as u64;
+        let addressing = if post_index {
+            if index != 31 {
+                return Err(UnsupportedInstruction);
+            }
+            Addressing::PostIndex(span as i64)
+        } else {
+            if index != 0 {
+                return Err(UnsupportedInstruction);
+            }
+            Addressing::Offset(0)
+        };
+        return Ok(SimdMemory(self::SimdMemory {
+            op: if word & 0x0040_0000 != 0 {
+                MemoryOp::Load
+            } else {
+                MemoryOp::Store
+            },
+            bytes: bytes as u8,
+            rn,
+            rt: rd,
+            registers: registers as u8,
+            addressing,
+        }));
+    }
+    // LD1/ST1 (one structure): a full or half-width SIMD register.
+    //
+    // bits 29:24 are `001100`, bits 14:12 are `111`, bit 23 selects the
+    // no-offset vs post-index addressing; bits 21:16 are the `size:opc`
+    // structure field, which must be 0b000000 or 0b011111.
+    if word & 0xbf00_8000 == 0x0c00_0000 && word & 0x0000_7000 == 0x0000_7000 {
+        let bytes = if word & 0x4000_0000 != 0 { 16 } else { 8 };
+        let post_index = word & 0x0080_0000 != 0;
+        let index = (word >> 16) & 0x3f;
+        let addressing = if post_index {
+            if index != 31 {
+                return Err(UnsupportedInstruction);
+            }
+            Addressing::PostIndex(bytes as i64)
+        } else {
+            if index != 0 {
+                return Err(UnsupportedInstruction);
+            }
+            Addressing::Offset(0)
+        };
+        return Ok(SimdMemory(self::SimdMemory {
+            op: if word & 0x0040_0000 != 0 {
+                MemoryOp::Load
+            } else {
+                MemoryOp::Store
+            },
+            bytes: bytes as u8,
+            rn,
+            rt: rd,
+            registers: 1,
+            addressing,
+        }));
+    }
+    if word & 0x3a00_0000 == 0x3800_0000 {
+        let vector = word & 0x0400_0000 != 0;
+        if vector {
+            let opc = (word >> 22) & 3;
+            let size_bits = word >> 30;
+            let (bytes, is_load) = match (size_bits, opc) {
+                (0, 0) => (1, false),
+                (0, 1) => (1, true),
+                (1, 0) => (2, false),
+                (1, 1) => (2, true),
+                (2, 0) => (4, false),
+                (2, 1) => (4, true),
+                (3, 0) => (8, false),
+                (3, 1) => (8, true),
+                (0, 2) => (16, false),
+                (0, 3) => (16, true),
+                _ => return Err(UnsupportedInstruction),
+            };
+            let addressing = if word & 0x0100_0000 != 0 {
+                Addressing::Offset((((word >> 10) & 0xfff) * bytes as u32) as i64)
+            } else if word & 0x0020_0000 != 0 {
+                if word & 0x0000_0c00 != 0x800 {
+                    return Err(UnsupportedInstruction);
+                }
+                let extend = match (word >> 13) & 7 {
+                    2 => Extend::Uxtw,
+                    3 => Extend::Uxtx,
+                    6 => Extend::Sxtw,
+                    7 => Extend::Sxtx,
+                    _ => return Err(UnsupportedInstruction),
+                };
+                Addressing::Register {
+                    rm,
+                    extend,
+                    amount: if word & 0x1000 != 0 {
+                        (bytes as u32).trailing_zeros() as u8
+                    } else {
+                        0
+                    },
+                }
+            } else {
+                let offset = sign_extend(word >> 12, 9);
+                match (word >> 10) & 3 {
+                    0 | 2 => Addressing::Offset(offset),
+                    1 => Addressing::PostIndex(offset),
+                    3 => Addressing::PreIndex(offset),
+                    _ => return Err(UnsupportedInstruction),
+                }
+            };
+            return Ok(SimdMemory(self::SimdMemory {
+                op: if is_load {
+                    MemoryOp::Load
+                } else {
+                    MemoryOp::Store
+                },
+                bytes,
+                rn,
+                rt: rd,
+                registers: 1,
+                addressing,
+            }));
         }
         let opc = (word >> 22) & 3;
         let size = size(word);
@@ -1113,9 +1447,36 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             rd,
         }));
     }
-    if word & 0x3e00_0000 == 0x2800_0000 {
-        if word & 0x0400_0000 != 0 {
-            return Err(UnsupportedInstruction);
+    if word & 0x3a00_0000 == 0x2800_0000 {
+        let vector = word & 0x0400_0000 != 0;
+        let load = word & 0x0040_0000 != 0;
+        let opc = word >> 30;
+        if vector {
+            let bytes = match opc {
+                0 => 4,  // S
+                1 => 8,  // D
+                2 => 16, // Q
+                _ => return Err(UnsupportedInstruction),
+            };
+            let displacement = sign_extend(word >> 15, 7) * bytes as i64;
+            let addressing = match (word >> 23) & 7 {
+                0 | 2 => Addressing::Offset(displacement),
+                3 => Addressing::PreIndex(displacement),
+                1 => Addressing::PostIndex(displacement),
+                _ => return Err(UnsupportedInstruction),
+            };
+            return Ok(SimdPair(self::SimdPair {
+                op: if load {
+                    MemoryOp::Load
+                } else {
+                    MemoryOp::Store
+                },
+                bytes,
+                rn,
+                rt: rd,
+                rt2: reg(word, 10),
+                addressing,
+            }));
         }
         let load = word & 0x0040_0000 != 0;
         let opc = word >> 30;
@@ -1129,7 +1490,7 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
         };
         let displacement = sign_extend(word >> 15, 7) * size as i64;
         let addressing = match (word >> 23) & 7 {
-            2 => Addressing::Offset(displacement),
+            0 | 2 => Addressing::Offset(displacement),
             3 => Addressing::PreIndex(displacement),
             1 => Addressing::PostIndex(displacement),
             _ => return Err(UnsupportedInstruction),
@@ -1152,6 +1513,214 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             },
         }));
     }
+    if word & 0x9f00_0400 == 0x0f00_0400 {
+        let q = (word >> 30) & 1;
+        let op = (word >> 29) & 1;
+        let cmode = (word >> 12) & 0xf;
+        let abc = (word >> 16) & 7;
+        let defgh = (word >> 5) & 0x1f;
+        let imm8 = (abc << 5) | defgh;
+        let rd = (word & 0x1f) as u8;
+
+        let val32: u64 = match cmode {
+            0 | 1 => imm8 as u64,
+            2 | 3 => (imm8 as u64) << 8,
+            4 | 5 => (imm8 as u64) << 16,
+            6 | 7 => (imm8 as u64) << 24,
+            8 | 9 => {
+                let v16 = imm8 as u64;
+                v16 | (v16 << 16)
+            }
+            10 | 11 => {
+                let v16 = (imm8 as u64) << 8;
+                v16 | (v16 << 16)
+            }
+            14 => {
+                let b = imm8 as u64;
+                b | (b << 8) | (b << 16) | (b << 24)
+            }
+            _ => imm8 as u64,
+        };
+
+        let mut val64 = val32 | (val32 << 32);
+        if op == 1 {
+            val64 = !val64;
+        }
+
+        let low = val64;
+        let high = if q == 1 { val64 } else { 0 };
+        return Ok(SimdImm(SimdImmediate { rd, low, high }));
+    }
+    if word & 0xbf3f_fc00 == 0x0e20_9800 {
+        let q = word & 0x4000_0000 != 0;
+        let size = ((word >> 22) & 3) as u8;
+        if !q && size == 3 {
+            return Err(UnsupportedInstruction);
+        }
+        return Ok(SimdCompareZero(self::SimdCompareZero { rd, rn, size, q }));
+    }
+    // FMOV between a general register and an S/D register: a pure bit move.
+    if word & 0x7ebe_fc00 == 0x1e26_0000 {
+        let double64 = word & 0x8000_0000 != 0;
+        let double_type = word & 0x0040_0000 != 0;
+        if double64 != double_type {
+            return Err(UnsupportedInstruction);
+        }
+        return Ok(SimdFmov(self::SimdFmov {
+            rd,
+            rn,
+            to_fp: word & 0x0001_0000 != 0,
+            double: double64,
+        }));
+    }
+    // Integer three-registers-same (`U`, `size`, `opcode` verified with llvm-mc).
+    if word & 0x9f20_0000 == 0x0e20_0000 {
+        use SimdAluOp::*;
+        let q = word & 0x4000_0000 != 0;
+        let u = word & 0x2000_0000 != 0;
+        let size = ((word >> 22) & 3) as u8;
+        if !q && size == 3 {
+            return Err(UnsupportedInstruction);
+        }
+        let opc = ((word >> 11) & 31) as u8;
+        let op = match (u, opc) {
+            (false, 0b10000) => Add,
+            (true, 0b10000) => Sub,
+            (false, 0b10011) => Mul,
+            (false, 0b10010) => Mla,
+            (true, 0b10010) => Mls,
+            (true, 0b10001) => CmEq,
+            (false, 0b00110) => CmGt,
+            (false, 0b00111) => CmGe,
+            (true, 0b00110) => CmHi,
+            (true, 0b00111) => CmHs,
+            (false, 0b10001) => CmTst,
+            (true, 0b01100) => UMax,
+            (true, 0b01101) => UMin,
+            (false, 0b01100) => SMax,
+            (false, 0b01101) => SMin,
+            (true, 0b01110) => UAbd,
+            (false, 0b01110) => SAbd,
+            (false, 0b00001) => SQAdd,
+            (true, 0b00001) => UQAdd,
+            (false, 0b00101) => SQSub,
+            (true, 0b00101) => UQSub,
+            (false, 0b00000) => SHAdd,
+            (true, 0b00000) => UHAdd,
+            (false, 0b00100) => SHSub,
+            (true, 0b00100) => UHSub,
+            (false, 0b00010) => SRHAdd,
+            (true, 0b00010) => URHAdd,
+            (false, 0b01000) => SSHl,
+            (true, 0b01000) => USHl,
+            (false, 0b01001) => SQShl,
+            (true, 0b01001) => UQShl,
+            (false, 0b01011) => SQRShl,
+            (true, 0b01011) => UQRShl,
+            (false, 0b10111) if rm == 0b10001 => AddV,
+            (false, 0b10111) if rm != 0b10001 => AddP,
+            (true, 0b10100) => UMaxP,
+            (false, 0b10100) => SMaxP,
+            (true, 0b10101) => UMinP,
+            (false, 0b10101) => SMinP,
+            (false, 0b10111) if size != 3 => AddP,
+            // The two low opcode bits select AND/BIC/ORR/ORN (and, with U=1,
+            // EOR/BSL/BIT/BIF).
+            (false, 0b00011) if size == 0 => And,
+            (false, 0b00011) if size == 1 => Bic,
+            (false, 0b00011) if size == 2 => Orr,
+            (false, 0b00011) if size == 3 => Orn,
+            (true, 0b00011) if size == 0 => Eor,
+            (true, 0b00011) if size == 1 => Bsl,
+            (true, 0b00011) if size == 2 => Bit,
+            (true, 0b00011) if size == 3 => Bif,
+            _ => return Err(UnsupportedInstruction),
+        };
+        return Ok(SimdAlu(self::SimdAlu {
+            op,
+            rd,
+            rn,
+            rm,
+            size,
+            q,
+        }));
+    }
+    // Table vector lookup: `tbl` and `tbx` over one to four table registers.
+    // Bits 14:13 hold the table length, bit 12 selects tbl/tbx, and bits 11:10
+    // are reserved, so the class mask covers everything else.
+    if word & 0xbf20_8c00 == 0x0e00_0000 {
+        return Ok(SimdTable(self::SimdTable {
+            rd: (word & 0x1f) as u8,
+            rn: ((word >> 5) & 0x1f) as u8,
+            rm: ((word >> 16) & 0x1f) as u8,
+            len: ((word >> 13) & 3) as u8,
+            extend: word & 0x0000_1000 != 0,
+            q: word & 0x4000_0000 != 0,
+        }));
+    }
+    // `mov <Vd>.<T>[index], <R>` and the `umov`/`mov` lane-to-general form.
+    if word & 0xbf80_fc00 == 0x0e00_1c00 || word & 0xbf80_fc00 == 0x0e00_3c00 {
+        let imm5 = (word >> 16) & 0x1f;
+        if imm5 != 0 {
+            let esize = imm5.trailing_zeros() as u8;
+            let index = (imm5 >> (esize + 1)) as u8;
+            let q = word & 0x4000_0000 != 0;
+            if esize <= 3 && (q || esize < 3) {
+                return if word & 0x0000_2000 == 0 {
+                    Ok(SimdInsert(self::SimdInsert {
+                        rd,
+                        rn,
+                        esize,
+                        index,
+                    }))
+                } else {
+                    Ok(SimdExtract(self::SimdExtract {
+                        rd,
+                        rn,
+                        esize,
+                        index,
+                    }))
+                };
+            }
+        }
+    }
+    // `dup` from an element: the imm5 field encodes the element size as the
+    // position of its lowest set bit and the index in the bits above.
+    if word & 0xbf80_fc00 == 0x0e00_0400 {
+        let q = word & 0x4000_0000 != 0;
+        let imm5 = (word >> 16) & 0x1f;
+        if imm5 != 0 {
+            let esize = imm5.trailing_zeros() as u8;
+            if esize <= 3 && (q || esize < 3) {
+                return Ok(SimdDupElement(self::SimdDupElement {
+                    rd,
+                    rn,
+                    esize,
+                    index: (imm5 >> (esize + 1)) as u8,
+                    q,
+                }));
+            }
+        }
+    }
+    if word & 0xbf80_fc00 == 0x0e00_0c00 {
+        let q = (word >> 30) & 1 != 0;
+        let imm5 = (word >> 16) & 0x1f;
+        if imm5 != 0 {
+            let esize = imm5.trailing_zeros() as u8;
+            if esize <= 3 && (q || esize < 3) {
+                let rn = ((word >> 5) & 0x1f) as u8;
+                let rd = (word & 0x1f) as u8;
+                return Ok(SimdDup { rd, rn, esize, q });
+            }
+        }
+    }
+    if word & 0xbef0_fc00 == 0x0ea0_1c00 {
+        let rn = ((word >> 5) & 0x1f) as u8;
+        let rm = ((word >> 16) & 0x1f) as u8;
+        if rn == rm {
+            return Ok(SimdMove { rd, rn });
+        }
+    }
     if word & 0xfc00_0000 == 0x1400_0000 {
         return Ok(B(sign_extend(word, 26) << 2));
     }
@@ -1163,6 +1732,35 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
         return Ok(BCond(BranchCondition {
             cond,
             offset: sign_extend(word >> 5, 19) << 2,
+        }));
+    }
+    if word & 0xbfe0_8400 == 0x2e00_0000 {
+        let rm = ((word >> 16) & 0x1f) as u8;
+        let imm = ((word >> 11) & 0xf) as u8;
+        let rn = ((word >> 5) & 0x1f) as u8;
+        let rd = (word & 0x1f) as u8;
+        return Ok(SimdExt(self::SimdExt { rd, rn, rm, imm }));
+    }
+    if word & 0xbf20_8400 == 0x0e00_0000 {
+        let op = match (word >> 10) & 0x3f {
+            0b000110 => PermuteOp::Uzp1,
+            0b001110 => PermuteOp::Uzp2,
+            0b000101 => PermuteOp::Zip1,
+            0b001101 => PermuteOp::Zip2,
+            0b000111 => PermuteOp::Trn1,
+            0b001111 => PermuteOp::Trn2,
+            _ => return Err(UnsupportedInstruction),
+        };
+        let size = ((word >> 22) & 3) as u8;
+        let rm = ((word >> 16) & 0x1f) as u8;
+        let rn = ((word >> 5) & 0x1f) as u8;
+        let rd = (word & 0x1f) as u8;
+        return Ok(SimdPermute(self::SimdPermute {
+            op,
+            rd,
+            rn,
+            rm,
+            size,
         }));
     }
     if word & 0x7fff_0000 == 0x5ac0_0000 {
@@ -1361,6 +1959,15 @@ mod tests {
                 Addressing::Offset(64),
             ),
             (
+                0xa8300c02,
+                MemoryOp::Store,
+                Size::Double,
+                0,
+                2,
+                3,
+                Addressing::Offset(-256),
+            ),
+            (
                 0x29410861,
                 MemoryOp::Load,
                 Size::Word,
@@ -1383,7 +1990,6 @@ mod tests {
                 }))
             );
         }
-        assert_eq!(decode(0x6d410861), Err(DecodeError::UnsupportedInstruction));
     }
     #[test]
     fn assembler_system_register_vectors() {
@@ -1514,8 +2120,6 @@ mod tests {
             0x5400000e,              // unconditional condition in conditional branch
             0xd61f0001,              // reserved low branch bits
             0x887f7c00,              // pair-exclusive class
-            0x3dc00000,              // SIMD single memory
-            0x6d000000,              // SIMD pair memory
             0xb8c00000,              // reserved signed word to W load
             0xf8620800,              // unsupported index extension
             0x5ac00c00,              // W REV64
@@ -1528,6 +2132,15 @@ mod tests {
                 "{word:08x}"
             );
         }
+    }
+    #[test]
+    fn simd_immediate_zeroes_vector_registers() {
+        let Instruction::SimdImm(simd) = decode(0x4f00041f).unwrap() else {
+            panic!("not a simd immediate")
+        };
+        assert_eq!(simd.rd, 31);
+        assert_eq!(simd.low, 0);
+        assert_eq!(simd.high, 0);
     }
     #[test]
     fn signed_branches_and_address_generation_preserve_negative_offsets() {
@@ -1555,5 +2168,234 @@ mod tests {
                 offset: -16384
             }))
         );
+    }
+    #[test]
+    fn test_decode_stp_q() {
+        let insn = decode(0xad05ffbf).unwrap();
+        let Instruction::SimdPair(pair) = insn else {
+            panic!("expected SimdPair, got {insn:?}");
+        };
+        assert_eq!(pair.bytes, 16);
+        assert_eq!(pair.rt, 31);
+        assert_eq!(pair.rt2, 31);
+        assert_eq!(pair.rn, 29);
+        assert_eq!(pair.op, MemoryOp::Store);
+        assert_eq!(pair.addressing, Addressing::Offset(176));
+    }
+    #[test]
+    fn test_decode_dup_general() {
+        let insn = decode(0x4e010c20).unwrap();
+        let Instruction::SimdDup { rd, rn, esize, q } = insn else {
+            panic!("expected SimdDup, got {insn:?}");
+        };
+        assert_eq!(rd, 0);
+        assert_eq!(rn, 1);
+        assert_eq!(esize, 0);
+        assert!(q);
+    }
+    #[test]
+    fn test_decode_ext() {
+        let insn = decode(0x6e0043bf).unwrap();
+        let Instruction::SimdExt(ext) = insn else {
+            panic!("expected SimdExt, got {insn:?}");
+        };
+        assert_eq!(ext.rd, 31);
+        assert_eq!(ext.rn, 29);
+        assert_eq!(ext.rm, 0);
+        assert_eq!(ext.imm, 8);
+    }
+    #[test]
+    fn decodes_single_structure_simd_memory() {
+        assert_eq!(
+            decode(0x4c407020),
+            Ok(Instruction::SimdMemory(SimdMemory {
+                op: MemoryOp::Load,
+                bytes: 16,
+                rn: 1,
+                rt: 0,
+                registers: 1,
+                addressing: Addressing::Offset(0),
+            }))
+        );
+        assert_eq!(
+            decode(0x4c9f7020),
+            Ok(Instruction::SimdMemory(SimdMemory {
+                op: MemoryOp::Store,
+                bytes: 16,
+                rn: 1,
+                rt: 0,
+                registers: 1,
+                addressing: Addressing::PostIndex(16),
+            }))
+        );
+    }
+    #[test]
+    fn decodes_simd_compare_zero() {
+        assert_eq!(
+            decode(0x4e209801),
+            Ok(Instruction::SimdCompareZero(SimdCompareZero {
+                rd: 1,
+                rn: 0,
+                size: 0,
+                q: true,
+            }))
+        );
+        // Half-width form zeroes the upper doubleword at runtime.
+        assert_eq!(
+            decode(0x0e209801),
+            Ok(Instruction::SimdCompareZero(SimdCompareZero {
+                rd: 1,
+                rn: 0,
+                size: 0,
+                q: false,
+            }))
+        );
+    }
+    #[test]
+    fn decodes_simd_fmov() {
+        // fmov x2, d2 / fmov d2, x2 / fmov w2, s1 / fmov s1, w2.
+        assert_eq!(
+            decode(0x9e660042),
+            Ok(Instruction::SimdFmov(SimdFmov {
+                rd: 2,
+                rn: 2,
+                to_fp: false,
+                double: true
+            }))
+        );
+        assert_eq!(
+            decode(0x9e670042),
+            Ok(Instruction::SimdFmov(SimdFmov {
+                rd: 2,
+                rn: 2,
+                to_fp: true,
+                double: true
+            }))
+        );
+        assert_eq!(
+            decode(0x1e260022),
+            Ok(Instruction::SimdFmov(SimdFmov {
+                rd: 2,
+                rn: 1,
+                to_fp: false,
+                double: false
+            }))
+        );
+        assert_eq!(
+            decode(0x1e270041),
+            Ok(Instruction::SimdFmov(SimdFmov {
+                rd: 1,
+                rn: 2,
+                to_fp: true,
+                double: false
+            }))
+        );
+    }
+    #[test]
+    fn decodes_table_vector_lookup() {
+        assert_eq!(
+            decode(0x4e020020),
+            Ok(Instruction::SimdTable(SimdTable {
+                rd: 0,
+                rn: 1,
+                rm: 2,
+                len: 0,
+                extend: false,
+                q: true,
+            }))
+        );
+        assert_eq!(
+            decode(0x4e032020),
+            Ok(Instruction::SimdTable(SimdTable {
+                rd: 0,
+                rn: 1,
+                rm: 3,
+                len: 1,
+                extend: false,
+                q: true,
+            }))
+        );
+        assert_eq!(
+            decode(0x4e021020),
+            Ok(Instruction::SimdTable(SimdTable {
+                rd: 0,
+                rn: 1,
+                rm: 2,
+                len: 0,
+                extend: true,
+                q: true,
+            }))
+        );
+        assert_eq!(
+            decode(0x0e020020),
+            Ok(Instruction::SimdTable(SimdTable {
+                rd: 0,
+                rn: 1,
+                rm: 2,
+                len: 0,
+                extend: false,
+                q: false,
+            }))
+        );
+    }
+    #[test]
+    fn decodes_integer_three_same_vectors() {
+        use SimdAluOp::*;
+        // Encodings below are `llvm-mc` output for v0/v1/v2 `.16b` forms.
+        let cases: [(u32, SimdAluOp); 41] = [
+            (0x4e228420, Add),
+            (0x6e228420, Sub),
+            (0x4e221c20, And),
+            (0x4ea21c20, Orr),
+            (0x6e221c20, Eor),
+            (0x6e228c20, CmEq),
+            (0x4e223420, CmGt),
+            (0x4e223c20, CmGe),
+            (0x6e223420, CmHi),
+            (0x6e223c20, CmHs),
+            (0x4e228c20, CmTst),
+            (0x6e226c20, UMin),
+            (0x6e226420, UMax),
+            (0x4e226c20, SMin),
+            (0x4e226420, SMax),
+            (0x6e227420, UAbd),
+            (0x4e227420, SAbd),
+            (0x4e229c20, Mul),
+            (0x4e229420, Mla),
+            (0x6e229420, Mls),
+            (0x4e220c20, SQAdd),
+            (0x6e220c20, UQAdd),
+            (0x4e222c20, SQSub),
+            (0x6e222c20, UQSub),
+            (0x4e220420, SHAdd),
+            (0x6e220420, UHAdd),
+            (0x4e224420, SSHl),
+            (0x6e224420, USHl),
+            (0x4e621c20, Bic),
+            (0x4ee21c20, Orn),
+            (0x4e222420, SHSub),
+            (0x6e222420, UHSub),
+            (0x4e221420, SRHAdd),
+            (0x6e221420, URHAdd),
+            (0x4e224c20, SQShl),
+            (0x6e224c20, UQShl),
+            (0x4e225c20, SQRShl),
+            (0x6e225c20, UQRShl),
+            (0x4e31b820, AddV),
+            (0x4e71b820, AddV),
+            (0x4eb1b820, AddV),
+        ];
+        for (word, op) in cases {
+            let decoded = decode(word).unwrap_or_else(|e| panic!("{word:08x}: {e:?}"));
+            let Instruction::SimdAlu(alu) = decoded else {
+                panic!("{word:08x}: not a vector ALU op: {decoded:?}");
+            };
+            assert_eq!(alu.op, op, "{word:08x}");
+            assert_eq!((alu.rn, alu.rd), (1, 0), "{word:08x}");
+            assert!(alu.q, "{word:08x}");
+            if op != AddV {
+                assert_eq!(alu.rm, 2, "{word:08x}");
+            }
+        }
     }
 }

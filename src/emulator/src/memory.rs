@@ -38,6 +38,11 @@ pub trait GuestMemory {
     fn host_page(&self, _page: u64) -> Option<*mut u8> {
         None
     }
+    /// A handle for reading RAM from worker threads, if this memory can offer
+    /// one. Enables background compilation.
+    fn code_reader(&self) -> Option<Arc<dyn crate::aarch64::ahead::CodeReader>> {
+        None
+    }
 }
 
 const PAGE_SHIFT: u32 = 12;
@@ -352,6 +357,23 @@ impl GuestMemory for SharedMemory {
     }
     fn host_page(&self, page: u64) -> Option<*mut u8> {
         self.host_range(page, 1 << PAGE_SHIFT)
+    }
+    fn code_reader(&self) -> Option<Arc<dyn crate::aarch64::ahead::CodeReader>> {
+        Some(Arc::new(self.clone()))
+    }
+}
+
+#[cfg(feature = "system")]
+impl crate::aarch64::ahead::CodeReader for SharedMemory {
+    fn read(&self, physical: u64, out: &mut [u8]) -> bool {
+        match self.host_range(physical, out.len()) {
+            Some(host) => {
+                // SAFETY: in bounds of a live RAM region; `out` is a distinct buffer.
+                unsafe { core::ptr::copy_nonoverlapping(host, out.as_mut_ptr(), out.len()) };
+                true
+            }
+            None => false,
+        }
     }
 }
 

@@ -39,5 +39,5 @@ opt-level = 3
 
 [profile.release]
 lto = "thin"
-opt-level = "s"
+opt-level = 3
 strip = true
