@@ -26,6 +26,13 @@ pub trait DeviceIo {
     fn write_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64);
     fn read_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64;
     fn write_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64);
+    fn read_virtio(&mut self, offset: u64, size: u8) -> u64 {
+        let _ = (offset, size);
+        0
+    }
+    fn write_virtio(&mut self, offset: u64, size: u8, value: u64) {
+        let _ = (offset, size, value);
+    }
 }
 
 impl DeviceIo for (&mut Pl011, &mut Gicv2) {
@@ -706,6 +713,13 @@ impl<M: GuestMemory> Machine<M> {
                             width,
                             value,
                         );
+                        None
+                    }
+                } else if window(fdt::VIRTIO_MMIO_BASE, fdt::VIRTIO_MMIO_SIZE) {
+                    if load {
+                        Some(devices.read_virtio(physical - fdt::VIRTIO_MMIO_BASE, width))
+                    } else {
+                        devices.write_virtio(physical - fdt::VIRTIO_MMIO_BASE, width, value);
                         None
                     }
                 } else {

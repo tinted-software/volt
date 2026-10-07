@@ -3,12 +3,10 @@ use super::{
     cpu::Cpu,
     decode::decode,
 };
+use core::hash::{Hash, Hasher};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::{
-    Arc, Mutex, MutexGuard, PoisonError,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 const MAX_INSNS: usize = 64;
 const DIRECT_SLOTS: usize = 4096;
@@ -435,7 +433,7 @@ mod tests {
         words(&mut source.memory, 0x1000, &[NOP, NOP, SVC]);
         let mut cache = Cache::new();
         let mut cpu = Cpu::default();
-        let mut run = |cache: &mut Cache, cpu: &mut Cpu, source: &mut Ram<_>| {
+        let run = |cache: &mut Cache, cpu: &mut Cpu, source: &mut Ram<_>| {
             cpu.pc = 0x1000;
             source.fetches = 0;
             cache.run_block_with(cpu, source).unwrap();

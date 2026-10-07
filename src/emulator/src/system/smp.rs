@@ -105,20 +105,38 @@ impl Default for VcpuControl {
     }
 }
 
-#[derive(Clone)]
-pub struct SharedDevices {
+pub struct SharedDevices<V = ()> {
     pub serial: Arc<Mutex<Pl011>>,
     pub gic: Arc<Mutex<Gicv2>>,
+    pub virtio: Option<Arc<Mutex<V>>>,
     pub exclusive: Arc<GlobalExclusiveMonitor>,
     /// Translated blocks shared by every vCPU.
     pub blocks: Arc<crate::aarch64::cache::SharedBlocks>,
     pub controls: Vec<Arc<VcpuControl>>,
     pub uart_line: Arc<AtomicBool>,
+    pub virtio_line: Arc<AtomicBool>,
     pub shutdown_reason: Arc<Mutex<Option<StopReason>>>,
     pub shutdown_cond: Arc<Condvar>,
 }
 
-impl SharedDevices {
+impl<V> Clone for SharedDevices<V> {
+    fn clone(&self) -> Self {
+        Self {
+            serial: self.serial.clone(),
+            gic: self.gic.clone(),
+            virtio: self.virtio.clone(),
+            exclusive: self.exclusive.clone(),
+            blocks: self.blocks.clone(),
+            controls: self.controls.clone(),
+            uart_line: self.uart_line.clone(),
+            virtio_line: self.virtio_line.clone(),
+            shutdown_reason: self.shutdown_reason.clone(),
+            shutdown_cond: self.shutdown_cond.clone(),
+        }
+    }
+}
+
+impl<V> SharedDevices<V> {
     pub fn is_shutdown(&self) -> bool {
         self.shutdown_reason.lock().is_some()
     }
@@ -145,7 +163,46 @@ impl SharedDevices {
     }
 }
 
-impl DeviceIo for SharedDevices {
+impl<V: crate::devices::VirtioIo> DeviceIo for SharedDevices<V> {
+    fn read_uart(&mut self, offset: u64, size: u8) -> u64 {
+        self.serial.lock().read(offset, size)
+    }
+    fn write_uart(&mut self, offset: u64, size: u8, value: u64) {
+        self.serial.lock().write(offset, size, value);
+    }
+    fn read_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64 {
+        self.gic.lock().read_distributor_for(cpu_id, offset, size)
+    }
+    fn write_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64) {
+        let targets = self
+            .gic
+            .lock()
+            .write_distributor_for(cpu_id, offset, size, value);
+        if targets != 0 {
+            self.kick_targets(targets);
+        }
+    }
+    fn read_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64 {
+        self.gic.lock().read_cpu_for(cpu_id, offset, size)
+    }
+    fn write_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64) {
+        self.gic.lock().write_cpu_for(cpu_id, offset, size, value);
+    }
+    fn read_virtio(&mut self, offset: u64, size: u8) -> u64 {
+        if let Some(v) = &self.virtio {
+            v.lock().read(offset, size)
+        } else {
+            0
+        }
+    }
+    fn write_virtio(&mut self, offset: u64, size: u8, value: u64) {
+        if let Some(v) = &self.virtio {
+            v.lock().write(offset, size, value);
+        }
+    }
+}
+
+impl DeviceIo for SharedDevices<()> {
     fn read_uart(&mut self, offset: u64, size: u8) -> u64 {
         self.serial.lock().read(offset, size)
     }
@@ -173,20 +230,26 @@ impl DeviceIo for SharedDevices {
 }
 
 #[derive(Debug, Clone)]
-pub struct SmpConfig {
+pub struct SmpConfig<B = Vec<u8>> {
     pub cpus: u32,
     pub timeout: Duration,
     pub cmdline: String,
     pub idle_mode: IdleMode,
+    pub ram_size: usize,
+    pub initrd: Option<Vec<u8>>,
+    pub disk: Option<B>,
 }
 
-impl Default for SmpConfig {
+impl<B> Default for SmpConfig<B> {
     fn default() -> Self {
         Self {
             cpus: 2,
             timeout: Duration::from_secs(20),
             cmdline: super::DEFAULT_CMDLINE.into(),
             idle_mode: IdleMode::default(),
+            ram_size: super::RAM_SIZE,
+            initrd: None,
+            disk: None,
         }
     }
 }
@@ -232,26 +295,33 @@ impl fmt::Display for SmpReport {
 }
 
 /// Boot a Linux Image in multi-threaded SMP mode (MTTCG).
-pub fn boot_smp(
+pub fn boot_smp<B: crate::devices::BlockBackend + 'static>(
     image: &[u8],
-    config: SmpConfig,
+    config: SmpConfig<B>,
     mut sink: impl FnMut(u8) + Send + 'static,
 ) -> Result<SmpReport, Error> {
     let cpu_count = config.cpus.clamp(1, gicv2::MAX_CPUS as u32);
-    let region = Region::ram(RAM_BASE, vec![0; RAM_SIZE]).map_err(Error::Memory)?;
+    let ram_size = if config.ram_size > 0 {
+        config.ram_size
+    } else {
+        RAM_SIZE
+    };
+    let region = Region::ram(RAM_BASE, vec![0; ram_size]).map_err(Error::Memory)?;
     let memory = PhysicalMemory::new(vec![region]).map_err(Error::Memory)?;
     let mut shared_mem = SharedMemory::new(memory);
 
-    let layout = boot::prepare_smp(
+    let has_virtio = config.disk.is_some();
+    let layout = boot::prepare_boot(
         &mut shared_mem,
         image,
+        config.initrd.as_deref(),
         &config.cmdline,
         RAM_BASE,
-        RAM_SIZE as u64,
+        ram_size as u64,
         cpu_count,
+        has_virtio,
     )
     .map_err(Error::Boot)?;
-
     let console = Arc::new(Mutex::new(Vec::new()));
     let console_sink = console.clone();
     let uart_line = Arc::new(AtomicBool::new(false));
@@ -275,13 +345,24 @@ pub fn boot_smp(
     // CPU 0 starts in Running state
     *controls[0].state.lock() = VcpuState::Running;
 
+    let virtio_line = Arc::new(AtomicBool::new(false));
+    let virtio_notify = virtio_line.clone();
+    let virtio = config.disk.map(|backend| {
+        Arc::new(Mutex::new(
+            crate::devices::VirtioBlock::new(backend, shared_mem.clone())
+                .with_line(move |level| virtio_notify.store(level, Ordering::Release)),
+        ))
+    });
+
     let devices = SharedDevices {
         serial: Arc::new(Mutex::new(serial)),
         gic: Arc::new(Mutex::new(gic)),
+        virtio,
         exclusive: Arc::new(GlobalExclusiveMonitor::default()),
         blocks: Arc::new(crate::aarch64::cache::SharedBlocks::new(true)),
         controls: controls.clone(),
         uart_line,
+        virtio_line,
         shutdown_reason: Arc::new(Mutex::new(None)),
         shutdown_cond: Arc::new(Condvar::new()),
     };
@@ -368,11 +449,11 @@ pub fn boot_smp(
     })
 }
 
-fn vcpu_worker_thread(
+fn vcpu_worker_thread<V: crate::devices::VirtioIo + Send + 'static>(
     cpu_id: u32,
     memory: SharedMemory,
     control: Arc<VcpuControl>,
-    devices: SharedDevices,
+    devices: SharedDevices<V>,
     timeout: Duration,
     started: Instant,
     idle_mode: IdleMode,
@@ -414,6 +495,11 @@ fn vcpu_worker_thread(
                 devices.gic.lock().raise(fdt::UART_INTID);
             } else {
                 devices.gic.lock().lower(fdt::UART_INTID);
+            }
+            if devices.virtio_line.load(Ordering::Acquire) {
+                devices.gic.lock().raise(fdt::VIRTIO_INTID);
+            } else {
+                devices.gic.lock().lower(fdt::VIRTIO_INTID);
             }
         }
 
@@ -610,11 +696,12 @@ mod tests {
         let length = image.len() as u64;
         image[16..24].copy_from_slice(&length.to_le_bytes());
 
-        let config = SmpConfig {
+        let config = SmpConfig::<Vec<u8>> {
             cpus: 2,
             timeout: Duration::from_secs(5),
             cmdline: super::super::DEFAULT_CMDLINE.into(),
             idle_mode: IdleMode::FastForward,
+            ..Default::default()
         };
 
         let report = boot_smp(&image, config, |_| {}).unwrap();
@@ -670,13 +757,13 @@ mod tests {
         let length = image.len() as u64;
         image[16..24].copy_from_slice(&length.to_le_bytes());
 
-        let config = SmpConfig {
+        let config = SmpConfig::<Vec<u8>> {
             cpus: 2,
             timeout: Duration::from_secs(5),
             cmdline: super::super::DEFAULT_CMDLINE.into(),
             idle_mode: IdleMode::Paced,
+            ..Default::default()
         };
-
         let report = boot_smp(&image, config, |_| {}).unwrap();
         assert_eq!(report.reason, StopReason::Shutdown, "{report}");
         assert_eq!(report.console, b"B");

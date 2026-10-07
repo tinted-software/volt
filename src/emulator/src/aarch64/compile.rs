@@ -3,7 +3,7 @@ use super::{
     decode::*,
 };
 use crate::memory::MemoryError;
-use std::{
+use core::{
     cell::{Cell, RefCell},
     fmt,
     mem::offset_of,
@@ -41,7 +41,7 @@ impl fmt::Display for Error {
         }
     }
 }
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 impl From<MemoryError> for Error {
     fn from(e: MemoryError) -> Self {
         Self::Memory(e)
@@ -1242,6 +1242,11 @@ fn lower_system(l: &Lower, a: System) {
                 2,
             ),
         ),
+        RazWi => {
+            if a.read {
+                l.put(a.rt, l.k(l.u64, 0));
+            }
+        }
         DaifSet | DaifClear => {
             let p = at + offset_of!(CpuSystem, daif);
             let before = l.load(l.u64, p);

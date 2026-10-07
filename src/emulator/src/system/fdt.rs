@@ -7,6 +7,9 @@ pub const UART_BASE: u64 = 0x0900_0000;
 pub const UART_INTID: u32 = 33;
 pub const VIRTUAL_TIMER_INTID: u32 = 27;
 pub const TIMER_FREQ: u64 = 24_000_000;
+pub const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
+pub const VIRTIO_MMIO_SIZE: u64 = 0x200;
+pub const VIRTIO_INTID: u32 = 48; // SPI 16 -> GIC INTID 32 + 16 = 48
 
 struct Builder {
     structure: Vec<u8>,
@@ -104,10 +107,17 @@ fn range(address: u64, size: u64) -> [u32; 4] {
 }
 
 pub fn build(ram_base: u64, ram_size: u64, cmdline: &str) -> Vec<u8> {
-    build_smp(ram_base, ram_size, cmdline, 1)
+    build_smp(ram_base, ram_size, cmdline, 1, None, false)
 }
 
-pub fn build_smp(ram_base: u64, ram_size: u64, cmdline: &str, cpus: u32) -> Vec<u8> {
+pub fn build_smp(
+    ram_base: u64,
+    ram_size: u64,
+    cmdline: &str,
+    cpus: u32,
+    initrd: Option<(u64, u64)>,
+    has_virtio: bool,
+) -> Vec<u8> {
     let mut b = Builder::new();
     b.begin("");
     b.cells("#address-cells", &[2]);
@@ -118,6 +128,10 @@ pub fn build_smp(ram_base: u64, ram_size: u64, cmdline: &str, cpus: u32) -> Vec<
     b.begin("chosen");
     b.string("bootargs", cmdline);
     b.string("stdout-path", "/pl011@9000000");
+    if let Some((start, end)) = initrd {
+        b.cells("linux,initrd-start", &[(start >> 32) as u32, start as u32]);
+        b.cells("linux,initrd-end", &[(end >> 32) as u32, end as u32]);
+    }
     b.end();
     b.begin(&format!("memory@{ram_base:x}"));
     b.string("device_type", "memory");
@@ -165,6 +179,13 @@ pub fn build_smp(ram_base: u64, ram_size: u64, cmdline: &str, cpus: u32) -> Vec<
     b.cells("clocks", &[1, 1]);
     b.string("clock-names", "uartclk\0apb_pclk");
     b.end();
+    if has_virtio {
+        b.begin("virtio@a000000");
+        b.string("compatible", "virtio,mmio");
+        b.cells("reg", &range(VIRTIO_MMIO_BASE, VIRTIO_MMIO_SIZE));
+        b.cells("interrupts", &[0, 16, 4]); // SPI 16, level high
+        b.end();
+    }
     b.begin("apb-pclk");
     b.string("compatible", "fixed-clock");
     b.cells("#clock-cells", &[0]);
@@ -189,5 +210,19 @@ mod tests {
         assert_eq!(word(12), word(8) + word(36));
         assert_eq!(word(word(12) - 4), 9);
         assert!(tree.windows(19).any(|part| part == b"arm,cortex-a15-gic\0"));
+    }
+    #[test]
+    fn fdt_includes_initrd_properties_when_provided() {
+        let tree = build_smp(
+            0x40000000,
+            128 << 20,
+            "console=ttyAMA0",
+            1,
+            Some((0x42000000, 0x42100000)),
+            true,
+        );
+        assert!(tree.windows(19).any(|part| part == b"linux,initrd-start\0"));
+        assert!(tree.windows(17).any(|part| part == b"linux,initrd-end\0"));
+        assert!(tree.windows(12).any(|part| part == b"virtio,mmio\0"));
     }
 }

@@ -79,10 +79,11 @@ pub fn load_address(ram_base: u64, header: Header) -> Result<u64, Error> {
         .checked_add(header.text_offset)
         .ok_or(Error::NoRoom)
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
     pub entry: u64,
     pub device_tree: u64,
+    pub initrd: Option<(u64, u64)>,
 }
 pub fn prepare(
     memory: &mut impl GuestMemory,
@@ -91,7 +92,7 @@ pub fn prepare(
     ram_base: u64,
     ram_size: u64,
 ) -> Result<Layout, Error> {
-    prepare_smp(memory, image, cmdline, ram_base, ram_size, 1)
+    prepare_boot(memory, image, None, cmdline, ram_base, ram_size, 1, false)
 }
 
 pub fn prepare_smp(
@@ -102,12 +103,39 @@ pub fn prepare_smp(
     ram_size: u64,
     cpus: u32,
 ) -> Result<Layout, Error> {
+    prepare_boot(
+        memory, image, None, cmdline, ram_base, ram_size, cpus, false,
+    )
+}
+
+pub fn prepare_boot(
+    memory: &mut impl GuestMemory,
+    image: &[u8],
+    initrd: Option<&[u8]>,
+    cmdline: &str,
+    ram_base: u64,
+    ram_size: u64,
+    cpus: u32,
+    has_virtio: bool,
+) -> Result<Layout, Error> {
     let header = parse(image)?;
     let entry = load_address(ram_base, header)?;
     let occupied = header.image_size.max(image.len() as u64);
-    let above = entry.checked_add(occupied).ok_or(Error::NoRoom)?;
+    let mut above = entry.checked_add(occupied).ok_or(Error::NoRoom)?;
+
+    let initrd_info = if let Some(initrd_data) = initrd {
+        let start = align(above)?;
+        let end = start
+            .checked_add(initrd_data.len() as u64)
+            .ok_or(Error::NoRoom)?;
+        above = end;
+        Some((start, end))
+    } else {
+        None
+    };
+
     let device_tree = align(above)?;
-    let tree = super::fdt::build_smp(ram_base, ram_size, cmdline, cpus);
+    let tree = super::fdt::build_smp(ram_base, ram_size, cmdline, cpus, initrd_info, has_virtio);
     let end = ram_base.checked_add(ram_size).ok_or(Error::NoRoom)?;
     if above > end
         || device_tree
@@ -118,8 +146,15 @@ pub fn prepare_smp(
         return Err(Error::NoRoom);
     }
     memory.write(entry, image).map_err(Error::Memory)?;
+    if let (Some(initrd_data), Some((start, _))) = (initrd, initrd_info) {
+        memory.write(start, initrd_data).map_err(Error::Memory)?;
+    }
     memory.write(device_tree, &tree).map_err(Error::Memory)?;
-    Ok(Layout { entry, device_tree })
+    Ok(Layout {
+        entry,
+        device_tree,
+        initrd: initrd_info,
+    })
 }
 
 #[cfg(test)]
@@ -137,5 +172,41 @@ mod tests {
         assert_eq!(load_address(0x40001000, parsed).unwrap(), 0x40200000);
         assert!(parsed.place_anywhere());
         assert!(matches!(parse(&header[..32]), Err(Error::TooSmall)));
+    }
+    #[test]
+    fn prepare_boot_places_initrd_correctly() {
+        use crate::memory::{PhysicalMemory, Region};
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(&MAGIC.to_le_bytes()); // magic ARM\x64
+        header[16..24].copy_from_slice(&0x200000u64.to_le_bytes()); // image_size 2MiB
+        header[56..60].copy_from_slice(&MAGIC.to_le_bytes());
+
+        let ram_base = 0x4000_0000;
+        let ram_size = 32 << 20;
+        let region = Region::ram(ram_base, vec![0; ram_size as usize]).unwrap();
+        let mut mem = PhysicalMemory::new(vec![region]).unwrap();
+        let initrd_data = b"mock cpio payload";
+
+        let layout = prepare_boot(
+            &mut mem,
+            &header,
+            Some(initrd_data),
+            "console=ttyAMA0",
+            ram_base,
+            ram_size,
+            1,
+            false,
+        )
+        .unwrap();
+
+        assert!(layout.initrd.is_some());
+        let (initrd_start, initrd_end) = layout.initrd.unwrap();
+        assert!(initrd_start >= layout.entry + 0x200000);
+        assert_eq!(initrd_end, initrd_start + initrd_data.len() as u64);
+        assert!(layout.device_tree >= initrd_end);
+
+        let mut read_back = vec![0u8; initrd_data.len()];
+        mem.read(initrd_start, &mut read_back).unwrap();
+        assert_eq!(&read_back, initrd_data);
     }
 }
