@@ -63,7 +63,15 @@ pub struct JittedFunction {
     address: NonNull<u8>,
     mapped_len: usize,
     code_len: usize,
+    /// Set when the code lives in a shared arena chunk, which owns the mapping.
+    chunk: Option<std::sync::Arc<arena::Chunk>>,
 }
+
+// SAFETY: the code is immutable after construction (the writable view of an
+// arena chunk is never exposed) and the mapping lives as long as the value, so
+// it can be shared and run from any thread.
+unsafe impl Send for JittedFunction {}
+unsafe impl Sync for JittedFunction {}
 
 impl JittedFunction {
     pub fn code(&self) -> &[u8] {
@@ -103,6 +111,9 @@ impl JittedFunction {
 
 impl Drop for JittedFunction {
     fn drop(&mut self) {
+        if self.chunk.is_some() {
+            return;
+        }
         #[cfg(target_os = "linux")]
         // SAFETY: these are exactly the mmap address and length owned by self.
         unsafe {
@@ -117,6 +128,10 @@ pub fn map_code(code: impl AsRef<[u8]>) -> Result<JittedFunction, Error> {
     let code = code.as_ref();
     if code.is_empty() {
         return Err(Error::EmptyCode);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(image) = arena::place(code) {
+        return Ok(image);
     }
     #[cfg(target_os = "linux")]
     {
@@ -142,6 +157,7 @@ pub fn map_code(code: impl AsRef<[u8]>) -> Result<JittedFunction, Error> {
             address,
             mapped_len,
             code_len: code.len(),
+            chunk: None,
         };
         // SAFETY: new mapping is writable and at least code.len() bytes long.
         unsafe {
@@ -216,4 +232,130 @@ fn sync_icache(code: &[u8]) {
     }
     #[cfg(not(target_arch = "aarch64"))]
     let _ = code;
+}
+
+/// Shared executable arena. Small functions are bump-allocated from large
+/// chunks so each one costs a memcpy instead of mmap + mprotect + munmap.
+///
+/// W^X is preserved: a chunk is a memfd mapped twice, once read/write (never
+/// executable) and once read/execute (never writable).
+#[cfg(target_os = "linux")]
+mod arena {
+    use super::{JittedFunction, NonNull, sync_icache};
+    use std::sync::{Arc, Mutex};
+
+    const CHUNK: usize = 1 << 20;
+    const ALIGN: usize = 16;
+
+    pub struct Chunk {
+        rw: *mut u8,
+        rx: *mut u8,
+        len: usize,
+    }
+    // SAFETY: the pointers name process-wide mappings that live as long as the
+    // chunk. Writes only go to disjoint, not-yet-published byte ranges.
+    unsafe impl Send for Chunk {}
+    unsafe impl Sync for Chunk {}
+
+    impl Drop for Chunk {
+        fn drop(&mut self) {
+            // SAFETY: exact addresses and length returned by mmap in `Chunk::new`.
+            unsafe {
+                libc::munmap(self.rw.cast(), self.len);
+                libc::munmap(self.rx.cast(), self.len);
+            }
+        }
+    }
+
+    impl Chunk {
+        fn new() -> Option<Self> {
+            // SAFETY: plain syscalls; every failure path releases what it made.
+            unsafe {
+                let fd = libc::memfd_create(c"volt-jit".as_ptr(), libc::MFD_CLOEXEC);
+                if fd < 0 {
+                    return None;
+                }
+                let sized = libc::ftruncate(fd, CHUNK as libc::off_t) == 0;
+                let rw = if sized {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        CHUNK,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        fd,
+                        0,
+                    )
+                } else {
+                    libc::MAP_FAILED
+                };
+                let rx = if rw != libc::MAP_FAILED {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        CHUNK,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                        libc::MAP_SHARED,
+                        fd,
+                        0,
+                    )
+                } else {
+                    libc::MAP_FAILED
+                };
+                libc::close(fd);
+                if rx == libc::MAP_FAILED {
+                    if rw != libc::MAP_FAILED {
+                        libc::munmap(rw, CHUNK);
+                    }
+                    return None;
+                }
+                Some(Self {
+                    rw: rw.cast(),
+                    rx: rx.cast(),
+                    len: CHUNK,
+                })
+            }
+        }
+    }
+
+    struct Current {
+        chunk: Arc<Chunk>,
+        used: usize,
+    }
+
+    static CURRENT: Mutex<Option<Current>> = Mutex::new(None);
+
+    /// Copy `code` into the arena. `None` means the caller should fall back to
+    /// a dedicated mapping (oversized code or the host refused memfd/mmap).
+    pub fn place(code: &[u8]) -> Option<JittedFunction> {
+        if code.len() > CHUNK / 4 {
+            return None;
+        }
+        let mut guard = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+        let fits = |c: &Current| c.used + code.len() <= c.chunk.len;
+        if !guard.as_ref().is_some_and(fits) {
+            *guard = Some(Current {
+                chunk: Arc::new(Chunk::new()?),
+                used: 0,
+            });
+        }
+        let current = guard.as_mut()?;
+        let offset = current.used;
+        current.used = (offset + code.len()).next_multiple_of(ALIGN);
+        let chunk = current.chunk.clone();
+        drop(guard);
+        // SAFETY: [offset, offset + len) lies inside the chunk and was reserved
+        // exclusively for this call under the lock.
+        let (rx, address) = unsafe {
+            core::ptr::copy_nonoverlapping(code.as_ptr(), chunk.rw.add(offset), code.len());
+            let rx = chunk.rx.add(offset);
+            (rx, NonNull::new(rx)?)
+        };
+        // SAFETY: the executable view is live and covers the bytes just written.
+        sync_icache(unsafe { core::slice::from_raw_parts(rx, code.len()) });
+        Some(JittedFunction {
+            address,
+            mapped_len: code.len(),
+            code_len: code.len(),
+            chunk: Some(chunk),
+        })
+    }
 }

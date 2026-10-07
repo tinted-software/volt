@@ -56,8 +56,8 @@ const KEPT: [u64; 5] = [IBRD, FBRD, LCR_H, CR, IFLS];
 /// port with nowhere to report is still usable by a driver that polls, which
 /// is what an early console does.
 pub struct Pl011 {
-    sink: Box<dyn FnMut(u8)>,
-    line: Option<Box<dyn FnMut(bool)>>,
+    sink: Box<dyn FnMut(u8) + Send>,
+    line: Option<Box<dyn FnMut(bool) + Send>>,
     imsc: u32,
     /// What was written to each of [`KEPT`], in the same order.
     held: [u32; KEPT.len()],
@@ -65,7 +65,7 @@ pub struct Pl011 {
 
 impl Pl011 {
     /// A port writing bytes to `sink`, with no interrupt line (polling only).
-    pub fn new(sink: impl FnMut(u8) + 'static) -> Self {
+    pub fn new(sink: impl FnMut(u8) + Send + 'static) -> Self {
         Self {
             sink: Box::new(sink),
             line: None,
@@ -75,11 +75,10 @@ impl Pl011 {
     }
 
     /// Attach an interrupt line reporting raise/release of the masked status.
-    pub fn with_line(mut self, line: impl FnMut(bool) + 'static) -> Self {
+    pub fn with_line(mut self, line: impl FnMut(bool) + Send + 'static) -> Self {
         self.line = Some(Box::new(line));
         self
     }
-
     /// The raw status. Room to transmit is the only thing ever reported.
     fn status(&self) -> u32 {
         INTERRUPT_TX
@@ -150,16 +149,26 @@ mod tests {
 
     const BASE: u64 = 0x0900_0000;
 
+    #[derive(Clone, Copy)]
+    struct SendPtr(*mut Vec<u8>);
+    unsafe impl Send for SendPtr {}
+    impl SendPtr {
+        unsafe fn push(&self, byte: u8) {
+            unsafe { (*self.0).push(byte) }
+        }
+    }
+
     fn bus_with_sink(buffer: &mut Vec<u8>) -> (Bus, *mut Vec<u8>) {
         // The port owns the sink closure; hand the test a raw pointer to the
         // buffer it pushes into. Single-threaded tests only.
-        let ptr: *mut Vec<u8> = buffer;
+        let ptr = SendPtr(buffer);
+        let raw = ptr.0;
         let uart = Pl011::new(move |byte| unsafe {
-            (*ptr).push(byte);
+            ptr.push(byte);
         });
         let mut bus = Bus::new();
         bus.attach(BusDevice::new(BASE, LEN, uart));
-        (bus, ptr)
+        (bus, raw)
     }
 
     #[test]
@@ -239,19 +248,19 @@ mod tests {
     #[test]
     fn asking_for_the_transmit_interrupt_raises_and_releases_the_line() {
         let mut buffer = Vec::new();
-        let raised = alloc::rc::Rc::new(core::cell::Cell::new(false));
+        let raised = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let flag = raised.clone();
-        let ptr: *mut Vec<u8> = &mut buffer;
+        let ptr = SendPtr(&mut buffer);
         let uart = Pl011::new(move |byte| unsafe {
-            (*ptr).push(byte);
+            ptr.push(byte);
         })
-        .with_line(move |level| flag.set(level));
+        .with_line(move |level| flag.store(level, core::sync::atomic::Ordering::Release));
         let mut bus = Bus::new();
         bus.attach(BusDevice::new(BASE, LEN, uart));
-        assert!(!raised.get());
+        assert!(!raised.load(core::sync::atomic::Ordering::Acquire));
         bus.write(BASE + 0x038, 4, 1 << 5);
-        assert!(raised.get());
+        assert!(raised.load(core::sync::atomic::Ordering::Acquire));
         bus.write(BASE + 0x038, 4, 0);
-        assert!(!raised.get());
+        assert!(!raised.load(core::sync::atomic::Ordering::Acquire));
     }
 }

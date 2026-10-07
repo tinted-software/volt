@@ -91,12 +91,23 @@ pub fn prepare(
     ram_base: u64,
     ram_size: u64,
 ) -> Result<Layout, Error> {
+    prepare_smp(memory, image, cmdline, ram_base, ram_size, 1)
+}
+
+pub fn prepare_smp(
+    memory: &mut impl GuestMemory,
+    image: &[u8],
+    cmdline: &str,
+    ram_base: u64,
+    ram_size: u64,
+    cpus: u32,
+) -> Result<Layout, Error> {
     let header = parse(image)?;
     let entry = load_address(ram_base, header)?;
     let occupied = header.image_size.max(image.len() as u64);
     let above = entry.checked_add(occupied).ok_or(Error::NoRoom)?;
     let device_tree = align(above)?;
-    let tree = super::fdt::build(ram_base, ram_size, cmdline);
+    let tree = super::fdt::build_smp(ram_base, ram_size, cmdline, cpus);
     let end = ram_base.checked_add(ram_size).ok_or(Error::NoRoom)?;
     if above > end
         || device_tree

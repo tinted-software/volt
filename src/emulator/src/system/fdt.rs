@@ -6,6 +6,7 @@ pub const GIC_CPU_BASE: u64 = 0x0801_0000;
 pub const UART_BASE: u64 = 0x0900_0000;
 pub const UART_INTID: u32 = 33;
 pub const VIRTUAL_TIMER_INTID: u32 = 27;
+pub const TIMER_FREQ: u64 = 24_000_000;
 
 struct Builder {
     structure: Vec<u8>,
@@ -103,6 +104,10 @@ fn range(address: u64, size: u64) -> [u32; 4] {
 }
 
 pub fn build(ram_base: u64, ram_size: u64, cmdline: &str) -> Vec<u8> {
+    build_smp(ram_base, ram_size, cmdline, 1)
+}
+
+pub fn build_smp(ram_base: u64, ram_size: u64, cmdline: &str, cpus: u32) -> Vec<u8> {
     let mut b = Builder::new();
     b.begin("");
     b.cells("#address-cells", &[2]);
@@ -121,12 +126,14 @@ pub fn build(ram_base: u64, ram_size: u64, cmdline: &str) -> Vec<u8> {
     b.begin("cpus");
     b.cells("#address-cells", &[1]);
     b.cells("#size-cells", &[0]);
-    b.begin("cpu@0");
-    b.string("device_type", "cpu");
-    b.string("compatible", "arm,armv8");
-    b.cells("reg", &[0]);
-    b.string("enable-method", "psci");
-    b.end();
+    for cpu in 0..cpus.max(1) {
+        b.begin(&format!("cpu@{cpu}"));
+        b.string("device_type", "cpu");
+        b.string("compatible", "arm,armv8");
+        b.cells("reg", &[cpu]);
+        b.string("enable-method", "psci");
+        b.end();
+    }
     b.end();
     b.begin("psci");
     b.string("compatible", "arm,psci-0.2");
@@ -161,7 +168,7 @@ pub fn build(ram_base: u64, ram_size: u64, cmdline: &str) -> Vec<u8> {
     b.begin("apb-pclk");
     b.string("compatible", "fixed-clock");
     b.cells("#clock-cells", &[0]);
-    b.cells("clock-frequency", &[24_000_000]);
+    b.cells("clock-frequency", &[TIMER_FREQ as u32]);
     b.cells("phandle", &[1]);
     b.end();
     b.end();

@@ -8,10 +8,11 @@ license.workspace = true
 volt-ir.workspace = true
 volt-target.workspace = true
 libc = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
 
 [features]
 default = ["system"]
-system = []
+system = ["dep:parking_lot"]
 user = ["dep:libc"]
 
 [lints]

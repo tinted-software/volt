@@ -6,15 +6,18 @@ pub mod esr;
 pub mod fdt;
 pub mod machine;
 pub mod psci;
+pub mod smp;
 
 use crate::aarch64::{Cpu, decode, translate};
 use crate::devices::{gicv2::Gicv2, pl011::Pl011};
 use crate::memory::{GuestMemory, PhysicalMemory, Region};
+use alloc::sync::Arc;
 use core::{
-    cell::{Cell, RefCell},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use std::{io::Write, rc::Rc, time::Instant};
+use parking_lot::Mutex;
+use std::{io::Write, time::Instant};
 
 pub const RAM_BASE: u64 = 0x4000_0000;
 pub const RAM_SIZE: usize = 128 << 20;
@@ -38,7 +41,22 @@ pub enum StopReason {
     Reset,
     Timeout,
     LostStack,
+    Halt,
     Fault(String),
+}
+
+/// CPU idle policy when the guest issues `WFI` (Wait For Interrupt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdleMode {
+    /// Advance virtual time to the next timer deadline and sleep the host thread
+    /// to pace execution with real time and conserve CPU/battery.
+    #[default]
+    Paced,
+    /// Fast-forward virtual time directly to the timer deadline without sleeping.
+    /// Ideal for headless batch testing, benchmarks, and CI.
+    FastForward,
+    /// Busy-spin without advancing virtual timer or sleeping (legacy behavior).
+    Spin,
 }
 #[derive(Debug)]
 pub struct InstructionDiagnostic {
@@ -158,8 +176,18 @@ impl core::fmt::Display for BootReport {
 /// Boot a raw Linux Image with live serial output on stdout and a bounded wall-clock run.
 /// Execution faults are returned in the report with the full guest state, not discarded.
 pub fn boot(image: &[u8], timeout: Duration, cmdline: &str) -> Result<BootReport, Error> {
+    boot_options(image, timeout, cmdline, IdleMode::default())
+}
+
+/// Same as [`boot`], with a selectable [`IdleMode`].
+pub fn boot_options(
+    image: &[u8],
+    timeout: Duration,
+    cmdline: &str,
+    idle_mode: IdleMode,
+) -> Result<BootReport, Error> {
     let mut output = std::io::BufWriter::new(std::io::stdout());
-    boot_with_serial(image, timeout, cmdline, move |byte| {
+    boot_with_options(image, timeout, cmdline, idle_mode, move |byte| {
         // The complete output also lives in BootReport if a host console cannot accept it.
         let _ = output.write_all(&[byte]);
         if byte == b'\n' {
@@ -173,21 +201,32 @@ pub fn boot_with_serial(
     image: &[u8],
     timeout: Duration,
     cmdline: &str,
-    mut sink: impl FnMut(u8) + 'static,
+    sink: impl FnMut(u8) + Send + 'static,
+) -> Result<BootReport, Error> {
+    boot_with_options(image, timeout, cmdline, IdleMode::default(), sink)
+}
+
+/// Same machine as [`boot_with_serial`], with a selectable [`IdleMode`].
+pub fn boot_with_options(
+    image: &[u8],
+    timeout: Duration,
+    cmdline: &str,
+    idle_mode: IdleMode,
+    mut sink: impl FnMut(u8) + Send + 'static,
 ) -> Result<BootReport, Error> {
     let region = Region::ram(RAM_BASE, vec![0; RAM_SIZE]).map_err(Error::Memory)?;
     let mut memory = PhysicalMemory::new(vec![region]).map_err(Error::Memory)?;
     let layout = boot::prepare(&mut memory, image, cmdline, RAM_BASE, RAM_SIZE as u64)
         .map_err(Error::Boot)?;
-    let console = Rc::new(RefCell::new(Vec::new()));
+    let console = Arc::new(Mutex::new(Vec::new()));
     let serial_console = console.clone();
-    let uart_line = Rc::new(Cell::new(false));
+    let uart_line = Arc::new(AtomicBool::new(false));
     let serial_line = uart_line.clone();
     let mut serial = Pl011::new(move |byte| {
-        serial_console.borrow_mut().push(byte);
+        serial_console.lock().push(byte);
         sink(byte);
     })
-    .with_line(move |level| serial_line.set(level));
+    .with_line(move |level| serial_line.store(level, Ordering::Release));
     let mut gic = Gicv2::default();
     let mut machine = machine::Machine::new(memory);
     machine.cpu.pc = layout.entry;
@@ -200,7 +239,7 @@ pub fn boot_with_serial(
         if started.elapsed() >= timeout {
             break StopReason::Timeout;
         }
-        if uart_line.get() {
+        if uart_line.load(Ordering::Acquire) {
             gic.raise(fdt::UART_INTID);
         } else {
             gic.lower(fdt::UART_INTID);
@@ -218,7 +257,54 @@ pub fn boot_with_serial(
                 // The FDT advertises exactly one CPU. There is no target to start.
                 psci::Outcome::StartCpu { .. } => machine.cpu.x[0] = psci::NOT_SUPPORTED,
             },
-            Ok(machine::Exit::Wait | machine::Exit::Interrupted) => {}
+            Ok(machine::Exit::Wait) => match idle_mode {
+                IdleMode::Paced => {
+                    let ctl = machine.cpu.system.cntv_ctl_el0;
+                    let enabled = ctl & 1 != 0;
+                    let masked = ctl & 2 != 0;
+                    let cval = machine.cpu.system.cntv_cval_el0;
+                    let vct = machine.cpu.system.cntvct_el0;
+                    if enabled && !masked {
+                        if cval > vct {
+                            let delta = cval - vct;
+                            let nanos =
+                                (delta as u128 * 1_000_000_000 / fdt::TIMER_FREQ as u128) as u64;
+                            let remaining = timeout.saturating_sub(started.elapsed());
+                            let sleep_dur = Duration::from_nanos(nanos).min(remaining);
+                            if !sleep_dur.is_zero() {
+                                std::thread::sleep(sleep_dur);
+                            }
+                            machine.cpu.system.cntvct_el0 = cval;
+                        }
+                        gic.raise_on(0, fdt::VIRTUAL_TIMER_INTID);
+                        timer_interrupts += 1;
+                    } else if (!enabled || masked) && !machine.irq_line && !gic.signalled(0) {
+                        let remaining = timeout.saturating_sub(started.elapsed());
+                        let sleep_dur = Duration::from_millis(1).min(remaining);
+                        if !sleep_dur.is_zero() {
+                            std::thread::sleep(sleep_dur);
+                        }
+                    }
+                }
+                IdleMode::FastForward => {
+                    let ctl = machine.cpu.system.cntv_ctl_el0;
+                    let enabled = ctl & 1 != 0;
+                    let masked = ctl & 2 != 0;
+                    let cval = machine.cpu.system.cntv_cval_el0;
+                    let vct = machine.cpu.system.cntvct_el0;
+                    if enabled && !masked {
+                        if cval > vct {
+                            machine.cpu.system.cntvct_el0 = cval;
+                        }
+                        gic.raise_on(0, fdt::VIRTUAL_TIMER_INTID);
+                        timer_interrupts += 1;
+                    } else if (!enabled || masked) && !machine.irq_line && !gic.signalled(0) {
+                        break StopReason::Halt;
+                    }
+                }
+                IdleMode::Spin => {}
+            },
+            Ok(machine::Exit::Interrupted) => {}
             Err(error) => break StopReason::Fault(error.to_string()),
         }
         exits += 1;
@@ -238,7 +324,7 @@ pub fn boot_with_serial(
         reason,
         layout,
         cpu: machine.cpu,
-        console: core::mem::take(&mut *console.borrow_mut()),
+        console: core::mem::take(&mut *console.lock()),
         exits,
         compiled_blocks: machine.cache.len(),
         executed_blocks: machine.blocks_run,
@@ -367,5 +453,89 @@ mod tests {
         assert_eq!(report.console, b"A");
         assert_eq!(report.unmapped_accesses, 0);
         assert!(report.compiled_blocks >= 3);
+    }
+
+    fn create_test_image(instructions: &[u32]) -> Vec<u8> {
+        let mut image = vec![0; 64];
+        image[..4].copy_from_slice(&0x14000010u32.to_le_bytes());
+        image[4..8].copy_from_slice(&0xd503201fu32.to_le_bytes());
+        image[24..32].copy_from_slice(&2u64.to_le_bytes());
+        image[56..60].copy_from_slice(&boot::MAGIC.to_le_bytes());
+        for instruction in instructions {
+            image.extend_from_slice(&instruction.to_le_bytes());
+        }
+        let length = image.len() as u64;
+        image[16..24].copy_from_slice(&length.to_le_bytes());
+        image
+    }
+
+    #[test]
+    fn wfi_idle_mode_fast_forward_advances_virtual_counter_and_fires_timer() {
+        let image = create_test_image(&[
+            0xd28a0000, // movz x0, #0x5000 (20480 ticks in future)
+            0xd51be340, // msr cntv_cval_el0, x0
+            0xd2800020, // movz x0, #1
+            0xd51be320, // msr cntv_ctl_el0, x0
+            0xd503207f, // wfi
+            0xd2b08000, // movz x0, #0x8400, lsl #16
+            0xf2800100, // movk x0, #8 (PSCI_SYSTEM_OFF)
+            0xd4000002, // hvc #0
+        ]);
+        let report = boot_with_options(
+            &image,
+            Duration::from_secs(5),
+            DEFAULT_CMDLINE,
+            IdleMode::FastForward,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.reason, StopReason::Shutdown, "{report}");
+        assert!(report.cpu.system.cntvct_el0 >= 0x5000);
+        assert!(report.timer_interrupts >= 1);
+    }
+
+    #[test]
+    fn wfi_idle_mode_fast_forward_halts_when_no_timer_armed() {
+        let image = create_test_image(&[
+            0xd503207f, // wfi with no timer enabled
+            0xd2b08000, // movz x0, #0x8400, lsl #16
+            0xf2800100, // movk x0, #8 (PSCI_SYSTEM_OFF)
+            0xd4000002, // hvc #0
+        ]);
+        let report = boot_with_options(
+            &image,
+            Duration::from_secs(5),
+            DEFAULT_CMDLINE,
+            IdleMode::FastForward,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.reason, StopReason::Halt, "{report}");
+    }
+
+    #[test]
+    fn wfi_idle_mode_paced_sleeps_and_fires_timer() {
+        let image = create_test_image(&[
+            0xd2977000, // movz x0, #48000 (2 ms at 24 MHz)
+            0xd51be340, // msr cntv_cval_el0, x0
+            0xd2800020, // movz x0, #1
+            0xd51be320, // msr cntv_ctl_el0, x0
+            0xd503207f, // wfi
+            0xd2b08000, // movz x0, #0x8400, lsl #16
+            0xf2800100, // movk x0, #8 (PSCI_SYSTEM_OFF)
+            0xd4000002, // hvc #0
+        ]);
+        let report = boot_with_options(
+            &image,
+            Duration::from_secs(5),
+            DEFAULT_CMDLINE,
+            IdleMode::Paced,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.reason, StopReason::Shutdown, "{report}");
+        assert!(report.cpu.system.cntvct_el0 >= 48_000);
+        assert!(report.timer_interrupts >= 1);
+        assert!(report.elapsed >= Duration::from_millis(2));
     }
 }

@@ -19,6 +19,7 @@ volt-emulator = { path = "src/emulator" }
 
 object = { version = "0.40.0", default-features = false, features = ["read_core", "write_core", "elf"] }
 libc = "0.2"
+parking_lot = "0.12"
 
 [workspace.lints.clippy]
 std_instead_of_core = "deny"

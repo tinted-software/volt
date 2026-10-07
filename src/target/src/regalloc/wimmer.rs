@@ -841,6 +841,9 @@ fn span_placeable(
 
 /// The minimum of `arr` over the register span `[base, base + regs)`.
 fn span_min(arr: &[u32], base: usize, regs: u16) -> u32 {
+    if regs == 1 {
+        return arr.get(base).copied().unwrap_or(INFINITY);
+    }
     arr.iter()
         .skip(base)
         .take(regs as usize)
@@ -2140,6 +2143,9 @@ pub fn allocate<F: Func, D: RegDescription<F>>(
     let max_pos = max_end_position(&intervals, &children);
     let iter_bound: usize = 2 * (intervals.len() + intervals.len() * (max_pos as usize + 1)) + 8;
     let mut iters: usize = 0;
+    // Fixed-register intervals all exist before the scan and split children
+    // never carry one, so the register limit is loop-invariant.
+    let limit = reg_limit(&intervals, &children, desc);
     while !unhandled.is_empty() {
         iters += 1;
         debug_assert!(iters <= iter_bound);
@@ -2177,7 +2183,6 @@ pub fn allocate<F: Func, D: RegDescription<F>>(
 
         debug_assert!(get(&intervals, &children, current).fixed_reg.is_none());
 
-        let limit = reg_limit(&intervals, &children, desc);
         let param_hint = if desc.coalesce_block_params() {
             compute_param_hint(
                 &param_args,
@@ -2313,21 +2318,20 @@ fn build_allocation<F: Func, D: RegDescription<F>>(
 
     // Group every placed value interval (originals + children) by its value.
     let mut groups: Vec<(Value, Vec<usize>, Vec<usize>)> = Vec::new();
+    // Dense value -> group slot table; keeps grouping O(n) while preserving
+    // first-seen group order.
+    let mut group_of: Vec<u32> = alloc::vec![u32::MAX; func.value_count()];
     let mut push_iv = |v: Value, child: bool, idx: usize| {
-        for (gv, origs, ch) in groups.iter_mut() {
-            if *gv == v {
-                if child {
-                    ch.push(idx);
-                } else {
-                    origs.push(idx);
-                }
-                return;
-            }
+        let slot = &mut group_of[v.index()];
+        if *slot == u32::MAX {
+            *slot = groups.len() as u32;
+            groups.push((v, Vec::new(), Vec::new()));
         }
+        let (_, origs, ch) = &mut groups[*slot as usize];
         if child {
-            groups.push((v, Vec::new(), alloc::vec![idx]));
+            ch.push(idx);
         } else {
-            groups.push((v, alloc::vec![idx], Vec::new()));
+            origs.push(idx);
         }
     };
     for (i, iv) in intervals.iter().enumerate() {
@@ -3067,6 +3071,7 @@ fn resolve_data_flow<F: Func, D: RegDescription<F>>(
 
     let bounds = compute_block_bounds(func);
     let mut edges: Vec<EdgeMoves> = Vec::new();
+    let tables = EdgeTables::build(func, intervals, children, result, &bounds.from);
 
     for bi in 0..func.block_count() {
         let block = Block::from_u32(bi as u32);
@@ -3075,9 +3080,8 @@ fn resolve_data_flow<F: Func, D: RegDescription<F>>(
                 add_edge_moves(
                     func,
                     desc,
-                    intervals,
-                    children,
                     result,
+                    &tables,
                     &bounds.from,
                     &bounds.to,
                     &mut edges,
@@ -3087,9 +3091,8 @@ fn resolve_data_flow<F: Func, D: RegDescription<F>>(
                 add_edge_moves(
                     func,
                     desc,
-                    intervals,
-                    children,
                     result,
+                    &tables,
                     &bounds.from,
                     &bounds.to,
                     &mut edges,
@@ -3104,9 +3107,8 @@ fn resolve_data_flow<F: Func, D: RegDescription<F>>(
                     add_edge_moves(
                         func,
                         desc,
-                        intervals,
-                        children,
                         result,
+                        &tables,
                         &bounds.from,
                         &bounds.to,
                         &mut edges,
@@ -3122,13 +3124,66 @@ fn resolve_data_flow<F: Func, D: RegDescription<F>>(
     result.edge_moves = edges;
 }
 
+/// Lookup tables that keep edge-move construction linear in the function size
+/// instead of rescanning every value and interval for every edge.
+struct EdgeTables {
+    /// Value index -> position in `Allocation::segments` (`u32::MAX` if none).
+    segment_slot: Vec<u32>,
+    /// Block index -> positions in `Allocation::segments` of the values with a
+    /// value interval covering that block's entry, ascending.
+    live_in: Vec<Vec<u32>>,
+}
+
+impl EdgeTables {
+    fn build<F: Func>(
+        func: &F,
+        intervals: &[Interval],
+        children: &[Interval],
+        result: &Allocation,
+        block_from: &[u32],
+    ) -> Self {
+        let mut segment_slot = alloc::vec![u32::MAX; func.value_count()];
+        for (slot, (v, _)) in result.segments.iter().enumerate() {
+            segment_slot[v.index()] = slot as u32;
+        }
+        let mut live_in: Vec<Vec<u32>> = alloc::vec![Vec::new(); block_from.len()];
+        for iv in intervals.iter().chain(children.iter()) {
+            let Some(v) = iv.value else { continue };
+            if iv.fixed_reg.is_some() {
+                continue;
+            }
+            let slot = segment_slot[v.index()];
+            if slot == u32::MAX {
+                continue;
+            }
+            for (b, from) in block_from.iter().enumerate() {
+                if iv.covers(*from) {
+                    live_in[b].push(slot);
+                }
+            }
+        }
+        for list in &mut live_in {
+            list.sort_unstable();
+            list.dedup();
+        }
+        Self {
+            segment_slot,
+            live_in,
+        }
+    }
+
+    fn segments<'a>(&self, result: &'a Allocation, v: Value) -> Option<&'a [Segment]> {
+        let slot = *self.segment_slot.get(v.index())?;
+        (slot != u32::MAX).then(|| result.segments[slot as usize].1.as_slice())
+    }
+}
+
 /// Compute and store the ordered move list for one edge `pred -> edge.target`.
 fn add_edge_moves<F: Func, D: RegDescription<F>>(
     func: &F,
     desc: &D,
-    intervals: &[Interval],
-    children: &[Interval],
     result: &Allocation,
+    tables: &EdgeTables,
     block_from: &[u32],
     block_to: &[u32],
     edges: &mut Vec<EdgeMoves>,
@@ -3150,8 +3205,8 @@ fn add_edge_moves<F: Func, D: RegDescription<F>>(
     debug_assert!(params.len() == args.len());
     if params.len() == args.len() {
         for (p, a) in params.iter().zip(args.iter()) {
-            let a_segs = result.segments_of(*a).expect("arg has no segments");
-            let p_segs = result.segments_of(*p).expect("param has no segments");
+            let a_segs = tables.segments(result, *a).expect("arg has no segments");
+            let p_segs = tables.segments(result, *p).expect("param has no segments");
             let from = location_at(a_segs, pt);
             let to = location_at(p_segs, ss);
             if !loc_eql(from, to) {
@@ -3167,11 +3222,11 @@ fn add_edge_moves<F: Func, D: RegDescription<F>>(
 
     // (2) Non-parameter live-in moves: a value that flows THROUGH the edge
     // and whose location changes across the edge.
-    for (v, segs) in &result.segments {
+    // Only values live at the successor's entry can need a move. The tables
+    // list exactly those, in segment order.
+    for &slot in &tables.live_in[succ.index()] {
+        let (v, segs) = &result.segments[slot as usize];
         if is_param_of(func, succ, *v) {
-            continue;
-        }
-        if !value_live_at(intervals, children, *v, ss) {
             continue;
         }
         debug_assert!(segs[0].from <= ss);
