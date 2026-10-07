@@ -354,12 +354,16 @@ pub fn boot_smp<B: crate::devices::BlockBackend + 'static>(
         ))
     });
 
+    let blocks = Arc::new(crate::aarch64::cache::SharedBlocks::new(true));
+    if let Some(reader) = crate::memory::GuestMemory::code_reader(&shared_mem) {
+        blocks.enable_ahead(reader, crate::aarch64::ahead::default_threads());
+    }
     let devices = SharedDevices {
         serial: Arc::new(Mutex::new(serial)),
         gic: Arc::new(Mutex::new(gic)),
         virtio,
         exclusive: Arc::new(GlobalExclusiveMonitor::default()),
-        blocks: Arc::new(crate::aarch64::cache::SharedBlocks::new(true)),
+        blocks,
         controls: controls.clone(),
         uart_line,
         virtio_line,
@@ -626,7 +630,13 @@ fn vcpu_worker_thread<V: crate::devices::VirtioIo + Send + 'static>(
             },
             Ok(Exit::Interrupted) => {}
             Err(err) => {
-                devices.request_shutdown(StopReason::Fault(err.to_string()));
+                let pc = machine
+                    .stalled
+                    .map(|_| machine.stalled_at)
+                    .unwrap_or(machine.cpu.pc);
+                devices.request_shutdown(StopReason::Fault(alloc::format!(
+                    "cpu {cpu_id} at {pc:x}: {err}"
+                )));
                 break;
             }
         }

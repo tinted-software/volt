@@ -129,6 +129,12 @@ pub fn compile(function: &Function) -> Result<Vec<u32>, Error> {
     Ok(lower::compile(function, &ModelCaps::default(), true)?.code)
 }
 
+/// Like [`compile`], consuming `function` so the lowering passes can rewrite it
+/// in place instead of working on a copy.
+pub fn compile_owned(function: Function) -> Result<Vec<u32>, Error> {
+    Ok(lower::compile_owned(function, &ModelCaps::default(), true)?.code)
+}
+
 /// Select A64 words for an IR function.
 pub fn select_function(function: &Function) -> Result<Vec<u32>, Error> {
     compile(function)

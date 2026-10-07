@@ -1,4 +1,5 @@
 use super::{
+    ahead::{Ahead, CodeReader},
     compile::{Block, Error, compile_with},
     cpu::Cpu,
     decode::decode,
@@ -6,17 +7,22 @@ use super::{
 use core::hash::{Hash, Hasher};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-const MAX_INSNS: usize = 64;
-const DIRECT_SLOTS: usize = 4096;
+pub(super) const MAX_INSNS: usize = 64;
+const DIRECT_SET_BITS: u32 = 15;
+const DIRECT_WAYS: usize = 4;
 const NO_ENTRY: u32 = u32::MAX;
+/// `Entry::epoch` value that matches no `Fetch::translation_epoch`.
+const NO_EPOCH: u64 = u64::MAX;
 
 pub struct Cache {
     entries: Vec<Entry>,
     index: HashMap<(u64, u64), Vec<usize>>,
-    /// Direct-mapped `pc -> entry` table for the hit fast path.
-    direct: Box<[u32]>,
+    /// Set-associative `pc -> entry` table for the hit fast path, `DIRECT_WAYS`
+    /// slots per set, newest first. Slots carry the pc so a probe never touches
+    /// `entries` unless it matches.
+    direct: Box<[DirectSlot]>,
     /// Where blocks come from on a local miss. Private to this cache unless
     /// built with `with_shared`.
     shared: Arc<SharedBlocks>,
@@ -31,8 +37,17 @@ impl Default for Cache {
         }
     }
 }
-fn alloc_direct() -> Box<[u32]> {
-    vec![NO_ENTRY; DIRECT_SLOTS].into_boxed_slice()
+#[derive(Clone, Copy)]
+struct DirectSlot {
+    pc: u64,
+    at: u32,
+}
+fn alloc_direct() -> Box<[DirectSlot]> {
+    let empty = DirectSlot {
+        pc: 0,
+        at: NO_ENTRY,
+    };
+    vec![empty; DIRECT_WAYS << DIRECT_SET_BITS].into_boxed_slice()
 }
 struct Entry {
     pc: u64,
@@ -46,6 +61,10 @@ struct Entry {
     /// Physical page and write-tracker version the block was last validated
     /// against. Only set when the memory provides a `CodeTracker`.
     key: Option<(u64, u32)>,
+    /// `Fetch::translation_epoch` at the time `key` was last confirmed. While
+    /// it is unchanged `pc` still maps to `key`'s page, so a hit needs only the
+    /// page version, not a fresh address translation.
+    epoch: u64,
 }
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -61,6 +80,15 @@ pub struct SharedBlocks {
     inline_memory: bool,
     map: Mutex<HashMap<(u64, u64), Vec<Arc<Slot>>>>,
     compiled: AtomicUsize,
+    /// Background compilation of the blocks likely to run next, once enabled.
+    ahead: OnceLock<Arc<Ahead>>,
+}
+impl Drop for SharedBlocks {
+    fn drop(&mut self) {
+        if let Some(ahead) = self.ahead.get() {
+            ahead.shutdown();
+        }
+    }
 }
 struct Slot {
     bytes: Box<[u8]>,
@@ -75,7 +103,19 @@ impl SharedBlocks {
             inline_memory,
             map: Mutex::new(HashMap::new()),
             compiled: AtomicUsize::new(0),
+            ahead: OnceLock::new(),
         }
+    }
+    /// Compile the likely successors of every block on `threads` background
+    /// threads, reading code through `reader`. Does nothing for 0 threads or when
+    /// already enabled.
+    pub fn enable_ahead(self: &Arc<Self>, reader: Arc<dyn CodeReader>, threads: usize) {
+        if threads > 0 {
+            let _ = self.ahead.set(Ahead::start(self, reader, threads));
+        }
+    }
+    fn ahead(&self) -> Option<&Arc<Ahead>> {
+        self.ahead.get()
     }
     /// Number of blocks compiled so far (not the number of lookups).
     pub fn compiled(&self) -> usize {
@@ -84,7 +124,7 @@ impl SharedBlocks {
     pub fn inline_memory(&self) -> bool {
         self.inline_memory
     }
-    fn get(&self, pc: u64, bytes: &[u8]) -> Result<Arc<Block>, Error> {
+    pub(super) fn get(&self, pc: u64, bytes: &[u8]) -> Result<Arc<Block>, Error> {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         bytes.hash(&mut hash);
         let slot = {
@@ -125,6 +165,17 @@ pub trait Fetch {
     fn code_key(&mut self, _cpu: &mut Cpu, _pc: u64, _watch: bool) -> Option<(u64, u32)> {
         None
     }
+    /// A value that changes whenever some virtual-to-physical code mapping
+    /// may have changed. A `code_key` taken under the same epoch still names
+    /// the page `pc` fetches from. `None` (the default) means no such promise,
+    /// so every hit re-derives its key through `code_key`.
+    fn translation_epoch(&self) -> Option<u64> {
+        None
+    }
+    /// Current write-tracker version of physical code page `page`.
+    fn page_version(&self, _page: u64) -> Option<u32> {
+        None
+    }
 }
 struct Plain<F>(F);
 impl<F: FnMut(&Cpu, u64, &mut [u8]) -> Result<usize, Error>> Fetch for Plain<F> {
@@ -132,8 +183,10 @@ impl<F: FnMut(&Cpu, u64, &mut [u8]) -> Result<usize, Error>> Fetch for Plain<F> 
         (self.0)(cpu, at, out)
     }
 }
-fn slot(pc: u64) -> usize {
-    ((pc >> 2) ^ (pc >> 14)) as usize & (DIRECT_SLOTS - 1)
+/// Index of the first slot of `pc`'s set.
+fn set_base(pc: u64) -> usize {
+    let word = pc >> 2;
+    (((word ^ (word >> DIRECT_SET_BITS)) as usize) & ((1 << DIRECT_SET_BITS) - 1)) * DIRECT_WAYS
 }
 impl Cache {
     pub fn new() -> Self {
@@ -155,6 +208,11 @@ impl Cache {
             shared,
             ..Self::default()
         }
+    }
+    /// Start background compilation for this cache's blocks (see
+    /// [`SharedBlocks::enable_ahead`]).
+    pub fn start_ahead(&self, reader: Arc<dyn CodeReader>, threads: usize) {
+        self.shared.enable_ahead(reader, threads);
     }
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -178,6 +236,9 @@ impl Cache {
             }
         }
         let block = self.shared.get(pc, bytes)?;
+        // Another thread may have just written this block's code; make sure this
+        // one fetches the new instructions.
+        volt_target::native::instruction_barrier();
         let at = self.entries.len();
         self.entries.push(Entry {
             pc,
@@ -185,9 +246,30 @@ impl Cache {
             block,
             fast: false,
             key: None,
+            epoch: NO_EPOCH,
         });
         self.index.entry(key).or_default().push(at);
         Ok(at)
+    }
+    fn find_direct(&self, pc: u64) -> u32 {
+        let set = &self.direct[set_base(pc)..][..DIRECT_WAYS];
+        for slot in set {
+            if slot.pc == pc && slot.at != NO_ENTRY {
+                return slot.at;
+            }
+        }
+        NO_ENTRY
+    }
+    /// Make `at` the newest slot of `pc`'s set, replacing any slot already
+    /// holding `pc` or else the oldest.
+    fn insert_direct(&mut self, pc: u64, at: u32) {
+        let set = &mut self.direct[set_base(pc)..][..DIRECT_WAYS];
+        let way = set
+            .iter()
+            .position(|slot| slot.pc == pc && slot.at != NO_ENTRY)
+            .unwrap_or(DIRECT_WAYS - 1);
+        set.copy_within(..way, 1);
+        set[0] = DirectSlot { pc, at };
     }
     pub fn run_block<F>(&mut self, cpu: &mut Cpu, fetch: F) -> Result<u64, Error>
     where
@@ -199,15 +281,26 @@ impl Cache {
         let pc = cpu.pc;
         // Fast path. Any failure or mismatch falls through to the full scan,
         // which reports faults and handles changed code exactly as before.
-        let candidate = self.direct[slot(pc)];
+        let candidate = self.find_direct(pc);
         if candidate != NO_ENTRY {
             let at = candidate as usize;
             if self.entries[at].pc == pc && self.entries[at].fast {
                 // 1. Tracked memory: the block is valid while its page's write
-                //    version is unchanged. No fetch, no compare.
+                //    version is unchanged. No fetch, no compare. Under an
+                //    unchanged translation epoch even the address translation
+                //    is skipped.
+                let epoch = fetch.translation_epoch().unwrap_or(NO_EPOCH);
+                if epoch != NO_EPOCH
+                    && self.entries[at].epoch == epoch
+                    && let Some((page, version)) = self.entries[at].key
+                    && fetch.page_version(page) == Some(version)
+                {
+                    return Ok(self.entries[at].block.run(cpu));
+                }
                 if let Some(now) = fetch.code_key(cpu, pc, false)
                     && self.entries[at].key == Some(now)
                 {
+                    self.entries[at].epoch = epoch;
                     return Ok(self.entries[at].block.run(cpu));
                 }
                 // 2. Otherwise (untracked memory, or the page was written):
@@ -221,6 +314,7 @@ impl Cache {
                     && room == self.entries[at].bytes.as_ref()
                 {
                     self.entries[at].key = watched;
+                    self.entries[at].epoch = epoch;
                     return Ok(self.entries[at].block.run(cpu));
                 }
             }
@@ -231,6 +325,7 @@ impl Cache {
         let mut bytes = [0u8; MAX_INSNS * 4];
         let mut count = 0usize;
         let mut complete = false;
+        let mut last = None;
         for n in 0..MAX_INSNS {
             let at = cpu
                 .pc
@@ -246,19 +341,41 @@ impl Cache {
                 return Err(Error::InvalidInstructionLength);
             }
             count += 4;
-            if decode(u32::from_le_bytes(room.try_into().unwrap()))?
-                .terminates_with(self.shared.inline_memory())
-            {
+            let word = u32::from_le_bytes(room.try_into().unwrap());
+            let instruction = match decode(word) {
+                Ok(insn) => insn,
+                Err(_) => {
+                    eprintln!("cache decode failure at pc {at:x}: word {word:08x}");
+                    return Err(Error::Decode { word, pc: at });
+                }
+            };
+            last = Some((instruction, at));
+            if instruction.terminates_with(self.shared.inline_memory()) {
                 complete = true;
                 break;
             }
-            complete = n + 1 == MAX_INSNS;
+            // Never straddle a page: a block inside one page is validated by
+            // that page's version alone, and the next page is translated and
+            // checked when its own block starts.
+            complete = n + 1 == MAX_INSNS || (pc + count as u64) & 0xfff == 0;
+            if complete {
+                break;
+            }
         }
+        let known = self.entries.len();
         let at = self.lookup_or_compile(pc, &bytes[..count])?;
         if complete && (pc & 0xfff) + count as u64 <= 0x1000 {
             self.entries[at].fast = true;
             self.entries[at].key = watched;
-            self.direct[slot(pc)] = at as u32;
+            self.entries[at].epoch = fetch.translation_epoch().unwrap_or(NO_EPOCH);
+            self.insert_direct(pc, at as u32);
+            // A block this cache has not seen: have spare cores build what can follow.
+            if self.entries.len() > known
+                && let (Some(ahead), Some((page, _)), Some((last, last_pc))) =
+                    (self.shared.ahead(), watched, last)
+            {
+                ahead.offer_successors(last, last_pc, (page << 12) | (last_pc & 0xfff));
+            }
         }
         Ok(self.entries[at].block.run(cpu))
     }
@@ -366,26 +483,27 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
     #[test]
-    fn page_crossing_blocks_never_take_the_fast_path() {
+    fn blocks_end_at_the_page_boundary_and_hit_the_fast_path() {
         let mut cache = Cache::new();
         let mut cpu = Cpu::default();
-        let nop = 0xd503201fu32;
-        let svc = 0xd4000001u32;
-        let mut code = vec![nop; 0x1000 / 4 - 1];
-        code.push(nop);
-        code.push(svc);
-        let mut calls = 0;
+        let nop = 0xd503201fu32.to_le_bytes();
+        let mut fetched = Vec::new();
         for _ in 0..2 {
-            calls = 0;
-            cpu.pc = 0x1000 + 0x1000 - 8;
-            let mut f = serve(&code, &mut calls);
-            let mut shifted = |c: &Cpu, at: u64, out: &mut [u8]| f(c, at - 0x1000 + 0x1000, out);
-            let _ = cache.run_block(&mut cpu, &mut shifted);
+            // Two nops reach the end of the page; the block must not read past it.
+            cpu.pc = 0x1ff8;
+            let next = cache
+                .run_block(&mut cpu, |_, at, out| {
+                    fetched.push(at);
+                    out.chunks_exact_mut(4)
+                        .for_each(|w| w.copy_from_slice(&nop));
+                    Ok(out.len())
+                })
+                .unwrap();
+            assert_eq!(next, 0x2000);
         }
-        assert!(
-            calls > 1,
-            "crossing block must be fully rescanned each time"
-        );
+        // First run scans two instructions; the second revalidates with one fetch.
+        assert_eq!(fetched, [0x1ff8, 0x1ffc, 0x1ff8]);
+        assert_eq!(cache.len(), 1);
     }
     /// Identity-mapped fetch over guest memory, counting byte fetches.
     struct Ram<M: crate::memory::GuestMemory> {

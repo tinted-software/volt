@@ -112,7 +112,7 @@ pub fn run(path: &Path, args: &[OsString], env: &[(OsString, OsString)]) -> Resu
                         return Ok(status);
                     }
                 }
-                Trap::Sync => cpu.trap = Trap::None,
+                Trap::Isb | Trap::Tlbi => cpu.trap = Trap::None,
                 Trap::DcZva => {
                     let address = cpu.address & !63;
                     space.write(address, &[0; 64])?;
@@ -143,7 +143,8 @@ fn fetch(
         }
     }
     let word = u32::from_le_bytes(bytes);
-    let instruction = decode(word)?;
+    let instruction =
+        decode(word).map_err(|_| crate::aarch64::compile::Error::Decode { word, pc: address })?;
     if !user_instruction(&instruction) {
         return Err(crate::aarch64::compile::Error::InvalidUserInstruction);
     }
@@ -201,8 +202,17 @@ pub fn service(space: &mut Space, cpu: &mut Cpu) -> Result<(), Error> {
     }
     let first = (cpu.address, cpu.width, cpu.dest, cpu.value, cpu.load_signed);
     access(
-        space, cpu, loading, first.0, first.1, first.2, first.3, first.4,
+        space,
+        cpu,
+        loading,
+        first.0,
+        first.1,
+        first.2,
+        first.3,
+        first.4,
+        cpu.vector_dest,
     )?;
+    cpu.vector_dest = false;
     if cpu.second_pending {
         let second = (
             cpu.second_address,
@@ -211,11 +221,21 @@ pub fn service(space: &mut Space, cpu: &mut Cpu) -> Result<(), Error> {
             cpu.second_value,
             cpu.second_signed,
         );
+        let second_vector = cpu.second_vector;
         access(
-            space, cpu, loading, second.0, second.1, second.2, second.3, second.4,
+            space,
+            cpu,
+            loading,
+            second.0,
+            second.1,
+            second.2,
+            second.3,
+            second.4,
+            second_vector,
         )?;
         cpu.second_pending = false;
         cpu.second_signed = SignExtend::None;
+        cpu.second_vector = false;
     }
     if cpu.writeback {
         if cpu.writeback_dest == 31 {
@@ -249,13 +269,40 @@ fn access(
     dest: u8,
     value: u64,
     signed: SignExtend,
+    vector: bool,
 ) -> Result<(), Error> {
-    if !matches!(width, 1 | 2 | 4 | 8) {
+    if !matches!(width, 1 | 2 | 4 | 8 | 16) {
         return Err(Error::InvalidAccessWidth);
     }
     space.check(address, width as usize, if loading { 1 } else { 2 })?;
     if !loading {
+        if vector {
+            let v = cpu.v[dest as usize];
+            let mut bytes = [0u8; 16];
+            bytes[0..8].copy_from_slice(&v[0].to_le_bytes());
+            bytes[8..16].copy_from_slice(&v[1].to_le_bytes());
+            space.write(address, &bytes[..width as usize])?;
+            return Ok(());
+        }
         space.write(address, &value.to_le_bytes()[..width as usize])?;
+        return Ok(());
+    }
+    if vector {
+        let mut bytes = [0u8; 16];
+        space.read(address, &mut bytes[..width as usize])?;
+        let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let hi = if width == 16 {
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap())
+        } else {
+            0
+        };
+        let bits = (width as u32).min(8) * 8;
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        cpu.v[dest as usize] = [lo & mask, hi];
         return Ok(());
     }
     if dest == 31 {

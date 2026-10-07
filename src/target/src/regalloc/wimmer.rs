@@ -2069,10 +2069,36 @@ pub struct Allocation {
     /// intra-block `actions` do NOT cover it; a backend that emits from this
     /// allocation before resolution runs must bail when this flag is set.
     pub needs_resolution: bool,
+    /// Dense alternative to `segments` for allocations that give every value
+    /// one register for its whole life: value index -> register, `u16::MAX`
+    /// for a value with none. Empty when `segments` carries the allocation.
+    pub single_regs: Vec<u16>,
+    /// Value index -> position in `segments` (`u32::MAX` if none). Empty until
+    /// `index_segments` runs; `segments_of` then falls back to a linear scan.
+    value_slot: Vec<u32>,
 }
 
 impl Allocation {
+    /// Build the dense value lookup behind `segments_of`. Call once `segments`
+    /// is final; the first entry wins for a repeated value, like the scan.
+    pub fn index_segments(&mut self, value_count: usize) {
+        let mut slots = alloc::vec![u32::MAX; value_count];
+        for (n, (v, _)) in self.segments.iter().enumerate() {
+            let slot = &mut slots[v.index()];
+            if *slot == u32::MAX {
+                *slot = n as u32;
+            }
+        }
+        self.value_slot = slots;
+    }
+
     pub fn segments_of(&self, v: Value) -> Option<&[Segment]> {
+        if !self.value_slot.is_empty() {
+            return match self.value_slot.get(v.index()) {
+                Some(&n) if n != u32::MAX => Some(&self.segments[n as usize].1),
+                _ => None,
+            };
+        }
         for (vv, segs) in &self.segments {
             if *vv == v {
                 return Some(segs);
@@ -2237,6 +2263,7 @@ pub fn allocate<F: Func, D: RegDescription<F>>(
 
     let mut result = build_allocation(func, &intervals, &children, &slots, desc);
     resolve_data_flow(func, desc, &intervals, &children, &mut result);
+    result.index_segments(func.value_count());
     Ok(result)
 }
 

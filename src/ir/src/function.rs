@@ -654,6 +654,14 @@ impl Function {
         Self::default()
     }
 
+    /// Reserve room for at least this many more blocks, instructions and values,
+    /// so a builder that knows its rough size avoids repeated regrowth.
+    pub fn reserve(&mut self, blocks: usize, insts: usize, values: usize) {
+        self.blocks.reserve(blocks);
+        self.insts.reserve(insts);
+        self.values.reserve(values);
+    }
+
     pub fn clone_func(&self) -> Self {
         self.clone()
     }
@@ -1307,6 +1315,11 @@ impl Function {
 
     pub fn opcode(&self, inst: Inst) -> Opcode {
         self.insts[inst.0 as usize].op.clone()
+    }
+
+    /// The opcode without copying it, for hot read-only walks.
+    pub fn opcode_ref(&self, inst: Inst) -> &Opcode {
+        &self.insts[inst.0 as usize].op
     }
 
     pub fn opcode_mut(&mut self, inst: Inst) -> &mut Opcode {

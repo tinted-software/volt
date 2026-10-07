@@ -201,6 +201,34 @@ pub fn compile(function: &Function) -> Result<JittedFunction, Error> {
     }
 }
 
+/// Like [`compile`], consuming `function` so the backend need not copy it.
+pub fn compile_owned(function: Function) -> Result<JittedFunction, Error> {
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64"))]
+    {
+        let words = crate::aarch64::isel::compile_owned(function)
+            .map_err(|e| Error::Compile(Box::new(e)))?;
+        // SAFETY: `words` is a live slice of plain `u32`s; AArch64 hosts are little endian.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 4) };
+        map_code(bytes)
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "aarch64")))]
+    {
+        compile(&function)
+    }
+}
+
+/// Make instructions another thread wrote (and synchronized with
+/// [`map_code`]) visible to instruction fetch on the calling thread. Call it
+/// before first running code that was compiled elsewhere.
+pub fn instruction_barrier() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `isb` only flushes this core's pipeline.
+    unsafe {
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
 fn sync_icache(code: &[u8]) {
     #[cfg(target_arch = "aarch64")]
     unsafe {

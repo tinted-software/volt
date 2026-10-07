@@ -1,4 +1,5 @@
 pub mod addrfold;
+pub mod forward;
 pub mod ir;
 pub mod wimmer;
 

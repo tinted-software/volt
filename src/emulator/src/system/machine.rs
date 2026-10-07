@@ -132,6 +132,14 @@ impl<M: GuestMemory> crate::aarch64::cache::Fetch for SystemFetch<'_, M> {
         };
         Some((page, version))
     }
+    fn translation_epoch(&self) -> Option<u64> {
+        // `sync_dtlb` has already folded any context change into the
+        // generation, and every TLB flush advances it.
+        Some(self.tlb.generation)
+    }
+    fn page_version(&self, page: u64) -> Option<u32> {
+        self.memory.code_tracker()?.version(page)
+    }
 }
 
 pub struct Machine<M> {
@@ -156,16 +164,23 @@ pub struct Machine<M> {
 }
 impl<M: GuestMemory> Machine<M> {
     pub fn new(memory: M) -> Self {
+        // `VOLT_INLINE_MEMORY=0` turns the inline data-TLB fast path off, for
+        // A/B comparisons and for bisecting suspected emulation bugs.
+        let cache = if std::env::var_os("VOLT_INLINE_MEMORY").is_some_and(|v| v == "0") {
+            Cache::new()
+        } else {
+            Cache::with_inline_memory()
+        };
+        if let Some(reader) = memory.code_reader() {
+            cache.start_ahead(reader, crate::aarch64::ahead::default_threads());
+        }
+        Self::with_cache(memory, 0, cache)
+    }
+    fn with_cache(memory: M, cpu_id: u32, cache: Cache) -> Self {
         Self {
-            cpu_id: 0,
+            cpu_id,
             memory,
-            // `VOLT_INLINE_MEMORY=0` turns the inline data-TLB fast path off, for
-            // A/B comparisons and for bisecting suspected emulation bugs.
-            cache: if std::env::var_os("VOLT_INLINE_MEMORY").is_some_and(|v| v == "0") {
-                Cache::new()
-            } else {
-                Cache::with_inline_memory()
-            },
+            cache,
             cpu: Cpu::default(),
             tlb: translate::Tlb::default(),
             dtlb_generation: 0,
@@ -187,10 +202,7 @@ impl<M: GuestMemory> Machine<M> {
         cpu_id: u32,
         blocks: std::sync::Arc<crate::aarch64::cache::SharedBlocks>,
     ) -> Self {
-        Self {
-            cache: Cache::with_shared(blocks),
-            ..Self::with_cpu_id(memory, cpu_id)
-        }
+        Self::with_cache(memory, cpu_id, Cache::with_shared(blocks))
     }
     pub fn with_cpu_id(memory: M, cpu_id: u32) -> Self {
         Self {
@@ -345,7 +357,11 @@ impl<M: GuestMemory> Machine<M> {
                         pc,
                     );
                 }
-                Trap::Sync => {
+                Trap::Isb => {
+                    self.tlb.purge_faults();
+                    self.cpu.trap = Trap::None;
+                }
+                Trap::Tlbi => {
                     self.tlb.flush();
                     self.cpu.trap = Trap::None;
                 }
@@ -413,6 +429,8 @@ impl<M: GuestMemory> Machine<M> {
                     }
                     if self.cpu.second_pending {
                         self.cpu.second_pending = false;
+                        self.cpu.vector_dest = self.cpu.second_vector;
+                        self.cpu.second_vector = false;
                         let (second_width, second_dest, second_signed) =
                             self.cpu.second_memory_request();
                         self.cpu.load_signed = second_signed;
@@ -425,6 +443,7 @@ impl<M: GuestMemory> Machine<M> {
                             devices,
                         )?;
                     }
+                    self.cpu.vector_dest = false;
                     if self.cpu.writeback && !self.faulted {
                         if self.cpu.writeback_dest == 31 {
                             self.cpu.sp = self.cpu.writeback_value;
@@ -600,7 +619,7 @@ impl<M: GuestMemory> Machine<M> {
         value: u64,
         devices: &mut impl DeviceIo,
     ) -> Result<(), Error> {
-        if !matches!(width, 1 | 2 | 4 | 8) {
+        if !matches!(width, 1 | 2 | 4 | 8 | 16) {
             return Err(Error::InvalidAccessWidth(width));
         }
         let load = self.cpu.trap == Trap::Load;
@@ -625,7 +644,19 @@ impl<M: GuestMemory> Machine<M> {
                     return Ok(());
                 }
             };
-        let mut bytes = value.to_le_bytes();
+        let mut bytes = [0u8; 16];
+        if !load {
+            if self.cpu.vector_dest {
+                let v = self.cpu.v[dest as usize];
+                bytes[0..8].copy_from_slice(&v[0].to_le_bytes());
+                bytes[8..16].copy_from_slice(&v[1].to_le_bytes());
+                if width != 16 {
+                    bytes[8..16].fill(0);
+                }
+            } else {
+                bytes[0..8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
         let first = (4096 - (address & 4095) as usize).min(width as usize);
         let result = if first == width as usize {
             if load {
@@ -728,7 +759,7 @@ impl<M: GuestMemory> Machine<M> {
                     return Ok(());
                 };
                 if let Some(value) = read {
-                    bytes = value.to_le_bytes();
+                    bytes[0..8].copy_from_slice(&value.to_le_bytes());
                 }
             }
             Err(error) => return Err(Error::Memory(error)),
@@ -736,21 +767,37 @@ impl<M: GuestMemory> Machine<M> {
         if first == width as usize && !self.device_access && self.cache.inline_memory() {
             self.fill_dtlb(address, physical, !load);
         }
-        if load && dest != 31 {
-            let value = u64::from_le_bytes(bytes);
-            let bits = width as u32 * 8;
-            let kept = if bits == 64 {
-                value
-            } else {
-                value & ((1u64 << bits) - 1)
-            };
-            self.cpu.x[dest as usize] = match signed {
-                SignExtend::None => kept,
-                SignExtend::To32 => {
-                    (((kept << (64 - bits)) as i64 >> (64 - bits)) as u64) & 0xffff_ffff
-                }
-                SignExtend::To64 => ((kept << (64 - bits)) as i64 >> (64 - bits)) as u64,
-            };
+        if load {
+            if self.cpu.vector_dest {
+                let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let hi = if width == 16 {
+                    u64::from_le_bytes(bytes[8..16].try_into().unwrap())
+                } else {
+                    0
+                };
+                let bits = (width as u32).min(8) * 8;
+                let mask = if bits == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bits) - 1
+                };
+                self.cpu.v[dest as usize] = [lo & mask, hi];
+            } else if dest != 31 {
+                let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let bits = width as u32 * 8;
+                let kept = if bits == 64 {
+                    value
+                } else {
+                    value & ((1u64 << bits) - 1)
+                };
+                self.cpu.x[dest as usize] = match signed {
+                    SignExtend::None => kept,
+                    SignExtend::To32 => {
+                        (((kept << (64 - bits)) as i64 >> (64 - bits)) as u64) & 0xffff_ffff
+                    }
+                    SignExtend::To64 => ((kept << (64 - bits)) as i64 >> (64 - bits)) as u64,
+                };
+            }
         }
         Ok(())
     }
