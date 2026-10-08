@@ -520,6 +520,19 @@ pub enum SystemRegister {
     SpEl0,
     SpEl1,
     SpEl2,
+    SctlrEl2,
+    TcrEl2,
+    Ttbr0El2,
+    Ttbr1El2,
+    MairEl2,
+    VbarEl2,
+    ElrEl2,
+    SpsrEl2,
+    EsrEl2,
+    FarEl2,
+    HcrEl2,
+    TpidrEl2,
+    CntvoffEl2,
     CurrentEl,
     SpsrEl1,
     ElrEl1,
@@ -606,6 +619,10 @@ pub enum SystemRegister {
     /// Apple IMP-DEF configuration register the guest reads back, stored in
     /// `System::apple[slot]`.
     Apple(u8),
+    /// Apple IMP-DEF register of the banks the SPTM monitor configures (`op1` 4 to 6, and the
+    /// `op1` 0, 1 and 3 registers in `MONITOR_LOW_BANKS`), which
+    /// the SPTM monitor reads back; stored in `Cpu::apple_bank`.
+    AppleBank(u16),
     /// PAuth key register `APxAKey{Lo,Hi}_EL1`, stored in `System::pac_keys[slot]`.
     PacKey(u8),
 }
@@ -1090,6 +1107,46 @@ fn simd_struct(word: u32) -> Result<Option<(StructDesc, StructPost)>, DecodeErro
 }
 /// Number of Apple IMP-DEF configuration registers `System::apple` holds.
 pub const APPLE_SLOTS: usize = 21;
+/// Number of `S3_<op1>_c15` registers `Cpu::apple_bank` holds: eight banks of
+/// `crm` x `op2` (16 x 8).
+pub const APPLE_BANK_SLOTS: usize = 8 * 128;
+
+/// The `Cpu::apple_bank` slot of `S3_<op1>_c15_c<crm>_<op2>`.
+pub const fn apple_bank_slot(op1: u32, crm: u32, op2: u32) -> usize {
+    ((op1 as usize) << 7) | ((crm as usize) << 3) | op2 as usize
+}
+
+/// The `S3_{0,1,3}_c15` registers (`op1`, `crm`, `op2`) the SPTM monitor's code accesses
+/// that the kernel-side table above does not name, found by scanning its `mrs`/`msr`
+/// words. Their roles are not identified; they are stored so the monitor reads back what
+/// it wrote. Other registers in those banks stay unsupported.
+const MONITOR_LOW_BANKS: [(u32, u32, u32); 25] = [
+    (0, 0, 0),
+    (0, 1, 0),
+    (0, 1, 2),
+    (0, 1, 3),
+    (0, 2, 0),
+    (0, 2, 1),
+    (0, 3, 0),
+    (0, 4, 0),
+    (0, 4, 1),
+    (0, 5, 0),
+    (0, 6, 0),
+    (0, 7, 0),
+    (0, 9, 0),
+    (0, 9, 1),
+    (0, 10, 1),
+    (0, 11, 0),
+    (0, 11, 2),
+    (0, 14, 0),
+    (0, 15, 0),
+    (0, 15, 2),
+    (0, 15, 5),
+    (1, 8, 2),
+    (3, 8, 0),
+    (3, 9, 0),
+    (3, 10, 0),
+];
 
 /// The `S3_*` implementation-defined registers the M1 kernel and PMU driver touch
 /// at EL1 (`arch/arm64/include/asm/apple_m1_pmu.h`, `irq-apple-aic.c`). Configuration
@@ -1126,9 +1183,16 @@ fn apple_register(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> Option<Sy
         (5, 3, 1) => Apple(19),
         (7, 0, 4) => Apple(20),
         (7, 6, 4) => AppleZero,
-        // The S3_5_c15_cN_0 state registers early init reads, none named in the XNU
-        // source tree. Read as zero until their roles are identified.
+        // The S3_5_c15 state registers the kernel reads during early boot. None are named
+        // in the XNU source tree that is available here, so they read as zero and writes
+        // are dropped until their roles are identified.
         (5, 2..=7, 0) => AppleZero,
+        // The EL2 and guarded-level banks the SPTM monitor configures: stored, so a
+        // read-modify-write or a read-back sees what was written.
+        (4..=6, _, _) => AppleBank(apple_bank_slot(op1, crm, op2) as u16),
+        _ if MONITOR_LOW_BANKS.contains(&(op1, crm, op2)) => {
+            AppleBank(apple_bank_slot(op1, crm, op2) as u16)
+        }
         _ => return None,
     })
 }
@@ -1190,6 +1254,19 @@ fn system_register(
         0x0410 => SpEl0,
         0x4410 => SpEl1,
         0x6410 => SpEl2,
+        0x4100 => SctlrEl2,
+        0x4202 => TcrEl2,
+        0x4200 => Ttbr0El2,
+        0x4201 => Ttbr1El2,
+        0x4a20 => MairEl2,
+        0x4c00 => VbarEl2,
+        0x4401 => ElrEl2,
+        0x4400 => SpsrEl2,
+        0x4520 => EsrEl2,
+        0x4600 => FarEl2,
+        0x4110 => HcrEl2,
+        0x4d02 => TpidrEl2,
+        0x4e03 => CntvoffEl2,
         0x0422 => CurrentEl,
         0x0400 => SpsrEl1,
         0x0401 => ElrEl1,
@@ -1264,8 +1341,8 @@ fn system_register(
 pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
     use DecodeError::UnsupportedInstruction;
     use Instruction::*;
-    // PAuth instructions, hint-space forms included, run on the host.
-    if super::pauth::is_supported(word) {
+    // PAuth and guarded-execution instructions, hint-space forms included, run on the host.
+    if super::pauth::is_supported(word) || super::gxf::is_supported(word) {
         return Ok(Host(word));
     }
     let width = width(word);

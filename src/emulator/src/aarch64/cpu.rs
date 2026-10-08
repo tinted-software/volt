@@ -153,7 +153,26 @@ pub struct Cpu {
     pub v: [[u64; 2]; 32],
     /// Inline data TLB for generated loads and stores. Filled by the machine.
     pub dtlb: Dtlb,
+    /// Apple IMP-DEF registers of the `op1` 0 to 6 banks the SPTM monitor configures. It
+    /// is the last field so growing it never moves the fields generated code reaches
+    /// with short immediate offsets (`v`, `dtlb`).
+    pub apple_bank: ImpDefBank,
 }
+
+/// `S3_<op1>_c15` registers, indexed by `decode::apple_bank_slot`.
+#[derive(Clone, Debug)]
+pub struct ImpDefBank(pub [u64; crate::aarch64::decode::APPLE_BANK_SLOTS]);
+
+impl Default for ImpDefBank {
+    fn default() -> Self {
+        Self([0; crate::aarch64::decode::APPLE_BANK_SLOTS])
+    }
+}
+
+/// `HCR_EL2.TGE` (bit 27): exceptions taken from EL0 route to EL2.
+pub const HCR_TGE: u64 = 1 << 27;
+/// `HCR_EL2.E2H` (bit 34): VHE. EL1 register names accessed from EL2 reach the EL2 banks.
+pub const HCR_E2H: u64 = 1 << 34;
 
 #[derive(Clone, Debug)]
 #[repr(C)]
@@ -199,6 +218,20 @@ pub struct System {
     pub icc_igrpen0_el1: u64,
     pub cntp_ctl_el0: u64,
     pub actlr_el1: u64,
+    /// EL2 banks (SPTM runs at EL2, GL2). `SP_EL2` is `sp_el[2]`.
+    pub sctlr_el2: u64,
+    pub tcr_el2: u64,
+    pub ttbr0_el2: u64,
+    pub ttbr1_el2: u64,
+    pub mair_el2: u64,
+    pub vbar_el2: u64,
+    pub elr_el2: u64,
+    pub spsr_el2: u64,
+    pub esr_el2: u64,
+    pub far_el2: u64,
+    pub hcr_el2: u64,
+    pub tpidr_el2: u64,
+    pub cntvoff_el2: u64,
     /// Apple IMP-DEF configuration registers, indexed by `decode::SystemRegister::Apple`.
     pub apple: [u64; crate::aarch64::decode::APPLE_SLOTS],
     /// `MIDR_EL1`, `ID_AA64PFR0_EL1` and `ID_AA64MMFR0_EL1`: the identity this CPU
@@ -228,6 +261,19 @@ impl Default for System {
             ttbr0_el1: 0,
             ttbr1_el1: 0,
             tcr_el1: 0,
+            sctlr_el2: 0,
+            tcr_el2: 0,
+            ttbr0_el2: 0,
+            ttbr1_el2: 0,
+            mair_el2: 0,
+            vbar_el2: 0,
+            elr_el2: 0,
+            spsr_el2: 0,
+            esr_el2: 0,
+            far_el2: 0,
+            hcr_el2: 0,
+            tpidr_el2: 0,
+            cntvoff_el2: 0,
             mair_el1: 0,
             tpidr_el0: 0,
             tpidrro_el0: 0,

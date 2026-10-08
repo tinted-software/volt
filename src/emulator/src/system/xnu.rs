@@ -70,6 +70,12 @@ pub fn is_macho(image: &[u8]) -> bool {
     image.len() >= 4 && u32::from_le_bytes(image[..4].try_into().unwrap()) == MH_MAGIC_64
 }
 
+/// Whether `image` is a kernel collection (`MH_FILESET`), which enters at its reset
+/// trampoline rather than at `_start`.
+pub fn is_fileset(image: &[u8]) -> bool {
+    image.len() >= 16 && u32::from_le_bytes(image[12..16].try_into().unwrap()) == MH_FILESET
+}
+
 fn bad(reason: &'static str) -> Error {
     Error::BadMachO(reason)
 }

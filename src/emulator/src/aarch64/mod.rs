@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod decode;
 pub mod exception;
 pub mod fp;
+pub mod gxf;
 pub mod host;
 pub mod identification;
 pub mod pauth;

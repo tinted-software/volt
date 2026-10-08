@@ -36,9 +36,9 @@ pub const DEFAULT_CMDLINE: &str = "earlycon nokaslr loglevel=8";
 /// `MIDR_EL1` of an Icestorm core: implementer Apple (0x61), architecture from ID
 /// registers (0xf), part 0x022.
 pub const MIDR_EL1: u64 = 0x610f_0220;
-/// `ID_AA64PFR0_EL1`: EL0 and EL1 in AArch64, no EL2 or EL3, and floating point and
-/// Advanced SIMD implemented, as on the M1.
-pub const ID_AA64PFR0_EL1: u64 = 0x11;
+/// `ID_AA64PFR0_EL1`: EL0, EL1 and EL2 in AArch64 (EL2 hosts the SPTM monitor, which
+/// `CurrentEl` must report), no EL3, and floating point and Advanced SIMD implemented.
+pub const ID_AA64PFR0_EL1: u64 = 0x111;
 /// `ID_AA64MMFR0_EL1`: 4 KiB and 16 KiB translation granules (the Asahi kernel is built
 /// for 16 KiB pages and refuses a CPU without one), no 64 KiB granule, 40-bit PA.
 pub const ID_AA64MMFR0_EL1: u64 = (0xf << 24) | (1 << 20) | 2;
@@ -51,11 +51,16 @@ pub const ID_AA64ISAR1_EL1: u64 = (1 << 20) | (1 << 24) | (1 << 4);
 const CPUS: u32 = 1;
 
 /// Give `system` the identity of an M1 core.
-pub fn identify(system: &mut crate::aarch64::cpu::System) {
+pub fn identify(cpu: &mut crate::aarch64::cpu::Cpu) {
+    let system = &mut cpu.system;
     system.midr_el1 = MIDR_EL1;
     system.id_aa64pfr0_el1 = ID_AA64PFR0_EL1;
     system.id_aa64mmfr0_el1 = ID_AA64MMFR0_EL1;
     system.id_aa64isar1_el1 = ID_AA64ISAR1_EL1;
+    // The SPTM monitor polls `S3_6_c15_c12_4` until bit 0 is set before it continues
+    // (`mrs x0, s3_6_c15_c12_4; and x1, x0, #1; cbz x1, <mrs>`). Nothing here names the
+    // register, so bit 0 reads as set, which is the only value that lets the loop exit.
+    cpu.apple_bank.0[crate::aarch64::decode::apple_bank_slot(6, 12, 4)] = 1;
 }
 
 /// The SoC devices on the bus: the AIC, the power-state blocks, the console, and the

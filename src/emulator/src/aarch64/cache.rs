@@ -26,6 +26,8 @@ pub struct Cache {
     /// Where blocks come from on a local miss. Private to this cache unless
     /// built with `with_shared`.
     shared: Arc<SharedBlocks>,
+    /// Instructions one block scan may take: `MAX_INSNS`, or 1 when single-stepping.
+    max_insns: usize,
 }
 impl Default for Cache {
     fn default() -> Self {
@@ -34,6 +36,7 @@ impl Default for Cache {
             index: HashMap::new(),
             direct: alloc_direct(),
             shared: Arc::new(SharedBlocks::new(false)),
+            max_insns: MAX_INSNS,
         }
     }
 }
@@ -192,6 +195,17 @@ impl Cache {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// A cache whose blocks are one instruction each, so a trace sees every step.
+    pub fn single_step(inline_memory: bool) -> Self {
+        let mut cache = if inline_memory {
+            Self::with_inline_memory()
+        } else {
+            Self::new()
+        };
+        cache.max_insns = 1;
+        cache
+    }
     /// Whether blocks from this cache read `Cpu::dtlb`.
     pub fn inline_memory(&self) -> bool {
         self.shared.inline_memory()
@@ -326,7 +340,7 @@ impl Cache {
         let mut count = 0usize;
         let mut complete = false;
         let mut last = None;
-        for n in 0..MAX_INSNS {
+        for n in 0..self.max_insns {
             let at = cpu
                 .pc
                 .checked_add(count as u64)
@@ -366,7 +380,7 @@ impl Cache {
             // Never straddle a page: a block inside one page is validated by
             // that page's version alone, and the next page is translated and
             // checked when its own block starts.
-            complete = n + 1 == MAX_INSNS || (pc + count as u64) & 0xfff == 0;
+            complete = n + 1 == self.max_insns || (pc + count as u64) & 0xfff == 0;
             if complete {
                 break;
             }

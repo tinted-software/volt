@@ -9,6 +9,7 @@ pub mod esr;
 pub mod fdt;
 pub mod m1;
 pub mod machine;
+pub mod monitor;
 pub mod psci;
 pub mod smp;
 pub mod xnu;
@@ -511,11 +512,17 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
     });
     let mut machine = machine::Machine::new(shared_mem);
     if apple {
-        m1::identify(&mut machine.cpu.system);
+        m1::identify(&mut machine.cpu);
     }
     machine.cpu.pc = layout.entry;
     machine.cpu.x[0] = layout.boot_info;
     machine.cpu.x[1..4].fill(0);
+    if is_xnu && xnu::is_fileset(image) {
+        // A kernel collection enters at its reset trampoline: x0 is the reset type (0 for
+        // a cold boot) and x1 the boot arguments.
+        machine.cpu.x[0] = 0;
+        machine.cpu.x[1] = layout.boot_info;
+    }
     let started = Instant::now();
     let mut exits = 0;
     let mut timer_interrupts = 0;

@@ -90,8 +90,34 @@ The Linux kernel boots through the AIC and the S5L console, probes its power dom
 and panics on the missing root filesystem (`VFS: Unable to mount root fs`), which is
 the expected result without one. `--initrd`, `--disk` and `--smp` above 1 are rejected
 on this board. A kernelcache from the restore image (`MH_FILESET`) loads, with its ADT
-as `--dtb`, and runs its first blocks; it does not get past the early boot CPU
-table yet, and it needs PAuth and chained fixups before it can go further.
+as `--dtb`, and enters at its reset trampoline with the cold-boot reset type. It runs
+several hundred blocks of early boot, then executes `genter` (guarded execution) before
+it has set `VBAR_EL1`. The kernel expects iBoot to have enabled GXF and set its monitor
+entry, which volt does not provide; chained fixups are still not applied.
+
+The EL2 regime is modelled: `CurrentEl` reports EL2, exceptions and `ERET` target
+`VBAR_EL2`/`ELR_EL2`/`SPSR_EL2`, translation walks `TTBR0_EL2`/`TCR_EL2`, and
+`HCR_EL2.E2H` (VHE) redirects EL1 register names accessed from EL2 to their EL2 banks.
+`system::monitor` loads Apple's SPTM monitor (`sptm.t8103.release`) the way the boot
+firmware does: the image placed in DRAM at its physical address, the MMU off, EL2, and
+`x0` a boot structure (DRAM's virtual and physical base and size, the device tree, a
+scratch buffer). The monitor builds its own translation tables, turns the MMU on, and
+reads `chosen/memory-map` for the image regions iBoot would have recorded. Its strings
+(`sptm_fixup`, `unsupported auth_rebase key`) and a loop over the kernel's range suggest
+it applies the kernelcache's chained fixups itself; that is inferred, not yet confirmed.
+It runs about four million instructions on the real kernelcache before it panics with
+`init_get_image_region: error -1 looking up image region 'TXM-ro'`, written to its scratch
+buffer. The map holds one entry per image (`SPTM`, `TXM`, `BootKC`, `AuxKC`, `CL4`) and
+part (`-ro`, `-rx`, `-rw`, `-bx`, `-le`, `-rs`, plus `-entry`, `-virt`, `-exception`);
+volt supplies `BootKC-rs` and `BootKC-ro` only, and does not load TXM. GXF (`genter`,
+`gexit`, `GXF_*`, `VBAR_GL1`) and SPRR are not modelled; `genter` raises an undefined
+instruction.
+
+Two debugging hooks make this tractable. `Machine::set_step_trace` runs one instruction
+per block and reports each step with the system registers it changed, exception entries
+included. `Machine::set_memory_trace` reports every translated load and store (atomics
+and SIMD structure accesses excepted). Installing either turns the inline data TLB off,
+so a traced run is much slower than an untraced one.
 
 Not modelled: any arm-io device other than the AIC, the UART and the power-state
 blocks. Those addresses read as zero and writes are dropped, and the boot report counts

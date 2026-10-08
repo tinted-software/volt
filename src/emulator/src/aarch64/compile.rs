@@ -2446,6 +2446,19 @@ fn system_offset(r: SystemRegister) -> Option<usize> {
         CntpCtlEl0 => offset_of!(CpuSystem, cntp_ctl_el0),
         ActlrEl1 => offset_of!(CpuSystem, actlr_el1),
         VbarEl1 => offset_of!(CpuSystem, vbar_el1),
+        SctlrEl2 => offset_of!(CpuSystem, sctlr_el2),
+        TcrEl2 => offset_of!(CpuSystem, tcr_el2),
+        Ttbr0El2 => offset_of!(CpuSystem, ttbr0_el2),
+        Ttbr1El2 => offset_of!(CpuSystem, ttbr1_el2),
+        MairEl2 => offset_of!(CpuSystem, mair_el2),
+        VbarEl2 => offset_of!(CpuSystem, vbar_el2),
+        ElrEl2 => offset_of!(CpuSystem, elr_el2),
+        SpsrEl2 => offset_of!(CpuSystem, spsr_el2),
+        EsrEl2 => offset_of!(CpuSystem, esr_el2),
+        FarEl2 => offset_of!(CpuSystem, far_el2),
+        HcrEl2 => offset_of!(CpuSystem, hcr_el2),
+        TpidrEl2 => offset_of!(CpuSystem, tpidr_el2),
+        CntvoffEl2 => offset_of!(CpuSystem, cntvoff_el2),
         CpacrEl1 => offset_of!(CpuSystem, cpacr_el1),
         SctlrEl1 => offset_of!(CpuSystem, sctlr_el1),
         Ttbr0El1 => offset_of!(CpuSystem, ttbr0_el1),
@@ -2468,11 +2481,64 @@ fn system_offset(r: SystemRegister) -> Option<usize> {
         Fpsr => offset_of!(CpuSystem, fpsr),
         Daif => offset_of!(CpuSystem, daif),
         Apple(slot) => offset_of!(CpuSystem, apple) + 8 * usize::from(slot),
+        // After `system` in `Cpu`: relative to it, like every other register here.
+        AppleBank(slot) => {
+            offset_of!(Cpu, apple_bank) - offset_of!(Cpu, system) + 8 * usize::from(slot)
+        }
         MidrEl1 => offset_of!(CpuSystem, midr_el1),
         IdAa64pfr0El1 => offset_of!(CpuSystem, id_aa64pfr0_el1),
         IdAa64mmfr0El1 => offset_of!(CpuSystem, id_aa64mmfr0_el1),
         PacKey(slot) => offset_of!(CpuSystem, pac_keys) + 8 * usize::from(slot),
         IdAa64isar1El1 => offset_of!(CpuSystem, id_aa64isar1_el1),
+        _ => return None,
+    })
+}
+
+/// EL1 registers that `HCR_EL2.E2H` redirects to their EL2 banks when accessed from EL2:
+/// (EL1 field offset, EL2 field offset).
+fn vhe_banks(r: SystemRegister) -> Option<(usize, usize)> {
+    use SystemRegister::*;
+    Some(match r {
+        SctlrEl1 => (
+            offset_of!(CpuSystem, sctlr_el1),
+            offset_of!(CpuSystem, sctlr_el2),
+        ),
+        Ttbr0El1 => (
+            offset_of!(CpuSystem, ttbr0_el1),
+            offset_of!(CpuSystem, ttbr0_el2),
+        ),
+        Ttbr1El1 => (
+            offset_of!(CpuSystem, ttbr1_el1),
+            offset_of!(CpuSystem, ttbr1_el2),
+        ),
+        TcrEl1 => (
+            offset_of!(CpuSystem, tcr_el1),
+            offset_of!(CpuSystem, tcr_el2),
+        ),
+        MairEl1 => (
+            offset_of!(CpuSystem, mair_el1),
+            offset_of!(CpuSystem, mair_el2),
+        ),
+        VbarEl1 => (
+            offset_of!(CpuSystem, vbar_el1),
+            offset_of!(CpuSystem, vbar_el2),
+        ),
+        ElrEl1 => (
+            offset_of!(CpuSystem, elr_el1),
+            offset_of!(CpuSystem, elr_el2),
+        ),
+        SpsrEl1 => (
+            offset_of!(CpuSystem, spsr_el1),
+            offset_of!(CpuSystem, spsr_el2),
+        ),
+        EsrEl1 => (
+            offset_of!(CpuSystem, esr_el1),
+            offset_of!(CpuSystem, esr_el2),
+        ),
+        FarEl1 => (
+            offset_of!(CpuSystem, far_el1),
+            offset_of!(CpuSystem, far_el2),
+        ),
         _ => return None,
     })
 }
@@ -2515,6 +2581,29 @@ fn lower_system(l: &Lower, a: System) {
             l.put(a.rt, l.load_ptr(l.u64, p))
         } else {
             l.store_ptr(p, l.reg(l.u64, a.rt, true))
+        }
+        return;
+    }
+    if let Some((el1, el2)) = vhe_banks(a.register) {
+        // HCR_EL2.E2H: EL1 register names accessed from EL2 reach the EL2 banks.
+        let current = l.cv(l.u64, l.load(l.u8, at + offset_of!(CpuSystem, el)));
+        let el2_mode = l.cmp(C::Eq, current, l.k(l.u64, 2));
+        let e2h = l.cmp(
+            C::Ne,
+            l.imm(
+                l.u64,
+                B::BitAnd,
+                l.load(l.u64, at + offset_of!(CpuSystem, hcr_el2)),
+                super::cpu::HCR_E2H,
+            ),
+            l.k(l.u64, 0),
+        );
+        let redirect = l.bin(l.boolean, B::BitAnd, el2_mode, e2h);
+        let p = l.sel(l.ptr, redirect, l.addr(at + el2), l.addr(at + el1));
+        if a.read {
+            l.put(a.rt, l.load_ptr(l.u64, p));
+        } else {
+            l.store_ptr(p, l.reg(l.u64, a.rt, true));
         }
         return;
     }

@@ -27,21 +27,65 @@ pub struct Entry {
     pub ap: u8,
     pub executable: bool,
 }
+/// The translation regime for the current EL. `split` regimes (EL1&0, and EL2 with
+/// `HCR_EL2.E2H`, or EL0 under TGE with E2H) walk a TTBR0 and a TTBR1 range under the
+/// `TCR_EL1` layout. EL2 without E2H has one TTBR0 range under `TCR_EL2`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Context {
+struct Regime {
     sctlr: u64,
     tcr: u64,
     ttbr0: u64,
     ttbr1: u64,
+    split: bool,
+    /// Bit position of the physical-address size field: IPS (34:32) or PS (18:16).
+    ips_shift: u32,
+}
+impl Regime {
+    fn of(cpu: &Cpu) -> Self {
+        use super::cpu::{HCR_E2H, HCR_TGE};
+        let hcr = cpu.system.hcr_el2;
+        let el2_regime =
+            cpu.system.el == 2 || (cpu.system.el == 0 && hcr & HCR_TGE != 0 && hcr & HCR_E2H != 0);
+        if !el2_regime {
+            return Self {
+                sctlr: cpu.system.sctlr_el1,
+                tcr: cpu.system.tcr_el1,
+                ttbr0: cpu.system.ttbr0_el1,
+                ttbr1: cpu.system.ttbr1_el1,
+                split: true,
+                ips_shift: 32,
+            };
+        }
+        if hcr & HCR_E2H != 0 {
+            Self {
+                sctlr: cpu.system.sctlr_el2,
+                tcr: cpu.system.tcr_el2,
+                ttbr0: cpu.system.ttbr0_el2,
+                ttbr1: cpu.system.ttbr1_el2,
+                split: true,
+                ips_shift: 32,
+            }
+        } else {
+            Self {
+                sctlr: cpu.system.sctlr_el2,
+                tcr: cpu.system.tcr_el2,
+                ttbr0: cpu.system.ttbr0_el2,
+                ttbr1: 0,
+                split: false,
+                ips_shift: 16,
+            }
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Context {
+    regime: Regime,
     el: u8,
 }
 impl Context {
     fn of(cpu: &Cpu) -> Self {
         Self {
-            sctlr: cpu.system.sctlr_el1,
-            tcr: cpu.system.tcr_el1,
-            ttbr0: cpu.system.ttbr0_el1,
-            ttbr1: cpu.system.ttbr1_el1,
+            regime: Regime::of(cpu),
             el: cpu.system.el,
         }
     }
@@ -85,10 +129,11 @@ impl Tlb {
     }
 }
 fn enabled(cpu: &Cpu) -> Result<bool, TranslateError> {
-    if cpu.system.sctlr_el1 & 1 == 0 {
+    let regime = Regime::of(cpu);
+    if regime.sctlr & 1 == 0 {
         return Ok(false);
     }
-    if cpu.system.tcr_el1 & 63 == 0 {
+    if regime.tcr & 63 == 0 {
         return Err(TranslateError::MalformedTables);
     }
     Ok(true)
@@ -97,7 +142,10 @@ pub fn physical_bits(cpu: &Cpu) -> Result<u8, TranslateError> {
     if !enabled(cpu)? {
         return Ok(64);
     }
-    Ok([32, 36, 40, 42, 48, 52, 56, 56][((cpu.system.tcr_el1 >> 32) & 7) as usize])
+    let regime = Regime::of(cpu);
+    // IPS (TCR_EL1 bits 34:32) or PS (TCR_EL2 bits 18:16).
+    let field = (regime.tcr >> regime.ips_shift) & 7;
+    Ok([32, 36, 40, 42, 48, 52, 56, 56][field as usize])
 }
 fn permitted(ap: u8, executable: bool, access: Access, el: u8) -> Result<(), TranslateError> {
     if (el == 0 && ap & 1 == 0)
@@ -119,8 +167,9 @@ pub fn translate<M: GuestMemory + ?Sized>(
     if !enabled(cpu)? {
         return Ok(virtual_address);
     }
-    let t1sz = ((cpu.system.tcr_el1 >> 16) & 63) as u32;
-    if t1sz == 0 {
+    let regime = Regime::of(cpu);
+    let t1sz = ((regime.tcr >> 16) & 63) as u32;
+    if regime.split && t1sz == 0 {
         return Err(TranslateError::MalformedTables);
     }
     if ((virtual_address >> 55) & 1 != 0 && virtual_address >> 48 != 0xffff)
@@ -128,11 +177,11 @@ pub fn translate<M: GuestMemory + ?Sized>(
     {
         return Err(TranslateError::TranslationFault);
     }
-    let lower_bits = 64 - (cpu.system.tcr_el1 & 63) as u32;
+    let lower_bits = 64 - (regime.tcr & 63) as u32;
     let upper_bits = 64 - t1sz;
     let upper = if virtual_address >> lower_bits == 0 {
         false
-    } else if virtual_address >> upper_bits == u64::MAX >> upper_bits {
+    } else if regime.split && virtual_address >> upper_bits == u64::MAX >> upper_bits {
         true
     } else {
         return Err(TranslateError::TranslationFault);
@@ -171,8 +220,9 @@ fn walk<M: GuestMemory + ?Sized>(
     access: Access,
     upper: bool,
 ) -> Result<Entry, TranslateError> {
-    let tcr = cpu.system.tcr_el1;
-    if (upper && tcr & (1 << 23) != 0) || (!upper && tcr & (1 << 7) != 0) {
+    let regime = Regime::of(cpu);
+    let tcr = regime.tcr;
+    if (upper && tcr & (1 << 23) != 0) || (!upper && regime.split && tcr & (1 << 7) != 0) {
         return Err(TranslateError::TranslationFault);
     }
     let granule = if upper {
@@ -184,11 +234,7 @@ fn walk<M: GuestMemory + ?Sized>(
         return Err(TranslateError::MalformedTables);
     }
     // ASID is in TTBR bits 63:48, never part of a physical table address.
-    let root = if upper {
-        cpu.system.ttbr1_el1
-    } else {
-        cpu.system.ttbr0_el1
-    };
+    let root = if upper { regime.ttbr1 } else { regime.ttbr0 };
     let va_bits = 64 - if upper { (tcr >> 16) & 63 } else { tcr & 63 };
     if va_bits > 48 || va_bits <= u64::from(granule) {
         return Err(TranslateError::MalformedTables);
@@ -692,6 +738,36 @@ mod tests {
         assert_eq!(
             translate(&mut tlb, &cpu, &mut memory, 0, Access::Read),
             Err(TranslateError::PermissionFault)
+        );
+    }
+    #[test]
+    fn el2_walks_only_ttbr0_el2_under_tcr_el2_and_has_no_upper_range() {
+        let mut cpu = Cpu::default();
+        cpu.system.el = 2;
+        cpu.system.sctlr_el2 = 1;
+        // T0SZ = 16 (48-bit VAs), TG0 = 4 KiB, PS = 40 bits.
+        cpu.system.tcr_el2 = 16 | (2 << 16);
+        cpu.system.ttbr0_el2 = 0;
+        // The EL1&0 regime is disabled: EL2 translates from its own registers.
+        cpu.system.sctlr_el1 = 0;
+        let mut memory = Memory::new();
+        memory.chain(0, 0, 12, 4, 0, 0x4000_0443);
+        let mut tlb = Tlb::new();
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, 0, Access::Read),
+            Ok(0x4000_0000)
+        );
+        assert_eq!(physical_bits(&cpu), Ok(40));
+        // Bit 55 set with an all-ones upper half: a TTBR1 address, which EL2 lacks.
+        assert_eq!(
+            translate(
+                &mut tlb,
+                &cpu,
+                &mut memory,
+                0xffff_8000_0000_0000,
+                Access::Read
+            ),
+            Err(TranslateError::TranslationFault)
         );
     }
 }
