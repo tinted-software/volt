@@ -4,8 +4,10 @@
 
 pub mod afdt;
 pub mod boot;
+pub mod dtb;
 pub mod esr;
 pub mod fdt;
+pub mod m1;
 pub mod machine;
 pub mod psci;
 pub mod smp;
@@ -92,6 +94,8 @@ pub struct BootReport {
     pub executed_blocks: u64,
     pub timer_interrupts: u64,
     pub unmapped_accesses: u64,
+    /// Accesses to arm-io devices the M1 model does not implement (read as zero).
+    pub unmodeled_device_accesses: u64,
     pub stalled_at: Option<u64>,
     pub instruction: Option<InstructionDiagnostic>,
     pub last_fault_walk: Vec<WalkEntry>,
@@ -171,6 +175,11 @@ impl core::fmt::Display for BootReport {
         }
         writeln!(
             f,
+            "unmodeled device accesses {}",
+            self.unmodeled_device_accesses
+        )?;
+        writeln!(
+            f,
             "exits {}, blocks compiled {}, blocks executed {}, timer interrupts {}, unmapped accesses {}, elapsed {:.3}s",
             self.exits,
             self.compiled_blocks,
@@ -189,6 +198,18 @@ pub struct SystemConfig<B = Vec<u8>> {
     pub ram_size: usize,
     pub initrd: Option<Vec<u8>>,
     pub disk: Option<B>,
+    pub board: Board,
+}
+
+/// The machine a boot builds around the kernel.
+#[derive(Debug, Clone, Default)]
+pub enum Board {
+    /// QEMU `virt`-style board: a GICv2 for Linux, a GICv3 for XNU, a PL011 console.
+    #[default]
+    Virt,
+    /// Apple M1 (t8103) SoC ([`m1`]): an AIC and an S5L console. Linux only. The
+    /// caller supplies the device tree, such as the Asahi kernel's `t8103-j274.dtb`.
+    AppleM1 { device_tree: Vec<u8> },
 }
 
 impl<B> Default for SystemConfig<B> {
@@ -200,6 +221,7 @@ impl<B> Default for SystemConfig<B> {
             ram_size: RAM_SIZE,
             initrd: None,
             disk: None,
+            board: Board::Virt,
         }
     }
 }
@@ -207,10 +229,12 @@ impl<B> Default for SystemConfig<B> {
 /// The interrupt controller a boot configures: the GICv2 a Linux device tree
 /// describes, or the GICv3 XNU's platform expects. Shared peripherals (UART, virtio)
 /// are wired to the GICv2 only; the GICv3 carries the virtual timer, which the
-/// machine evaluates live from the timer registers.
+/// machine evaluates live from the timer registers. The M1 board has no GIC: its
+/// AIC sits in [`m1::Soc`] and presents the virtual timer as a FIQ.
 enum Intc {
     V2(Gicv2),
     V3(Gicv3),
+    Apple,
 }
 impl Intc {
     fn raise(&mut self, intid: u32) {
@@ -231,35 +255,51 @@ impl Intc {
     fn signalled(&self, cpu: u32) -> bool {
         match self {
             Self::V2(gic) => gic.signalled(cpu),
-            Self::V3(_) => false,
+            Self::V3(_) | Self::Apple => false,
         }
     }
     /// See [`machine::Machine::vtimer_fiq`].
     fn vtimer_fiq(&self) -> Option<u8> {
         match self {
-            Self::V2(_) => None,
+            Self::V2(_) | Self::Apple => None,
             Self::V3(gic) => gic.vtimer_fiq_priority(),
         }
     }
+    /// Whether the CPU sees a FIQ from the virtual timer, which is due at `due`. The
+    /// M1 AIC presents the timer's own condition with no further gating.
+    fn timer_fiq(&self, due: bool) -> bool {
+        matches!(self, Self::Apple) && due
+    }
 }
 
+/// The bus of one board. The fixed windows (QEMU `virt`'s UART, GIC and virtio) exist
+/// only on the virt board; on the M1 board `soc` answers instead, and the GIC accessors
+/// below are never reached with [`Intc::Apple`].
 struct SystemDevices<'a, V> {
-    serial: &'a mut Pl011,
+    serial: Option<&'a mut Pl011>,
     gic: &'a mut Intc,
     virtio: Option<&'a mut V>,
+    soc: Option<&'a mut m1::Soc>,
 }
 
 impl<V: crate::devices::VirtioIo> machine::DeviceIo for SystemDevices<'_, V> {
     fn read_uart(&mut self, offset: u64, size: u8) -> u64 {
-        self.serial.read(offset, size)
+        self.serial
+            .as_mut()
+            .expect("the fixed UART window exists only on the virt board, which has a PL011")
+            .read(offset, size)
     }
     fn write_uart(&mut self, offset: u64, size: u8, value: u64) {
-        self.serial.write(offset, size, value);
+        self.serial
+            .as_mut()
+            .expect("the fixed UART window exists only on the virt board, which has a PL011")
+            .write(offset, size, value);
     }
     fn read_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64 {
         match self.gic {
             Intc::V2(gic) => gic.read_distributor_for(cpu_id, offset, size),
             Intc::V3(gic) => gic.read_distributor(offset, size),
+            Intc::Apple => 0,
         }
     }
     fn write_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64) {
@@ -268,13 +308,14 @@ impl<V: crate::devices::VirtioIo> machine::DeviceIo for SystemDevices<'_, V> {
                 gic.write_distributor_for(cpu_id, offset, size, value);
             }
             Intc::V3(gic) => gic.write_distributor(offset, size, value),
+            Intc::Apple => {}
         }
     }
     fn read_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64 {
         match self.gic {
             Intc::V2(gic) => gic.read_cpu_for(cpu_id, offset, size),
             // The GICv3 CPU interface is the `ICC_*` system registers.
-            Intc::V3(_) => 0,
+            Intc::V3(_) | Intc::Apple => 0,
         }
     }
     fn write_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64) {
@@ -285,7 +326,7 @@ impl<V: crate::devices::VirtioIo> machine::DeviceIo for SystemDevices<'_, V> {
     fn read_gic_redistributor(&mut self, offset: u64, size: u8) -> u64 {
         match self.gic {
             Intc::V3(gic) => gic.read_redistributor(offset, size),
-            Intc::V2(_) => 0,
+            Intc::V2(_) | Intc::Apple => 0,
         }
     }
     fn write_gic_redistributor(&mut self, offset: u64, size: u8, value: u64) {
@@ -305,8 +346,18 @@ impl<V: crate::devices::VirtioIo> machine::DeviceIo for SystemDevices<'_, V> {
             v.write(offset, size, value);
         }
     }
+    fn read_soc(&mut self, cpu_id: u32, address: u64, size: u8) -> Option<u64> {
+        self.soc.as_mut()?.read(cpu_id, address, size)
+    }
+    fn write_soc(&mut self, cpu_id: u32, address: u64, size: u8, value: u64) -> bool {
+        self.soc
+            .as_mut()
+            .is_some_and(|soc| soc.write(cpu_id, address, size, value))
+    }
+    fn has_fixed_windows(&self) -> bool {
+        self.soc.is_none()
+    }
 }
-
 /// Boot a raw Linux Image with live serial output on stdout and a bounded wall-clock run.
 /// Execution faults are returned in the report with the full guest state, not discarded.
 pub fn boot(image: &[u8], timeout: Duration, cmdline: &str) -> Result<BootReport, Error> {
@@ -357,6 +408,7 @@ pub fn boot_with_options(
             ram_size: RAM_SIZE,
             initrd: None,
             disk: None,
+            board: Board::Virt,
         },
         sink,
     )
@@ -375,26 +427,48 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
     };
     let timeout = config.timeout;
     let idle_mode = config.idle_mode;
-    let region = Region::ram(RAM_BASE, vec![0; ram_size]).map_err(Error::Memory)?;
+    let apple = matches!(config.board, Board::AppleM1 { .. });
+    let ram_base = if apple { m1::RAM_BASE } else { RAM_BASE };
+    let region = Region::ram(ram_base, vec![0; ram_size]).map_err(Error::Memory)?;
     let memory = PhysicalMemory::new(vec![region]).map_err(Error::Memory)?;
     let mut shared_mem = SharedMemory::new(memory);
     let has_virtio = config.disk.is_some();
     let is_xnu = xnu::is_macho(image);
-    let layout = if is_xnu {
-        if config.initrd.is_some() || has_virtio {
-            return Err(Error::Boot(boot::Error::Unsupported(
-                "XNU boot has no initrd or virtio disk support",
-            )));
+    let layout = match config.board {
+        Board::AppleM1 { device_tree } => {
+            if is_xnu {
+                return Err(Error::Boot(boot::Error::Unsupported(
+                    "XNU boot on the Apple M1 SoC is not supported yet",
+                )));
+            }
+            if has_virtio || config.initrd.is_some() {
+                return Err(Error::Boot(boot::Error::Unsupported(
+                    "the Apple M1 SoC has no initrd or virtio disk support yet",
+                )));
+            }
+            m1::prepare(
+                &mut shared_mem,
+                image,
+                &device_tree,
+                &config.cmdline,
+                ram_size as u64,
+            )
         }
-        xnu::prepare_boot(
-            &mut shared_mem,
-            image,
-            &config.cmdline,
-            RAM_BASE,
-            ram_size as u64,
-        )
-    } else {
-        boot::prepare_boot(
+        Board::Virt if is_xnu => {
+            if config.initrd.is_some() || has_virtio {
+                return Err(Error::Boot(boot::Error::Unsupported(
+                    "XNU boot has no initrd or virtio disk support",
+                )));
+            }
+            xnu::prepare_boot(
+                &mut shared_mem,
+                image,
+                &config.cmdline,
+                RAM_BASE,
+                ram_size as u64,
+            )
+        }
+        Board::Virt => boot::prepare_boot(
             &mut shared_mem,
             image,
             config.initrd.as_deref(),
@@ -403,22 +477,28 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
             ram_size as u64,
             1,
             has_virtio,
-        )
+        ),
     }
     .map_err(Error::Boot)?;
     let console = Arc::new(Mutex::new(Vec::new()));
     let serial_console = console.clone();
-    let uart_line = Arc::new(AtomicBool::new(false));
-    let serial_line = uart_line.clone();
-    let mut serial = Pl011::new(move |byte| {
+    let emit = move |byte: u8| {
         serial_console.lock().push(byte);
         sink(byte);
-    })
-    .with_line(move |level| serial_line.store(level, Ordering::Release));
-    let mut gic = if is_xnu {
-        Intc::V3(Gicv3::default())
+    };
+    let uart_line = Arc::new(AtomicBool::new(false));
+    let serial_line = uart_line.clone();
+    let (mut serial, mut soc, mut gic) = if apple {
+        (None, Some(m1::Soc::new(emit)), Intc::Apple)
     } else {
-        Intc::V2(Gicv2::default())
+        let serial =
+            Pl011::new(emit).with_line(move |level| serial_line.store(level, Ordering::Release));
+        let gic = if is_xnu {
+            Intc::V3(Gicv3::default())
+        } else {
+            Intc::V2(Gicv2::default())
+        };
+        (Some(serial), None, gic)
     };
     let virtio_line = Arc::new(AtomicBool::new(false));
     let virtio_notify = virtio_line.clone();
@@ -427,6 +507,9 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
             .with_line(move |level| virtio_notify.store(level, Ordering::Release))
     });
     let mut machine = machine::Machine::new(shared_mem);
+    if apple {
+        m1::identify(&mut machine.cpu.system);
+    }
     machine.cpu.pc = layout.entry;
     machine.cpu.x[0] = layout.boot_info;
     machine.cpu.x[1..4].fill(0);
@@ -437,22 +520,32 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
         if started.elapsed() >= timeout {
             break StopReason::Timeout;
         }
-        if uart_line.load(Ordering::Acquire) {
-            gic.raise(fdt::UART_INTID);
-        } else {
-            gic.lower(fdt::UART_INTID);
+        match soc.as_mut() {
+            Some(soc) => soc.sync_lines(),
+            None => {
+                if uart_line.load(Ordering::Acquire) {
+                    gic.raise(fdt::UART_INTID);
+                } else {
+                    gic.lower(fdt::UART_INTID);
+                }
+                if virtio_line.load(Ordering::Acquire) {
+                    gic.raise(fdt::VIRTIO_INTID);
+                } else {
+                    gic.lower(fdt::VIRTIO_INTID);
+                }
+            }
         }
-        if virtio_line.load(Ordering::Acquire) {
-            gic.raise(fdt::VIRTIO_INTID);
-        } else {
-            gic.lower(fdt::VIRTIO_INTID);
-        }
-        machine.irq_line = gic.signalled(0);
+        machine.irq_line = match &soc {
+            Some(soc) => soc.irq_pending(0),
+            None => gic.signalled(0),
+        };
+        machine.fiq_line = gic.timer_fiq(machine.timer_due());
         machine.vtimer_fiq = gic.vtimer_fiq();
         let mut dev = SystemDevices {
-            serial: &mut serial,
+            serial: serial.as_mut(),
             gic: &mut gic,
             virtio: virtio.as_mut(),
+            soc: soc.as_mut(),
         };
         match machine.run_with_devices(&mut dev) {
             Ok(machine::Exit::Timer) => {
@@ -522,7 +615,7 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
         if !is_xnu
             && machine.cpu.system.sctlr_el1 & 1 == 0
             && sp != 0
-            && !(RAM_BASE..=RAM_BASE + ram_size as u64).contains(&sp)
+            && !(ram_base..=ram_base + ram_size as u64).contains(&sp)
         {
             break StopReason::LostStack;
         }
@@ -544,6 +637,7 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
         executed_blocks: machine.blocks_run,
         timer_interrupts,
         unmapped_accesses: machine.unmapped,
+        unmodeled_device_accesses: soc.as_ref().map_or(0, |soc| soc.unmodeled_accesses()),
         stalled_at,
         instruction,
         last_fault_walk,
@@ -585,41 +679,58 @@ fn instruction_diagnostic<M: GuestMemory>(
     }
     last
 }
+/// The descriptors a translation of `address` reads, top level first, for the granule
+/// and VA size the TCR selects. It follows `translate::walk` step for step, so the
+/// report shows what the translation saw, for any granule.
 fn walk_diagnostic(cpu: &Cpu, memory: &impl GuestMemory, address: u64) -> Vec<WalkEntry> {
     let mut entries = Vec::new();
     if address == 0 || cpu.system.sctlr_el1 & 1 == 0 {
         return entries;
     }
-    let upper = address >> 63 != 0;
-    let size = if upper {
-        (cpu.system.tcr_el1 >> 16) & 63
+    let tcr = cpu.system.tcr_el1;
+    let (granule, va_bits, root) = if address >> 63 != 0 {
+        let granule = [0u32, 14, 12, 16][((tcr >> 30) & 3) as usize];
+        let size = ((tcr >> 16) & 63) as u32;
+        (granule, 64 - size, cpu.system.ttbr1_el1)
     } else {
-        cpu.system.tcr_el1 & 63
+        let granule = [12u32, 16, 14, 0][((tcr >> 14) & 3) as usize];
+        let size = (tcr & 63) as u32;
+        (granule, 64 - size, cpu.system.ttbr0_el1)
     };
-    let granule = if upper {
-        (cpu.system.tcr_el1 >> 30) & 3
-    } else {
-        (cpu.system.tcr_el1 >> 14) & 3
-    };
-    if (!upper && granule != 0) || (upper && granule != 2) {
+    if granule == 0 || va_bits > 48 || va_bits <= granule {
         return entries;
     }
-    let bits = 64u64.saturating_sub(size);
-    let levels = bits.saturating_sub(12).div_ceil(9).clamp(1, 4) as u8;
-    let mut table = if upper {
-        cpu.system.ttbr1_el1
+    let stride = granule - 3;
+    let levels = (va_bits - granule).div_ceil(stride);
+    if levels > 4 {
+        return entries;
+    }
+    let top_bits = va_bits - (granule + stride * (levels - 1));
+    let root_alignment = if granule == 12 {
+        granule
     } else {
-        cpu.system.ttbr0_el1
-    } & 0x0000_ffff_ffff_f000;
-    for level in 4 - levels..4 {
-        let index = (address >> (39 - 9 * level)) & 0x1ff;
+        (top_bits + 3).max(6)
+    };
+    let address_mask = 0x0000_ffff_ffff_ffff & !((1u64 << granule) - 1);
+    let mut table = root & 0x0000_ffff_ffff_ffff & !((1u64 << root_alignment) - 1);
+    for depth in 0..levels {
+        // `translate::walk` counts levels from the leaf; the report counts from the top.
+        let from_leaf = levels - 1 - depth;
+        let shift = granule + stride * from_leaf;
+        let index_bits = if granule != 12 && depth == 0 {
+            top_bits
+        } else {
+            stride
+        };
+        let index = (address >> shift) & ((1u64 << index_bits) - 1);
+        let at = table.wrapping_add(index * 8);
         let mut bytes = [0; 8];
         let descriptor = memory
-            .read(table + index * 8, &mut bytes)
+            .read(at, &mut bytes)
             .ok()
             .map(|_| u64::from_le_bytes(bytes));
         entries.push(WalkEntry {
-            level,
+            level: (4 - levels + depth) as u8,
             table,
             index,
             descriptor,
@@ -627,10 +738,10 @@ fn walk_diagnostic(cpu: &Cpu, memory: &impl GuestMemory, address: u64) -> Vec<Wa
         let Some(descriptor) = descriptor else {
             break;
         };
-        if descriptor & 3 != 3 || level == 3 {
+        if descriptor & 3 != 3 || from_leaf == 0 {
             break;
         }
-        table = descriptor & 0x0000_ffff_ffff_f000;
+        table = descriptor & address_mask;
     }
     entries
 }
@@ -771,6 +882,7 @@ mod tests {
                 ram_size: 256 << 20,
                 initrd: Some(b"test initrd".to_vec()),
                 disk: None,
+                board: Board::Virt,
             },
             |_| {},
         )
@@ -799,6 +911,7 @@ mod tests {
                 ram_size: 128 << 20,
                 initrd: None,
                 disk: Some(disk),
+                board: Board::Virt,
             },
             |_| {},
         )

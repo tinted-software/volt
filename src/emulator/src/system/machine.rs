@@ -44,6 +44,23 @@ pub trait DeviceIo {
     fn write_virtio(&mut self, offset: u64, size: u8, value: u64) {
         let _ = (offset, size, value);
     }
+    /// A device the board places anywhere in the address space (the M1 SoC's
+    /// interrupt controller and UART). `None` declines the access, which then goes
+    /// to the fixed windows below.
+    fn read_soc(&mut self, cpu_id: u32, address: u64, size: u8) -> Option<u64> {
+        let _ = (cpu_id, address, size);
+        None
+    }
+    /// Returns `false` when the board's devices do not claim the address.
+    fn write_soc(&mut self, cpu_id: u32, address: u64, size: u8, value: u64) -> bool {
+        let _ = (cpu_id, address, size, value);
+        false
+    }
+    /// Whether the fixed windows below (the QEMU `virt` UART, GIC and virtio) exist on
+    /// this board. A board that maps none of them makes accesses there fault.
+    fn has_fixed_windows(&self) -> bool {
+        true
+    }
 }
 
 impl DeviceIo for (&mut Pl011, &mut Gicv2) {
@@ -167,6 +184,10 @@ pub struct Machine<M> {
     /// Set when a GICv3 forwards PPI 27 (the virtual timer) as a group 0 FIQ: the
     /// priority it was given. `None` leaves the timer to the GICv2 path.
     pub vtimer_fiq: Option<u8>,
+    /// A FIQ source the board drives directly. The M1 interrupt controller presents
+    /// the virtual timer this way: it is level-high while the timer's own condition
+    /// holds, with no GIC-style priority gating.
+    pub fiq_line: bool,
     timer_fired: bool,
     pub stalled_at: u64,
     pub stalled: Option<String>,
@@ -201,6 +222,7 @@ impl<M: GuestMemory> Machine<M> {
             watch_epoch: 0,
             irq_line: false,
             vtimer_fiq: None,
+            fiq_line: false,
             timer_fired: false,
             stalled_at: 0,
             stalled: None,
@@ -269,7 +291,7 @@ impl<M: GuestMemory> Machine<M> {
             if self.timer_edge() {
                 return Ok(Exit::Timer);
             }
-            let fiq = self.fiq_asserted();
+            let fiq = self.fiq_line || self.fiq_asserted();
             self.cpu.system.isr_el1 = u64::from(self.irq_line) << 7 | u64::from(fiq) << 6;
             let kind = if fiq && self.cpu.system.daif & 1 == 0 {
                 Some(exception::Kind::Fiq)
@@ -384,14 +406,32 @@ impl<M: GuestMemory> Machine<M> {
                     self.cpu.trap = Trap::None;
                     exception::eret(&mut self.cpu);
                 }
-                Trap::Svc | Trap::Brk => {
-                    let ec = if self.cpu.trap == Trap::Svc { 0x15 } else { 0 };
+                Trap::Svc => {
                     self.cpu.trap = Trap::None;
                     let pc = self.cpu.pc;
                     exception::take(
                         &mut self.cpu,
                         exception::Reason {
-                            ec,
+                            ec: 0x15,
+                            status: 0,
+                            instruction: true,
+                            ..Default::default()
+                        },
+                        pc,
+                    );
+                }
+                Trap::Brk => {
+                    self.cpu.trap = Trap::None;
+                    let pc = self.cpu.pc;
+                    let immediate = self.cpu.address as u32;
+                    // A breakpoint's syndrome is EC 0x3c with its immediate in ISS.
+                    exception::take(
+                        &mut self.cpu,
+                        exception::Reason {
+                            ec: 0x3c,
+                            status: 0,
+                            instruction: true,
+                            iss: immediate,
                             ..Default::default()
                         },
                         pc,
@@ -407,12 +447,12 @@ impl<M: GuestMemory> Machine<M> {
                             ec: 0,
                             instruction: true,
                             status: 0,
+                            iss: 0,
                         },
                         pc,
                     );
                 }
                 Trap::Isb => {
-                    self.tlb.purge_faults();
                     self.cpu.trap = Trap::None;
                 }
                 Trap::Tlbi => {
@@ -613,17 +653,21 @@ impl<M: GuestMemory> Machine<M> {
         }
     }
     fn abort(&mut self, address: u64, permission: bool, instruction: bool, write: bool) {
+        let status = match (permission, instruction) {
+            (false, _) => exception::status::TRANSLATION,
+            (true, false) => exception::status::PERMISSION,
+            (true, true) => exception::status::PERMISSION_FETCH,
+        };
+        self.abort_with_status(address, status, instruction, write);
+    }
+    /// A synchronous abort with fault status `status`.
+    fn abort_with_status(&mut self, address: u64, status: u8, instruction: bool, write: bool) {
         let ec = if instruction {
             if self.cpu.system.el == 1 { 0x21 } else { 0x20 }
         } else if self.cpu.system.el == 1 {
             0x25
         } else {
             0x24
-        };
-        let status = if permission {
-            if instruction { 13 } else { 12 }
-        } else {
-            4
         };
         self.cpu.trap = Trap::None;
         if !instruction {
@@ -636,6 +680,7 @@ impl<M: GuestMemory> Machine<M> {
                 ec,
                 instruction,
                 status,
+                iss: 0,
             },
             address,
         );
@@ -963,7 +1008,7 @@ impl<M: GuestMemory> Machine<M> {
             };
             if matches!(result, Err(MemoryError::AccessFault { .. })) {
                 self.unmapped += 1;
-                self.abort(address, false, false, !load);
+                self.abort_with_status(address, exception::status::SYNC_EXTERNAL, false, !load);
                 return Ok(());
             }
             result
@@ -973,9 +1018,20 @@ impl<M: GuestMemory> Machine<M> {
             Err(MemoryError::AccessFault { .. }) => {
                 self.device_access = true;
                 let end = physical.checked_add(width as u64);
-                let window =
-                    |base, length| physical >= base && end.is_some_and(|end| end <= base + length);
-                let read = if window(fdt::UART_BASE, crate::devices::pl011::LEN) {
+                let fixed = devices.has_fixed_windows();
+                let window = |base, length| {
+                    fixed && physical >= base && end.is_some_and(|end| end <= base + length)
+                };
+                let soc = if load {
+                    devices.read_soc(self.cpu_id, physical, width).map(Some)
+                } else {
+                    devices
+                        .write_soc(self.cpu_id, physical, width, value)
+                        .then_some(None)
+                };
+                let read = if let Some(read) = soc {
+                    read
+                } else if window(fdt::UART_BASE, crate::devices::pl011::LEN) {
                     if load {
                         Some(devices.read_uart(physical - fdt::UART_BASE, width))
                     } else {
@@ -1026,7 +1082,7 @@ impl<M: GuestMemory> Machine<M> {
                     }
                 } else {
                     self.unmapped += 1;
-                    self.abort(address, false, false, !load);
+                    self.abort_with_status(address, exception::status::SYNC_EXTERNAL, false, !load);
                     return Ok(());
                 };
                 if let Some(value) = read {
@@ -1272,6 +1328,39 @@ mod tests {
             machine.run(&mut serial, &mut gic).unwrap(),
             Exit::Psci { .. }
         ));
+    }
+
+    #[test]
+    fn brk_takes_an_el1_breakpoint_exception_with_its_immediate_in_the_syndrome() {
+        let mut machine = machine();
+        machine.cpu.system.el = 1;
+        machine.cpu.system.spsel = true;
+        machine.cpu.system.vbar_el1 = 0x40000400;
+        // `brk #0x800`, the immediate the kernel's `BUG()` uses.
+        machine
+            .memory
+            .write(0x40000000, &0xd4210000u32.to_le_bytes())
+            .unwrap();
+        // The vector for a synchronous exception from EL1 on SP_EL1: `VBAR + 0x200`.
+        machine
+            .memory
+            .write(0x40000600, &HVC.to_le_bytes())
+            .unwrap();
+        machine.cpu.pc = 0x40000000;
+        let mut serial = Pl011::new(|_| {});
+        let mut gic = Gicv2::default();
+        assert!(matches!(
+            machine.run(&mut serial, &mut gic).unwrap(),
+            Exit::Psci { .. }
+        ));
+        let esr = machine.cpu.system.esr_el1;
+        assert_eq!(esr >> 26, 0x3c, "EC is a breakpoint");
+        assert_eq!((esr >> 25) & 1, 1, "IL: a 32-bit instruction");
+        assert_eq!(esr & 0xffff, 0x800, "ISS is the immediate");
+        assert_eq!(
+            machine.cpu.system.elr_el1, 0x40000000,
+            "ELR is the BRK itself"
+        );
     }
     const LDXR_X1_X0: u32 = 0xc85f7c01;
     const STXR_W2_X3_X0: u32 = 0xc8027c03;

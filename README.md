@@ -67,6 +67,38 @@ enforced by translation, the physical timer is stored but never fires, floating 
 rounds to nearest even and sets no `FPSR` flags, and the GICv3 carries only the
 virtual timer (no SPIs, SGIs or group 1).
 
+## Apple M1 (t8103) SoC
+
+`--dtb` selects the M1 machine in place of the QEMU `virt` board. The device tree is
+the Asahi kernel's board tree, which the kernel tree builds as
+`arch/arm64/boot/dts/apple/t8103-j274.dtb`:
+
+```sh
+cargo run --release --bin volt-boot -- \
+  ~/src/linux/arch/arm64/boot/Image 60 \
+  --dtb ~/src/linux/arch/arm64/boot/dts/apple/t8103-j274.dtb
+```
+
+The SoC addresses come from the M1 Mac mini's own device tree (`DeviceTree.j274ap`
+in a macOS restore image; `ipsw dtree` reads it). DRAM is at `0x8_0000_0000`, the
+interrupt controller (AIC) at `0x2_3b10_0000`, the power-state blocks at
+`0x2_3b70_0000` and `0x2_3d28_0000`, and the console (`apple,s5l-uart`, `stdout-path`)
+at `0x2_3520_0000`. The machine is one vCPU with the M1 Icestorm identity
+(`MIDR_EL1` 0x610f0220) and a 16 KiB granule, which the Asahi kernel requires.
+
+The Linux kernel boots through the AIC and the S5L console, probes its power domains,
+and panics on the missing root filesystem (`VFS: Unable to mount root fs`), which is
+the expected result without one. `--initrd`, `--disk` and `--smp` above 1 are rejected
+on this board, and a Mach-O kernel is refused: XNU needs the SoC's own ADT and
+firmware interfaces, which are not modelled.
+
+Not modelled: any arm-io device other than the AIC, the UART and the power-state
+blocks. Those addresses read as zero and writes are dropped, and the boot report counts
+them as `unmodeled device accesses`, so driver probes of missing hardware (DART, GPU,
+SMC, PCIe) fail rather than fault. Secondary cores stay powered off (the device tree
+gives them no release address), the physical timer never fires, and fast IPIs are
+storage only.
+
 ## Performance
 
 Translating a block costs much more than running it once, and a kernel boot runs most

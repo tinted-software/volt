@@ -8,8 +8,8 @@ use std::{
 };
 use volt_emulator::devices::BlockBackend;
 use volt_emulator::system::{
-    DEFAULT_CMDLINE, DEFAULT_XNU_CMDLINE, IdleMode, RAM_SIZE, SystemConfig, XNU_RAM_SIZE,
-    smp::SmpConfig,
+    Board, DEFAULT_CMDLINE, DEFAULT_XNU_CMDLINE, IdleMode, RAM_SIZE, SystemConfig, XNU_RAM_SIZE,
+    m1, smp::SmpConfig,
 };
 use winnow_args::{Args, ValueEnum};
 
@@ -36,7 +36,7 @@ impl From<IdleModeArg> for IdleMode {
 #[derive(Args, Debug)]
 #[arg(
     name = "volt-boot",
-    about = "AArch64 Linux or XNU boot with PL011, GICv2/GICv3, and VirtIO-Blk (Linux)"
+    about = "AArch64 Linux or XNU boot with PL011, GICv2/GICv3, VirtIO-Blk, or the Apple M1 SoC"
 )]
 struct Cli {
     /// Path to a raw Linux AArch64 Image, or an XNU kernel (Mach-O).
@@ -58,6 +58,11 @@ struct Cli {
     /// Initial ramdisk image (e.g. initramfs.cpio, initrd.img).
     #[arg(short, long, alias = "initramfs")]
     initrd: Option<PathBuf>,
+
+    /// Device tree for the Apple M1 (t8103) SoC, such as the Asahi kernel's
+    /// `t8103-j274.dtb`. Selects that machine in place of the QEMU `virt` board.
+    #[arg(long)]
+    dtb: Option<PathBuf>,
 
     /// Guest RAM size (e.g. 128M, 256M, 512M, 1G).
     #[arg(short, long, alias = "ram")]
@@ -193,10 +198,18 @@ fn run(cli: Cli) -> Result<(), String> {
 
     let seconds = cli.seconds.unwrap_or(20);
     let image = std::fs::read(&cli.image).map_err(|e| format!("{}: {e}", cli.image.display()))?;
+    let board = match &cli.dtb {
+        Some(path) => Board::AppleM1 {
+            device_tree: std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?,
+        },
+        None => Board::Virt,
+    };
     // A Mach-O image is an XNU kernel; anything else is a raw Linux Image.
     let xnu = volt_emulator::system::xnu::is_macho(&image);
     let default_cmdline = if xnu {
         DEFAULT_XNU_CMDLINE
+    } else if matches!(board, Board::AppleM1 { .. }) {
+        m1::DEFAULT_CMDLINE
     } else if cli.disk.is_some() {
         "root=/dev/vda rw console=ttyAMA0 earlycon=pl011,0x9000000 nokaslr loglevel=8"
     } else {
@@ -213,6 +226,8 @@ fn run(cli: Cli) -> Result<(), String> {
         RAM_SIZE.max((initrd.len() * 3 + (128 << 20)).next_power_of_two())
     } else if xnu {
         XNU_RAM_SIZE
+    } else if matches!(board, Board::AppleM1 { .. }) {
+        m1::DEFAULT_RAM_SIZE
     } else {
         RAM_SIZE
     };
@@ -227,6 +242,9 @@ fn run(cli: Cli) -> Result<(), String> {
         None => None,
     };
 
+    if cli.cpus > 1 && !matches!(board, Board::Virt) {
+        return Err("the Apple M1 SoC boots one vCPU; pass --smp 1".into());
+    }
     if cli.cpus > 1 {
         let config = SmpConfig {
             cpus: cli.cpus,
@@ -256,6 +274,7 @@ fn run(cli: Cli) -> Result<(), String> {
         ram_size,
         initrd: initrd_data,
         disk: disk_backend,
+        board,
     };
     let mut output = std::io::BufWriter::new(std::io::stdout());
     let report = volt_emulator::system::boot_system(&image, config, move |byte| {

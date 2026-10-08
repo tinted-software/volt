@@ -2147,7 +2147,10 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
             | Instruction::Dmb
             | Instruction::Yield => {}
             Instruction::Wfe => l.trap(pc.wrapping_add(4), Trap::Wfe),
-            Instruction::Trap => l.trap(pc, Trap::Brk),
+            Instruction::Brk(imm) => {
+                l.store(offset_of!(Cpu, address), l.k(l.u64, u64::from(imm)));
+                l.trap(pc, Trap::Brk)
+            }
             Instruction::Isb => l.trap(pc.wrapping_add(4), Trap::Isb),
             Instruction::Tlbi => l.trap(pc.wrapping_add(4), Trap::Tlbi),
             Instruction::DcZva(rt) => {
@@ -2464,6 +2467,10 @@ fn system_offset(r: SystemRegister) -> Option<usize> {
         Fpcr => offset_of!(CpuSystem, fpcr),
         Fpsr => offset_of!(CpuSystem, fpsr),
         Daif => offset_of!(CpuSystem, daif),
+        Apple(slot) => offset_of!(CpuSystem, apple) + 8 * usize::from(slot),
+        MidrEl1 => offset_of!(CpuSystem, midr_el1),
+        IdAa64pfr0El1 => offset_of!(CpuSystem, id_aa64pfr0_el1),
+        IdAa64mmfr0El1 => offset_of!(CpuSystem, id_aa64mmfr0_el1),
         _ => return None,
     })
 }
@@ -2531,7 +2538,7 @@ fn lower_system(l: &Lower, a: System) {
                 l.store(pan, l.imm(l.u64, B::BitAnd, bit, 1));
             }
         }
-        RazWi => {
+        RazWi | AppleZero => {
             if a.read {
                 l.put(a.rt, l.k(l.u64, 0));
             }

@@ -601,6 +601,11 @@ pub enum SystemRegister {
     ActlrEl1,
     Nzcv,
     RazWi,
+    /// Read-as-zero, write-ignored: Apple IMP-DEF status registers (`op0` 3).
+    AppleZero,
+    /// Apple IMP-DEF configuration register the guest reads back, stored in
+    /// `System::apple[slot]`.
+    Apple(u8),
 }
 impl SystemRegister {
     pub fn read_only(self) -> bool {
@@ -814,7 +819,7 @@ pub enum Instruction {
     Sevl,
     Wfe,
     Yield,
-    Trap,
+    Brk(u16),
     B(i64),
     BCond(BranchCondition),
     Csel(Select),
@@ -894,7 +899,7 @@ impl Instruction {
                 | Psci
                 | Wfi
                 | Wfe
-                | Trap
+                | Brk(_)
                 | Isb
                 | DcZva(_)
                 | AddressTranslate(_)
@@ -1081,6 +1086,48 @@ fn simd_struct(word: u32) -> Result<Option<(StructDesc, StructPost)>, DecodeErro
     }
     Ok(Some((desc, post)))
 }
+/// Number of Apple IMP-DEF configuration registers `System::apple` holds.
+pub const APPLE_SLOTS: usize = 21;
+
+/// The `S3_*` implementation-defined registers the M1 kernel and PMU driver touch
+/// at EL1 (`arch/arm64/include/asm/apple_m1_pmu.h`, `irq-apple-aic.c`). Configuration
+/// is stored so the guest reads back what it wrote. Status registers (IPI pending,
+/// PMU interrupt active, PMU state) read as zero: this model raises no fast IPIs and
+/// no PMU interrupts. Anything else falls through to the unsupported path.
+fn apple_register(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> Option<SystemRegister> {
+    use SystemRegister::*;
+    if op0 != 3 || crn != 15 {
+        return None;
+    }
+    Some(match (op1, crm, op2) {
+        (1, 0, 0) => Apple(0),
+        (1, 1, 0) => Apple(1),
+        (1, 2, 0) => Apple(2),
+        (1, 3, 0) => Apple(3),
+        (1, 4, 0) => Apple(4),
+        (1, 5, 0) => Apple(5),
+        (1, 6, 0) => Apple(6),
+        (1, 13, 0) => AppleZero,
+        (2, 0, 0) => Apple(7),
+        (2, 1, 0) => Apple(8),
+        (2, 2, 0) => Apple(9),
+        (2, 3, 0) => Apple(10),
+        (2, 4, 0) => Apple(11),
+        (2, 5, 0) => Apple(12),
+        (2, 6, 0) => Apple(13),
+        (2, 7, 0) => Apple(14),
+        (2, 9, 0) => Apple(15),
+        (2, 10, 0) => Apple(16),
+        (5, 0, 0) => Apple(17),
+        (5, 0, 1) => Apple(18),
+        (5, 1, 1) => AppleZero,
+        (5, 3, 1) => Apple(19),
+        (7, 0, 4) => Apple(20),
+        (7, 6, 4) => AppleZero,
+        _ => return None,
+    })
+}
+
 fn system_register(
     op0: u32,
     op1: u32,
@@ -1091,6 +1138,9 @@ fn system_register(
     use SystemRegister::*;
     if op0 == 2 && op1 == 0 && crn == 0 && (4..=7).contains(&op2) {
         return Ok(RazWi);
+    }
+    if let Some(register) = apple_register(op0, op1, crn, crm, op2) {
+        return Ok(register);
     }
     if op1 == 0 && crn == 4 && op2 == 5 {
         return Ok(SpSelSet);
@@ -1753,12 +1803,10 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             immediate: ((word >> 8) & 15) as u8,
         }));
     }
-    if word & 0xffe0_f000 == 0xd420_0000 {
-        return if word & 0x0000_ffe0 == 0x20 {
-            Ok(Trap)
-        } else {
-            Err(UnsupportedInstruction)
-        };
+    // BRK #imm16: opc 001 with LL 00. Its immediate is the whole field, so any value
+    // decodes; the trap carries it to the exception syndrome.
+    if word & 0xffe0_001f == 0xd420_0000 {
+        return Ok(Brk((word >> 5) as u16));
     }
     if word & 0x1f00_0000 == 0x1000_0000 {
         let page = word & 0x8000_0000 != 0;
@@ -2493,7 +2541,8 @@ mod tests {
             (0xd69f03e0, Eret),
             (0xd4000001, Svc),
             (0xd4000002, Psci),
-            (0xd4200020, Trap),
+            (0xd4200020, Brk(1)),
+            (0xd4210000, Brk(0x800)),
         ] {
             assert_eq!(decode(word), Ok(expected));
         }

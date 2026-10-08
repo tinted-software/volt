@@ -15,6 +15,8 @@ pub struct Reason {
     pub ec: u8,
     pub instruction: bool,
     pub status: u8,
+    /// Further ISS bits: a BRK's immediate. Syndromes with a DFSC leave this 0.
+    pub iss: u32,
 }
 impl Default for Reason {
     fn default() -> Self {
@@ -23,6 +25,7 @@ impl Default for Reason {
             ec: 0,
             instruction: false,
             status: status::TRANSLATION,
+            iss: 0,
         }
     }
 }
@@ -30,6 +33,8 @@ pub mod status {
     pub const TRANSLATION: u8 = 0b000100;
     pub const PERMISSION: u8 = 0b001100;
     pub const PERMISSION_FETCH: u8 = 0b001101;
+    /// Synchronous external abort: the access reached no memory or device.
+    pub const SYNC_EXTERNAL: u8 = 0b010000;
 }
 pub fn take(cpu: &mut Cpu, reason: Reason, fault_address: u64) -> u64 {
     let from = cpu.system.el;
@@ -41,7 +46,8 @@ pub fn take(cpu: &mut Cpu, reason: Reason, fault_address: u64) -> u64 {
     cpu.system.elr_el1 = cpu.pc;
     cpu.system.esr_el1 = (u64::from(reason.ec & 63) << 26)
         | (u64::from(reason.instruction) << 25)
-        | u64::from(reason.status & 63);
+        | u64::from(reason.status & 63)
+        | u64::from(reason.iss & 0x1ff_ffff);
     cpu.system.far_el1 = fault_address;
     let group = if from != 1 {
         2

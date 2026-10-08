@@ -199,6 +199,13 @@ pub struct System {
     pub icc_igrpen0_el1: u64,
     pub cntp_ctl_el0: u64,
     pub actlr_el1: u64,
+    /// Apple IMP-DEF configuration registers, indexed by `decode::SystemRegister::Apple`.
+    pub apple: [u64; crate::aarch64::decode::APPLE_SLOTS],
+    /// `MIDR_EL1`, `ID_AA64PFR0_EL1` and `ID_AA64MMFR0_EL1`: the identity this CPU
+    /// advertises, set by the board.
+    pub midr_el1: u64,
+    pub id_aa64pfr0_el1: u64,
+    pub id_aa64mmfr0_el1: u64,
 }
 impl Default for System {
     fn default() -> Self {
@@ -243,6 +250,10 @@ impl Default for System {
             icc_igrpen0_el1: 0,
             cntp_ctl_el0: 0,
             actlr_el1: 0,
+            apple: [0; crate::aarch64::decode::APPLE_SLOTS],
+            midr_el1: crate::aarch64::identification::DEFAULT_MIDR_EL1,
+            id_aa64pfr0_el1: crate::aarch64::identification::DEFAULT_ID_AA64PFR0_EL1,
+            id_aa64mmfr0_el1: crate::aarch64::identification::DEFAULT_ID_AA64MMFR0_EL1,
         }
     }
 }
