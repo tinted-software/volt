@@ -1,5 +1,9 @@
-//! VirtIO-MMIO v2 Block Device (VIRTIO_ID_BLOCK).
-//! Implements the VirtIO 1.0 (v2 modern) memory-mapped block device specification.
+//! VirtIO block device: the request queue, shared by its transports.
+//!
+//! `VirtioBlock` is the VirtIO-MMIO v2 transport (the Linux virt board's `virtio,mmio`
+//! device). `virtio_pci::VirtioBlockPci` is the same device behind the modern PCI transport.
+//! Both own the register state and hand the queue to a [`BlockQueue`], which serves the
+//! requests the driver made available.
 
 use crate::memory::{GuestMemory, SharedMemory};
 use alloc::vec::Vec;
@@ -9,10 +13,10 @@ pub const VERSION: u32 = 2; // Modern VirtIO v2
 pub const DEVICE_ID_BLOCK: u32 = 2; // Block device
 pub const VENDOR_ID: u32 = 0x554d4551; // "QEMU"
 
-// Feature bits
+// Feature bits (virtio 1.2, section 5.2.3)
 pub const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 pub const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
-pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 11;
+pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 // Request types
@@ -30,6 +34,8 @@ pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
 
 pub const QUEUE_MAX_SIZE: u32 = 128;
+/// Block addresses are in sectors of this many bytes.
+pub const SECTOR_SIZE: u64 = 512;
 
 /// Storage backend for a block device.
 pub trait BlockBackend: Send {
@@ -72,219 +78,47 @@ impl BlockBackend for Vec<u8> {
         Ok(())
     }
 }
+
+/// The virtqueue a transport configures: its size, its three rings, and the progress
+/// the device has made through them.
 #[derive(Clone, Copy, Default)]
-struct Queue {
-    num: u32,
-    ready: bool,
-    desc_table: u64,
-    avail_ring: u64,
-    used_ring: u64,
-    last_avail_idx: u16,
-    last_used_idx: u16,
+pub struct Queue {
+    pub num: u32,
+    pub ready: bool,
+    pub desc_table: u64,
+    pub avail_ring: u64,
+    pub used_ring: u64,
+    pub last_avail_idx: u16,
+    pub last_used_idx: u16,
 }
 
-pub struct VirtioBlock<B, L = fn(bool)> {
+/// The backing store, the guest memory the rings and buffers live in, and the one request
+/// queue. Transports set `queue` from their registers and call [`BlockQueue::process`]
+/// when the driver kicks it.
+pub struct BlockQueue<B> {
     pub backend: B,
     memory: SharedMemory,
-    status: u32,
-    device_features_sel: u32,
-    driver_features_sel: u32,
-    driver_features: u64,
-    queue_sel: u32,
-    queue: Queue,
-    interrupt_status: u32,
-    line: Option<L>,
+    pub queue: Queue,
 }
 
-impl<B: BlockBackend> VirtioBlock<B, fn(bool)> {
+impl<B: BlockBackend> BlockQueue<B> {
     pub fn new(backend: B, memory: SharedMemory) -> Self {
         Self {
             backend,
             memory,
-            status: 0,
-            device_features_sel: 0,
-            driver_features_sel: 0,
-            driver_features: 0,
-            queue_sel: 0,
             queue: Queue::default(),
-            interrupt_status: 0,
-            line: None,
-        }
-    }
-}
-
-impl<B: BlockBackend, L: FnMut(bool)> VirtioBlock<B, L> {
-    pub fn with_line<L2: FnMut(bool)>(self, line: L2) -> VirtioBlock<B, L2> {
-        VirtioBlock {
-            backend: self.backend,
-            memory: self.memory,
-            status: self.status,
-            device_features_sel: self.device_features_sel,
-            driver_features_sel: self.driver_features_sel,
-            driver_features: self.driver_features,
-            queue_sel: self.queue_sel,
-            queue: self.queue,
-            interrupt_status: self.interrupt_status,
-            line: Some(line),
         }
     }
 
-    fn raise_irq(&mut self) {
-        self.interrupt_status |= 1;
-        if let Some(line) = &mut self.line {
-            line(true);
-        }
+    /// The disk's capacity in sectors, as the device configuration reports it.
+    pub fn capacity_sectors(&self) -> u64 {
+        self.backend.len() / SECTOR_SIZE
     }
 
-    fn lower_irq(&mut self) {
-        self.interrupt_status = 0;
-        if let Some(line) = &mut self.line {
-            line(false);
-        }
-    }
-
-    pub fn read(&mut self, offset: u64, size: u8) -> u64 {
-        let value = match offset {
-            0x000 => MAGIC_VALUE as u64,
-            0x004 => VERSION as u64,
-            0x008 => DEVICE_ID_BLOCK as u64,
-            0x00c => VENDOR_ID as u64,
-            0x010 => {
-                let features = VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_F_VERSION_1;
-                if self.device_features_sel == 0 {
-                    (features & 0xffff_ffff) as u64
-                } else {
-                    (features >> 32) as u64
-                }
-            }
-            0x034 => {
-                if self.queue_sel == 0 {
-                    QUEUE_MAX_SIZE as u64
-                } else {
-                    0
-                }
-            }
-            0x044 => {
-                if self.queue_sel == 0 && self.queue.ready {
-                    1
-                } else {
-                    0
-                }
-            }
-            0x060 => self.interrupt_status as u64,
-            0x070 => self.status as u64,
-            0x0fc => 0, // config generation
-            // Configuration space:
-            // 0x100..0x108: capacity in 512-byte sectors (u64)
-            0x100..=0x107 => {
-                let capacity = self.backend.len() / 512;
-                let shift = (offset - 0x100) * 8;
-                capacity >> shift
-            }
-            // 0x114..=0x117: blk_size (512)
-            0x114 => 512,
-            _ => 0,
-        };
-        // Mask to access width
-        match size {
-            1 => value & 0xff,
-            2 => value & 0xffff,
-            4 => value & 0xffff_ffff,
-            _ => value,
-        }
-    }
-
-    pub fn write(&mut self, offset: u64, size: u8, value: u64) {
-        let _ = size;
-        match offset {
-            0x014 => self.device_features_sel = value as u32,
-            0x020 => {
-                if self.driver_features_sel == 0 {
-                    self.driver_features =
-                        (self.driver_features & !0xffff_ffff) | (value & 0xffff_ffff);
-                } else {
-                    self.driver_features = (self.driver_features & 0xffff_ffff) | (value << 32);
-                }
-            }
-            0x024 => self.driver_features_sel = value as u32,
-            0x030 => self.queue_sel = value as u32,
-            0x038 => {
-                if self.queue_sel == 0 {
-                    self.queue.num = (value as u32).min(QUEUE_MAX_SIZE);
-                }
-            }
-            0x044 => {
-                if self.queue_sel == 0 {
-                    self.queue.ready = (value & 1) != 0;
-                }
-            }
-            0x050 => {
-                let queue_idx = value as u32;
-                if queue_idx == 0 && self.queue.ready {
-                    self.process_queue();
-                }
-            }
-            0x064 => {
-                self.interrupt_status &= !(value as u32);
-                if self.interrupt_status == 0 {
-                    self.lower_irq();
-                }
-            }
-            0x070 => {
-                self.status = value as u32;
-                if self.status == 0 {
-                    // Reset
-                    self.queue = Queue::default();
-                    self.lower_irq();
-                }
-            }
-            0x080 => {
-                self.queue.desc_table =
-                    (self.queue.desc_table & !0xffff_ffff) | (value & 0xffff_ffff)
-            }
-            0x084 => self.queue.desc_table = (self.queue.desc_table & 0xffff_ffff) | (value << 32),
-            0x090 => {
-                self.queue.avail_ring =
-                    (self.queue.avail_ring & !0xffff_ffff) | (value & 0xffff_ffff)
-            }
-            0x094 => self.queue.avail_ring = (self.queue.avail_ring & 0xffff_ffff) | (value << 32),
-            0x0a0 => {
-                self.queue.used_ring = (self.queue.used_ring & !0xffff_ffff) | (value & 0xffff_ffff)
-            }
-            0x0a4 => self.queue.used_ring = (self.queue.used_ring & 0xffff_ffff) | (value << 32),
-            _ => {}
-        }
-    }
-
-    fn read_guest_u16(&self, addr: u64) -> u16 {
-        let mut buf = [0u8; 2];
-        let _ = self.memory.read(addr, &mut buf);
-        u16::from_le_bytes(buf)
-    }
-
-    fn read_guest_u32(&self, addr: u64) -> u32 {
-        let mut buf = [0u8; 4];
-        let _ = self.memory.read(addr, &mut buf);
-        u32::from_le_bytes(buf)
-    }
-
-    fn read_guest_u64(&self, addr: u64) -> u64 {
-        let mut buf = [0u8; 8];
-        let _ = self.memory.read(addr, &mut buf);
-        u64::from_le_bytes(buf)
-    }
-
-    fn write_guest_u16(&mut self, addr: u64, val: u16) {
-        let _ = self.memory.write(addr, &val.to_le_bytes());
-    }
-
-    fn write_guest_u32(&mut self, addr: u64, val: u32) {
-        let _ = self.memory.write(addr, &val.to_le_bytes());
-    }
-
-    fn process_queue(&mut self) {
+    /// Serves every request the driver made available. Returns whether any was served.
+    pub fn process(&mut self) -> bool {
         if self.queue.num == 0 || !self.queue.ready {
-            return;
+            return false;
         }
 
         let avail_addr = self.queue.avail_ring;
@@ -339,7 +173,7 @@ impl<B: BlockBackend, L: FnMut(bool)> VirtioBlock<B, L> {
             if let Some(req_addr) = req_header_addr {
                 let req_type = self.read_guest_u32(req_addr);
                 let sector = self.read_guest_u64(req_addr + 8);
-                let mut disk_offset = sector.saturating_mul(512);
+                let mut disk_offset = sector.saturating_mul(SECTOR_SIZE);
 
                 match req_type {
                     VIRTIO_BLK_T_IN => {
@@ -406,11 +240,215 @@ impl<B: BlockBackend, L: FnMut(bool)> VirtioBlock<B, L> {
             processed_any = true;
         }
 
-        if processed_any {
-            self.raise_irq();
+        processed_any
+    }
+
+    fn read_guest_u16(&self, addr: u64) -> u16 {
+        let mut buf = [0u8; 2];
+        let _ = self.memory.read(addr, &mut buf);
+        u16::from_le_bytes(buf)
+    }
+
+    fn read_guest_u32(&self, addr: u64) -> u32 {
+        let mut buf = [0u8; 4];
+        let _ = self.memory.read(addr, &mut buf);
+        u32::from_le_bytes(buf)
+    }
+
+    fn read_guest_u64(&self, addr: u64) -> u64 {
+        let mut buf = [0u8; 8];
+        let _ = self.memory.read(addr, &mut buf);
+        u64::from_le_bytes(buf)
+    }
+
+    fn write_guest_u16(&mut self, addr: u64, val: u16) {
+        let _ = self.memory.write(addr, &val.to_le_bytes());
+    }
+
+    fn write_guest_u32(&mut self, addr: u64, val: u32) {
+        let _ = self.memory.write(addr, &val.to_le_bytes());
+    }
+}
+
+/// The VirtIO-MMIO v2 transport for the block device.
+pub struct VirtioBlock<B, L = fn(bool)> {
+    core: BlockQueue<B>,
+    status: u32,
+    device_features_sel: u32,
+    driver_features_sel: u32,
+    driver_features: u64,
+    queue_sel: u32,
+    interrupt_status: u32,
+    line: Option<L>,
+}
+
+impl<B: BlockBackend> VirtioBlock<B, fn(bool)> {
+    pub fn new(backend: B, memory: SharedMemory) -> Self {
+        Self {
+            core: BlockQueue::new(backend, memory),
+            status: 0,
+            device_features_sel: 0,
+            driver_features_sel: 0,
+            driver_features: 0,
+            queue_sel: 0,
+            interrupt_status: 0,
+            line: None,
         }
     }
 }
+
+impl<B: BlockBackend, L: FnMut(bool)> VirtioBlock<B, L> {
+    pub fn with_line<L2: FnMut(bool)>(self, line: L2) -> VirtioBlock<B, L2> {
+        VirtioBlock {
+            core: self.core,
+            status: self.status,
+            device_features_sel: self.device_features_sel,
+            driver_features_sel: self.driver_features_sel,
+            driver_features: self.driver_features,
+            queue_sel: self.queue_sel,
+            interrupt_status: self.interrupt_status,
+            line: Some(line),
+        }
+    }
+
+    fn raise_irq(&mut self) {
+        self.interrupt_status |= 1;
+        if let Some(line) = &mut self.line {
+            line(true);
+        }
+    }
+
+    fn lower_irq(&mut self) {
+        self.interrupt_status = 0;
+        if let Some(line) = &mut self.line {
+            line(false);
+        }
+    }
+
+    pub fn read(&mut self, offset: u64, size: u8) -> u64 {
+        let value = match offset {
+            0x000 => MAGIC_VALUE as u64,
+            0x004 => VERSION as u64,
+            0x008 => DEVICE_ID_BLOCK as u64,
+            0x00c => VENDOR_ID as u64,
+            0x010 => {
+                let features = VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_F_VERSION_1;
+                if self.device_features_sel == 0 {
+                    (features & 0xffff_ffff) as u64
+                } else {
+                    (features >> 32) as u64
+                }
+            }
+            0x034 => {
+                if self.queue_sel == 0 {
+                    QUEUE_MAX_SIZE as u64
+                } else {
+                    0
+                }
+            }
+            0x044 => {
+                if self.queue_sel == 0 && self.core.queue.ready {
+                    1
+                } else {
+                    0
+                }
+            }
+            0x060 => self.interrupt_status as u64,
+            0x070 => self.status as u64,
+            0x0fc => 0, // config generation
+            // Configuration space:
+            // 0x100..0x108: capacity in 512-byte sectors (u64)
+            0x100..=0x107 => {
+                let capacity = self.core.capacity_sectors();
+                let shift = (offset - 0x100) * 8;
+                capacity >> shift
+            }
+            // 0x114..=0x117: blk_size (512)
+            0x114 => 512,
+            _ => 0,
+        };
+        // Mask to access width
+        match size {
+            1 => value & 0xff,
+            2 => value & 0xffff,
+            4 => value & 0xffff_ffff,
+            _ => value,
+        }
+    }
+
+    pub fn write(&mut self, offset: u64, size: u8, value: u64) {
+        let _ = size;
+        match offset {
+            0x014 => self.device_features_sel = value as u32,
+            0x020 => {
+                if self.driver_features_sel == 0 {
+                    self.driver_features =
+                        (self.driver_features & !0xffff_ffff) | (value & 0xffff_ffff);
+                } else {
+                    self.driver_features = (self.driver_features & 0xffff_ffff) | (value << 32);
+                }
+            }
+            0x024 => self.driver_features_sel = value as u32,
+            0x030 => self.queue_sel = value as u32,
+            0x038 => {
+                if self.queue_sel == 0 {
+                    self.core.queue.num = (value as u32).min(QUEUE_MAX_SIZE);
+                }
+            }
+            0x044 => {
+                if self.queue_sel == 0 {
+                    self.core.queue.ready = (value & 1) != 0;
+                }
+            }
+            0x050 => {
+                let queue_idx = value as u32;
+                if queue_idx == 0 && self.core.queue.ready && self.core.process() {
+                    self.raise_irq();
+                }
+            }
+            0x064 => {
+                self.interrupt_status &= !(value as u32);
+                if self.interrupt_status == 0 {
+                    self.lower_irq();
+                }
+            }
+            0x070 => {
+                self.status = value as u32;
+                if self.status == 0 {
+                    // Reset
+                    self.core.queue = Queue::default();
+                    self.lower_irq();
+                }
+            }
+            0x080 => {
+                self.core.queue.desc_table =
+                    (self.core.queue.desc_table & !0xffff_ffff) | (value & 0xffff_ffff)
+            }
+            0x084 => {
+                self.core.queue.desc_table =
+                    (self.core.queue.desc_table & 0xffff_ffff) | (value << 32)
+            }
+            0x090 => {
+                self.core.queue.avail_ring =
+                    (self.core.queue.avail_ring & !0xffff_ffff) | (value & 0xffff_ffff)
+            }
+            0x094 => {
+                self.core.queue.avail_ring =
+                    (self.core.queue.avail_ring & 0xffff_ffff) | (value << 32)
+            }
+            0x0a0 => {
+                self.core.queue.used_ring =
+                    (self.core.queue.used_ring & !0xffff_ffff) | (value & 0xffff_ffff)
+            }
+            0x0a4 => {
+                self.core.queue.used_ring =
+                    (self.core.queue.used_ring & 0xffff_ffff) | (value << 32)
+            }
+            _ => {}
+        }
+    }
+}
+
 pub trait VirtioIo {
     fn read(&mut self, offset: u64, size: u8) -> u64;
     fn write(&mut self, offset: u64, size: u8, value: u64);

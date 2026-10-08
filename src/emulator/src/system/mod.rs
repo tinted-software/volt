@@ -16,8 +16,11 @@ pub mod xnu;
 
 use crate::aarch64::{Cpu, decode, translate};
 use crate::devices::bus::Device;
+use crate::devices::pci::PciHost;
+use crate::devices::virtio_pci::VirtioBlockPci;
 use crate::devices::{gicv2::Gicv2, gicv3::Gicv3, pl011::Pl011};
 use crate::memory::{GuestMemory, PhysicalMemory, Region, SharedMemory};
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::{
     sync::atomic::{AtomicBool, Ordering},
@@ -38,6 +41,10 @@ pub const XNU_RAM_SIZE: usize = 1 << 30;
 /// platform description assumes when no device tree is passed (QEMU's run script uses `-m 4G`).
 /// The region is zero-filled lazily by the host, so it costs what the guest touches.
 pub const FIRMWARE_RAM_SIZE: usize = 4 << 30;
+/// The distributor's `ITLinesNumber` on a firmware board: 288 INTIDs. `arm-gic` sizes a
+/// firmware's interrupt table from it, and an interrupt source beyond the table, such as the
+/// physical timer's PPI, cannot be registered when it reads zero.
+pub const FIRMWARE_IT_LINES: u8 = 8;
 
 #[derive(Debug)]
 pub enum Error {
@@ -285,6 +292,7 @@ struct SystemDevices<'a, V> {
     gic: &'a mut Intc,
     virtio: Option<&'a mut V>,
     soc: Option<&'a mut m1::Soc>,
+    pci: Option<&'a mut PciHost>,
 }
 
 impl<V: crate::devices::VirtioIo> machine::DeviceIo for SystemDevices<'_, V> {
@@ -359,6 +367,14 @@ impl<V: crate::devices::VirtioIo> machine::DeviceIo for SystemDevices<'_, V> {
             .as_mut()
             .is_some_and(|soc| soc.write(cpu_id, address, size, value))
     }
+    fn read_pci(&mut self, address: u64, size: u8) -> Option<u64> {
+        self.pci.as_mut()?.read(address, size)
+    }
+    fn write_pci(&mut self, address: u64, size: u8, value: u64) -> bool {
+        self.pci
+            .as_mut()
+            .is_some_and(|pci| pci.write(address, size, value))
+    }
     fn has_fixed_windows(&self) -> bool {
         self.soc.is_none()
     }
@@ -420,7 +436,7 @@ pub fn boot_with_options(
 }
 
 /// Boot with full system configuration including optional initrd and configurable RAM size.
-pub fn boot_system<B: crate::devices::BlockBackend>(
+pub fn boot_system<B: crate::devices::BlockBackend + 'static>(
     image: &[u8],
     config: SystemConfig<B>,
     sink: impl FnMut(u8) + Send + 'static,
@@ -431,8 +447,8 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
 /// Boot a firmware image the way QEMU's `-bios` does: the image is mapped read-only at
 /// [`boot::FIRMWARE_BASE`], the core resets there, and no kernel is loaded. The machine
 /// is the `virt` board with a GICv3, as tinted-boot is run. As under QEMU's `-bios`, `x0`
-/// is zero and a device tree sits at RAM base. Firmware boots take no initrd or disk yet.
-pub fn boot_firmware<B: crate::devices::BlockBackend>(
+/// is zero and a device tree sits at RAM base. A disk is a virtio-blk function on PCI; there is no initrd.
+pub fn boot_firmware<B: crate::devices::BlockBackend + 'static>(
     firmware: &[u8],
     config: SystemConfig<B>,
     sink: impl FnMut(u8) + Send + 'static,
@@ -447,7 +463,20 @@ enum Payload<'a> {
     Firmware(&'a [u8]),
 }
 
-fn boot_machine<B: crate::devices::BlockBackend>(
+/// The root bus a firmware boot sees: the host bridge at 00:00.0, and the disk, if any, as a
+/// virtio-blk function in slot 1.
+fn firmware_pci<B: crate::devices::BlockBackend + 'static>(
+    disk: Option<B>,
+    memory: SharedMemory,
+) -> PciHost {
+    let mut host = PciHost::new();
+    if let Some(backend) = disk {
+        host.attach(1, Box::new(VirtioBlockPci::new(backend, memory)));
+    }
+    host
+}
+
+fn boot_machine<B: crate::devices::BlockBackend + 'static>(
     payload: Payload<'_>,
     config: SystemConfig<B>,
     mut sink: impl FnMut(u8) + Send + 'static,
@@ -476,9 +505,9 @@ fn boot_machine<B: crate::devices::BlockBackend>(
             )));
         }
         (Payload::Firmware(_), Board::Virt) => {
-            if config.initrd.is_some() || has_virtio {
+            if config.initrd.is_some() {
                 return Err(Error::Boot(boot::Error::Unsupported(
-                    "firmware boot has no initrd or virtio-blk yet; the firmware reads its disk over PCI",
+                    "firmware boot has no initrd; the firmware reads its files from a disk",
                 )));
             }
             boot::prepare_firmware(&mut shared_mem, ram_base, ram_size as u64)
@@ -546,19 +575,27 @@ fn boot_machine<B: crate::devices::BlockBackend>(
     } else {
         let serial =
             Pl011::new(emit).with_line(move |level| serial_line.store(level, Ordering::Release));
-        let gic = if is_xnu || matches!(payload, Payload::Firmware(_)) {
-            Intc::V3(Gicv3::default())
-        } else {
-            Intc::V2(Gicv2::default())
+        let gic = match payload {
+            Payload::Firmware(_) => Intc::V3(Gicv3::default().with_it_lines(FIRMWARE_IT_LINES)),
+            Payload::Kernel(_) if is_xnu => Intc::V3(Gicv3::default()),
+            Payload::Kernel(_) => Intc::V2(Gicv2::default()),
         };
         (Some(serial), None, gic)
     };
     let virtio_line = Arc::new(AtomicBool::new(false));
     let virtio_notify = virtio_line.clone();
-    let mut virtio = config.disk.map(|backend| {
-        crate::devices::VirtioBlock::new(backend, shared_mem.clone())
-            .with_line(move |level| virtio_notify.store(level, Ordering::Release))
-    });
+    // A firmware boot reaches its disk over PCI, as under QEMU's `-bios`. A kernel boot on the
+    // virt board keeps the MMIO transport the Linux device tree describes.
+    let (mut virtio, mut pci) = match (payload, config.disk) {
+        (Payload::Kernel(_), disk) => (
+            disk.map(|backend| {
+                crate::devices::VirtioBlock::new(backend, shared_mem.clone())
+                    .with_line(move |level| virtio_notify.store(level, Ordering::Release))
+            }),
+            None,
+        ),
+        (Payload::Firmware(_), disk) => (None, Some(firmware_pci(disk, shared_mem.clone()))),
+    };
     let mut machine = machine::Machine::new(shared_mem);
     if apple {
         m1::identify(&mut machine.cpu);
@@ -610,6 +647,7 @@ fn boot_machine<B: crate::devices::BlockBackend>(
             gic: &mut gic,
             virtio: virtio.as_mut(),
             soc: soc.as_mut(),
+            pci: pci.as_mut(),
         };
         match machine.run_with_devices(&mut dev) {
             Ok(machine::Exit::Timer) => {
@@ -1023,25 +1061,54 @@ mod tests {
         assert_eq!(report.unmapped_accesses, 0);
     }
 
+    /// A firmware that reads the four bytes of the vendor and device IDs at ECAM slot 1 and
+    /// writes each to the PL011, then powers off. The ECAM window is 0x40_1000_0000.
+    fn read_slot_one_ids() -> Vec<u32> {
+        vec![
+            0xd2c00801, // movz x1, #0x40, lsl #32
+            0xf2a20001, // movk x1, #0x1000, lsl #16
+            0xf2900001, // movk x1, #0x8000        (slot 1 = bit 15)
+            0xd2a12000, // movz x0, #0x900, lsl #16 (PL011)
+            0x39400022, // ldrb w2, [x1]
+            0x39000002, // strb w2, [x0]
+            0x39400422, // ldrb w2, [x1, #1]
+            0x39000002, // strb w2, [x0]
+            0x39400822, // ldrb w2, [x1, #2]
+            0x39000002, // strb w2, [x0]
+            0x39400c22, // ldrb w2, [x1, #3]
+            0x39000002, // strb w2, [x0]
+            0xd2b08000, // movz x0, #0x8400, lsl #16
+            0xf2800100, // movk x0, #8 (PSCI_SYSTEM_OFF)
+            0xd4000002, // hvc #0
+        ]
+    }
+
+    fn firmware_config(disk: Option<Vec<u8>>) -> SystemConfig<Vec<u8>> {
+        SystemConfig {
+            timeout: Duration::from_secs(5),
+            cmdline: String::new(),
+            idle_mode: IdleMode::Paced,
+            ram_size: 256 << 20,
+            initrd: None,
+            disk,
+            board: Board::Virt,
+        }
+    }
+
     #[test]
-    fn firmware_boot_refuses_a_disk_it_cannot_reach() {
-        let flash = flash_image(&[0xd4000002]);
-        let result = boot_firmware(
-            &flash,
-            SystemConfig {
-                timeout: Duration::from_secs(5),
-                cmdline: String::new(),
-                idle_mode: IdleMode::Paced,
-                ram_size: 256 << 20,
-                initrd: None,
-                disk: Some(vec![0u8; 512]),
-                board: Board::Virt,
-            },
-            |_| {},
-        );
-        assert!(matches!(
-            result,
-            Err(Error::Boot(boot::Error::Unsupported(_)))
-        ));
+    fn firmware_finds_its_disk_as_a_virtio_function_in_slot_one() {
+        let flash = flash_image(&read_slot_one_ids());
+        let report = boot_firmware(&flash, firmware_config(Some(vec![0; 512])), |_| {}).unwrap();
+        assert_eq!(report.reason, StopReason::Shutdown, "{report}");
+        // Vendor 0x1af4 and device 0x1042, little-endian.
+        assert_eq!(report.console, [0xf4, 0x1a, 0x42, 0x10]);
+    }
+
+    #[test]
+    fn firmware_without_a_disk_finds_slot_one_empty() {
+        let flash = flash_image(&read_slot_one_ids());
+        let report = boot_firmware(&flash, firmware_config(None), |_| {}).unwrap();
+        assert_eq!(report.reason, StopReason::Shutdown, "{report}");
+        assert_eq!(report.console, [0xff; 4]);
     }
 }

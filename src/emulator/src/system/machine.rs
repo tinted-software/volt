@@ -56,6 +56,17 @@ pub trait DeviceIo {
         let _ = (cpu_id, address, size, value);
         false
     }
+    /// A read of an address the PCI bus claims: configuration space, or a memory BAR of a
+    /// function that decodes memory. `None` declines the access.
+    fn read_pci(&mut self, address: u64, size: u8) -> Option<u64> {
+        let _ = (address, size);
+        None
+    }
+    /// Returns `false` when no PCI function claims the address.
+    fn write_pci(&mut self, address: u64, size: u8, value: u64) -> bool {
+        let _ = (address, size, value);
+        false
+    }
     /// Whether the fixed windows below (the QEMU `virt` UART, GIC and virtio) exist on
     /// this board. A board that maps none of them makes accesses there fault.
     fn has_fixed_windows(&self) -> bool {
@@ -1182,7 +1193,15 @@ impl<M: GuestMemory> Machine<M> {
                         .write_soc(self.cpu_id, physical, width, value)
                         .then_some(None)
                 };
+                // Only accesses the board's own devices decline reach the PCI bus.
+                let pci = match (&soc, load) {
+                    (Some(_), _) => None,
+                    (None, true) => devices.read_pci(physical, width).map(Some),
+                    (None, false) => devices.write_pci(physical, width, value).then_some(None),
+                };
                 let read = if let Some(read) = soc {
+                    read
+                } else if let Some(read) = pci {
                     read
                 } else if window(fdt::UART_BASE, crate::devices::pl011::LEN) {
                     if load {

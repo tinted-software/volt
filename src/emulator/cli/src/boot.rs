@@ -52,7 +52,8 @@ struct Cli {
     #[arg(positional)]
     cmdline: Option<String>,
 
-    /// Disk image for virtio-blk rootfs (e.g. rootfs.ext4, disk.img).
+    /// Disk image (e.g. rootfs.ext4, disk.img). A kernel boot gets it as virtio-blk on MMIO; a
+    /// `--bios` boot as virtio-blk on PCI, at 00:01.0.
     #[arg(short, long, alias = "drive", alias = "rootfs")]
     disk: Option<PathBuf>,
 
