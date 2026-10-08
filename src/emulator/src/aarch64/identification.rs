@@ -21,6 +21,7 @@ pub const CCSIDR_L2: u64 = ccsidr(4, 2048, 8);
 pub const DEFAULT_MIDR_EL1: u64 = 0x410f_d0f0;
 pub const DEFAULT_ID_AA64PFR0_EL1: u64 = (0xf << 20) | (0xf << 16) | (1 << 4) | 1;
 pub const DEFAULT_ID_AA64MMFR0_EL1: u64 = (0xf << 24) | 2;
+pub const DEFAULT_ID_AA64ISAR1_EL1: u64 = 1 << 20;
 pub fn value(register: SystemRegister) -> Option<u64> {
     use SystemRegister::*;
     Some(match register {
@@ -32,7 +33,6 @@ pub fn value(register: SystemRegister) -> Option<u64> {
         CntfrqEl0 => counter_hz,
         IdAa64dfr0El1 => 6,
         IdAa64isar0El1 => 2 << 20,
-        IdAa64isar1El1 => 1 << 20,
         ClidrEl1 => CLIDR,
         RevidrEl1 | IdAa64pfr1El1 | IdAa64pfr2El1 | IdAa64zfr0El1 | IdAa64smfr0El1
         | IdAa64fpfr0El1 | IdAa64isar3El1 | AidrEl1 | IdAa64dfr1El1 | IdAa64isar2El1
@@ -59,7 +59,7 @@ mod tests {
         assert_eq!((mmfr0 >> 20) & 15, 0);
         // FEAT_LSE (Atomics = 2) and FEAT_LRCPC (LDAPR) are implemented.
         assert_eq!(value(IdAa64isar0El1), Some(2 << 20));
-        assert_eq!(value(IdAa64isar1El1), Some(1 << 20));
+        assert_eq!(DEFAULT_ID_AA64ISAR1_EL1, 1 << 20);
         assert_eq!(value(MpidrEl1), Some(1 << 31));
         assert_eq!(value(Ttbr0El1), None);
     }

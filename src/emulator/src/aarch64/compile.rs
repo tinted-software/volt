@@ -2471,6 +2471,8 @@ fn system_offset(r: SystemRegister) -> Option<usize> {
         MidrEl1 => offset_of!(CpuSystem, midr_el1),
         IdAa64pfr0El1 => offset_of!(CpuSystem, id_aa64pfr0_el1),
         IdAa64mmfr0El1 => offset_of!(CpuSystem, id_aa64mmfr0_el1),
+        PacKey(slot) => offset_of!(CpuSystem, pac_keys) + 8 * usize::from(slot),
+        IdAa64isar1El1 => offset_of!(CpuSystem, id_aa64isar1_el1),
         _ => return None,
     })
 }

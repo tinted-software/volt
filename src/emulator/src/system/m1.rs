@@ -42,6 +42,9 @@ pub const ID_AA64PFR0_EL1: u64 = 0x11;
 /// `ID_AA64MMFR0_EL1`: 4 KiB and 16 KiB translation granules (the Asahi kernel is built
 /// for 16 KiB pages and refuses a CPU without one), no 64 KiB granule, 40-bit PA.
 pub const ID_AA64MMFR0_EL1: u64 = (0xf << 24) | (1 << 20) | 2;
+/// `ID_AA64ISAR1_EL1`: LRCPC, and the architected QARMA5 for address (APA) and generic
+/// (GPA) pointer authentication. No implementation-defined algorithm (API, GPI).
+pub const ID_AA64ISAR1_EL1: u64 = (1 << 20) | (1 << 24) | (1 << 4);
 
 /// The machine runs one vCPU. The device tree lists eight cores, but their
 /// `cpu-release-addr` is zero, so Linux's spin-table code does not start them.
@@ -52,6 +55,7 @@ pub fn identify(system: &mut crate::aarch64::cpu::System) {
     system.midr_el1 = MIDR_EL1;
     system.id_aa64pfr0_el1 = ID_AA64PFR0_EL1;
     system.id_aa64mmfr0_el1 = ID_AA64MMFR0_EL1;
+    system.id_aa64isar1_el1 = ID_AA64ISAR1_EL1;
 }
 
 /// The SoC devices on the bus: the AIC, the power-state blocks, the console, and the

@@ -206,6 +206,10 @@ pub struct System {
     pub midr_el1: u64,
     pub id_aa64pfr0_el1: u64,
     pub id_aa64mmfr0_el1: u64,
+    /// PAuth keys, low word first: APIA, APIB, APDA, APDB, APGA.
+    pub pac_keys: [u64; 10],
+    /// `ID_AA64ISAR1_EL1`: which pointer authentication algorithms the CPU advertises.
+    pub id_aa64isar1_el1: u64,
 }
 impl Default for System {
     fn default() -> Self {
@@ -254,6 +258,8 @@ impl Default for System {
             midr_el1: crate::aarch64::identification::DEFAULT_MIDR_EL1,
             id_aa64pfr0_el1: crate::aarch64::identification::DEFAULT_ID_AA64PFR0_EL1,
             id_aa64mmfr0_el1: crate::aarch64::identification::DEFAULT_ID_AA64MMFR0_EL1,
+            pac_keys: [0; 10],
+            id_aa64isar1_el1: crate::aarch64::identification::DEFAULT_ID_AA64ISAR1_EL1,
         }
     }
 }

@@ -606,6 +606,8 @@ pub enum SystemRegister {
     /// Apple IMP-DEF configuration register the guest reads back, stored in
     /// `System::apple[slot]`.
     Apple(u8),
+    /// PAuth key register `APxAKey{Lo,Hi}_EL1`, stored in `System::pac_keys[slot]`.
+    PacKey(u8),
 }
 impl SystemRegister {
     pub fn read_only(self) -> bool {
@@ -1131,6 +1133,28 @@ fn apple_register(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> Option<Sy
     })
 }
 
+/// The PAuth key registers `S3_0_C2_C{1,2,3}_*`: APIA, APIB, APDA, APDB and APGA, low
+/// word first (`System::pac_keys`).
+fn pac_key_register(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> Option<SystemRegister> {
+    if op0 != 3 || op1 != 0 || crn != 2 {
+        return None;
+    }
+    let slot = match (crm, op2) {
+        (1, 0) => 0,
+        (1, 1) => 1,
+        (1, 2) => 2,
+        (1, 3) => 3,
+        (2, 0) => 4,
+        (2, 1) => 5,
+        (2, 2) => 6,
+        (2, 3) => 7,
+        (3, 0) => 8,
+        (3, 1) => 9,
+        _ => return None,
+    };
+    Some(SystemRegister::PacKey(slot))
+}
+
 fn system_register(
     op0: u32,
     op1: u32,
@@ -1143,6 +1167,9 @@ fn system_register(
         return Ok(RazWi);
     }
     if let Some(register) = apple_register(op0, op1, crn, crm, op2) {
+        return Ok(register);
+    }
+    if let Some(register) = pac_key_register(op0, op1, crn, crm, op2) {
         return Ok(register);
     }
     if op1 == 0 && crn == 4 && op2 == 5 {
@@ -1237,6 +1264,10 @@ fn system_register(
 pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
     use DecodeError::UnsupportedInstruction;
     use Instruction::*;
+    // PAuth instructions, hint-space forms included, run on the host.
+    if super::pauth::is_supported(word) {
+        return Ok(Host(word));
+    }
     let width = width(word);
     let rn = reg(word, 5);
     let rm = reg(word, 16);
