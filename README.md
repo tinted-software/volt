@@ -102,14 +102,22 @@ The EL2 regime is modelled: `CurrentEl` reports EL2, exceptions and `ERET` targe
 firmware does: the image placed in DRAM at its physical address, the MMU off, EL2, and
 `x0` a boot structure (DRAM's virtual and physical base and size, the device tree, a
 scratch buffer). The monitor builds its own translation tables, turns the MMU on, and
-reads `chosen/memory-map` for the image regions iBoot would have recorded. Its strings
-(`sptm_fixup`, `unsupported auth_rebase key`) and a loop over the kernel's range suggest
-it applies the kernelcache's chained fixups itself; that is inferred, not yet confirmed.
-It runs about four million instructions on the real kernelcache before it panics with
-`init_get_image_region: error -1 looking up image region 'TXM-ro'`, written to its scratch
-buffer. The map holds one entry per image (`SPTM`, `TXM`, `BootKC`, `AuxKC`, `CL4`) and
-part (`-ro`, `-rx`, `-rw`, `-bx`, `-le`, `-rs`, plus `-entry`, `-virt`, `-exception`);
-volt supplies `BootKC-rs` and `BootKC-ro` only, and does not load TXM. GXF (`genter`,
+checks what iBoot would have recorded in `chosen`: the `chosen/memory-map` regions, and
+`dram-base` and `dram-size`. Its strings suggest it applies the kernelcache's chained
+fixups itself (`sptm_fixup`); that is inferred, not confirmed.
+
+The region table is walked in a fixed order, and each present region must start where the
+previous present one ended. In order: `TXM-ro`, `TXM-rx`, `TXM-bx`, `TrustCache`,
+`AuxKC-ro/rx` (optional), `BootKC-rx`, `BootKC-bx`, `BootKC-ro`, `BootKC-rs`,
+`CL4-rx/ro` (optional), `DeviceTree`, `SPTM-ro`, `SPTM-rx`, `SPTM-rw`. Each part is a
+contiguous link span (`monitor::image_parts`), copied whole (`monitor::place_parts`). The
+monitor's own image stays linear, because it runs position-independently before its MMU
+is on. With that packing, validation passes and the monitor reaches `/chosen/dram-base`.
+
+It then stops in a data abort. It zeroes a page at `VA & 0x3fff_ffff_ffff` of a linear-map
+address, so its convention for converting a linear-map address to a physical one is not
+the one volt's boot structure implies (`VA = PA + x22 - x23`). Which convention it uses, and
+where iBoot places DRAM relative to the image, is not yet established. GXF (`genter`,
 `gexit`, `GXF_*`, `VBAR_GL1`) and SPRR are not modelled; `genter` raises an undefined
 instruction.
 

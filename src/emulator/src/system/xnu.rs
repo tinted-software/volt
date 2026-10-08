@@ -54,6 +54,16 @@ pub struct Segment {
     pub vmsize: u64,
     pub fileoff: u64,
     pub filesize: u64,
+    /// `segname`, NUL-padded.
+    pub name: [u8; 16],
+}
+
+impl Segment {
+    /// The segment name without its NUL padding (`__TEXT`).
+    pub fn name(&self) -> &[u8] {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(16);
+        &self.name[..end]
+    }
 }
 
 /// What the loader needs from a Mach-O kernel.
@@ -123,6 +133,7 @@ pub fn parse(image: &[u8]) -> Result<Kernel, Error> {
                     vmsize: double(at + 32),
                     fileoff: double(at + 40),
                     filesize: double(at + 48),
+                    name: image[at + 8..at + 24].try_into().unwrap(),
                 };
                 let in_file = segment
                     .fileoff

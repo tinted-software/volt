@@ -66,6 +66,8 @@ pub enum Error {
     },
     /// The device tree is not a well-formed Apple flattened device tree.
     DeviceTree(&'static str),
+    /// The entry point lies in no part of the image.
+    NoEntryPart,
 }
 
 impl From<MemoryError> for Error {
@@ -138,14 +140,13 @@ pub fn without_placeholder_flags(tree: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(copy)
 }
 
-/// Appends the property `name = {address: u64, size: u64}` to the device tree's
-/// `chosen/memory-map` node, the way the boot firmware records a region it loaded (the
-/// monitor looks up `BootKC-rs`, the kernel collection, and panics without it).
-pub fn add_memory_map_region(
+/// Appends a property `name = value` to the node at `path` of the device tree `tree`
+/// (`path` names children of the root, e.g. `["chosen", "memory-map"]`).
+pub fn add_property(
     tree: &[u8],
+    path: &[&[u8]],
     name: &str,
-    address: u64,
-    size: u64,
+    value: &[u8],
 ) -> Result<Vec<u8>, Error> {
     const TRUNCATED: Error = Error::DeviceTree("device tree is truncated");
     const NAME: usize = 32;
@@ -187,29 +188,42 @@ pub fn add_memory_map_region(
             }
             cursor = skip(tree, cursor)?;
         }
-        Err(Error::DeviceTree(
-            "device tree has no chosen/memory-map node",
-        ))
+        Err(Error::DeviceTree("device tree has no such node"))
     }
-    let chosen = child(tree, 0, b"chosen")?;
-    let map = child(tree, chosen, b"memory-map")?;
-    let (end, _) = properties(tree, map)?;
-    let mut property = [0u8; NAME + 4 + 16];
-    let name = name.as_bytes();
-    if name.len() >= NAME {
-        return Err(Error::DeviceTree("property name is too long"));
+    if name.len() >= NAME || value.len() > u32::MAX as usize {
+        return Err(Error::DeviceTree("property name or value is too large"));
     }
-    property[..name.len()].copy_from_slice(name);
-    property[NAME..NAME + 4].copy_from_slice(&16u32.to_le_bytes());
-    property[NAME + 4..NAME + 12].copy_from_slice(&address.to_le_bytes());
-    property[NAME + 12..].copy_from_slice(&size.to_le_bytes());
+    let mut node = 0;
+    for part in path {
+        node = child(tree, node, part)?;
+    }
+    let (end, _) = properties(tree, node)?;
+    let mut property = vec![0u8; NAME + 4 + value.len()];
+    property[..name.len()].copy_from_slice(name.as_bytes());
+    property[NAME..NAME + 4].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    property[NAME + 4..].copy_from_slice(value);
+    property.resize(property.len().next_multiple_of(4), 0);
     let mut out = Vec::with_capacity(tree.len() + property.len());
     out.extend_from_slice(&tree[..end]);
     out.extend_from_slice(&property);
     out.extend_from_slice(&tree[end..]);
-    let count = word(&out, map)? + 1;
-    out[map..map + 4].copy_from_slice(&count.to_le_bytes());
+    let count = word(&out, node)? + 1;
+    out[node..node + 4].copy_from_slice(&count.to_le_bytes());
     Ok(out)
+}
+
+/// Appends the property `name = {address: u64, size: u64}` to the device tree's
+/// `chosen/memory-map` node, the way the boot firmware records a region it loaded.
+pub fn add_memory_map_region(
+    tree: &[u8],
+    name: &str,
+    address: u64,
+    size: u64,
+) -> Result<Vec<u8>, Error> {
+    let mut value = Vec::with_capacity(16);
+    value.extend(address.to_le_bytes());
+    value.extend(size.to_le_bytes());
+    add_property(tree, &[b"chosen", b"memory-map"], name, &value)
 }
 
 /// Places the `MH_EXECUTE` monitor `image` and `device_tree`, and writes the boot structure.
@@ -291,6 +305,179 @@ pub fn load(
         entry: layout.image_phys + (kernel.entry - base),
         boot_phys: layout.boot_phys,
     })
+}
+
+/// The lowest nonempty segment address of `kernel`: the image's link base.
+fn image_base(kernel: &xnu::Kernel) -> u64 {
+    kernel
+        .segments
+        .iter()
+        .filter(|s| s.vmsize != 0)
+        .map(|s| s.vmaddr)
+        .min()
+        .unwrap_or(0)
+}
+
+/// Places a Mach-O image so that its lowest segment is at physical `phys`. `phys` must
+/// match the link base modulo [`BLOCK`], so the monitor's linear map reaches the image at
+/// its link address. Returns the physical entry point.
+pub fn place_image(memory: &mut impl GuestMemory, image: &[u8], phys: u64) -> Result<u64, Error> {
+    let kernel = xnu::parse(image).map_err(Error::Image)?;
+    let base = image_base(&kernel);
+    if (base ^ phys) & (BLOCK - 1) != 0 {
+        return Err(Error::Misaligned {
+            virtual_base: base,
+            physical_base: phys,
+        });
+    }
+    write_segments(memory, image, &kernel, base, phys)?;
+    Ok(phys + (kernel.entry - base))
+}
+
+/// Writes each segment's file bytes, zero-filled to its size, at `phys + (vmaddr - base)`.
+fn write_segments(
+    memory: &mut impl GuestMemory,
+    image: &[u8],
+    kernel: &xnu::Kernel,
+    base: u64,
+    phys: u64,
+) -> Result<(), Error> {
+    for segment in &kernel.segments {
+        if segment.vmsize == 0 {
+            continue;
+        }
+        let mut bytes = vec![0u8; segment.vmsize as usize];
+        let file = &image[segment.fileoff as usize..][..segment.filesize as usize];
+        bytes[..file.len()].copy_from_slice(file);
+        memory.write(phys + (segment.vmaddr - base), &bytes)?;
+    }
+    Ok(())
+}
+
+/// A named span of a Mach-O image, in the monitor's naming: link addresses `lo..hi`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Part {
+    pub name: &'static str,
+    pub lo: u64,
+    pub hi: u64,
+}
+
+/// The parts of a Mach-O image, as the monitor names them. `ro` covers `__TEXT`,
+/// `__PRELINK_TEXT`, `__DATA_CONST` and `__LATE_CONST`; `rx` covers `__TEXT_EXEC` and
+/// `__LAST`; `bx` is `__TEXT_BOOT_EXEC`; `rw` covers `__DATA` and `__BOOTDATA`; `le` is
+/// `__LINKEDIT`; `rs` is `__DATA_SPTM` where present; `virt` is the whole image; `entry`
+/// is the segment holding the entry point. A part is the smallest span covering its
+/// segments and is copied as one piece, so the monitor maps it contiguously.
+pub fn image_parts(image: &[u8]) -> Result<Vec<Part>, Error> {
+    let kernel = xnu::parse(image).map_err(Error::Image)?;
+    let base = image_base(&kernel);
+    let end = kernel
+        .segments
+        .iter()
+        .map(|s| s.vmaddr + s.vmsize)
+        .max()
+        .unwrap_or(base);
+    let span = |names: &[&[u8]]| -> Option<(u64, u64)> {
+        kernel
+            .segments
+            .iter()
+            .filter(|s| s.vmsize != 0 && names.contains(&s.name()))
+            .map(|s| (s.vmaddr, s.vmaddr + s.vmsize))
+            .fold(None, |acc, (lo, hi)| match acc {
+                None => Some((lo, hi)),
+                Some((a, b)) => Some((a.min(lo), b.max(hi))),
+            })
+    };
+    let entry = kernel
+        .segments
+        .iter()
+        .find(|s| s.vmsize != 0 && (s.vmaddr..s.vmaddr + s.vmsize).contains(&kernel.entry))
+        .map(|s| (s.vmaddr, s.vmaddr + s.vmsize));
+    let spans = [
+        (
+            "ro",
+            span(&[
+                b"__TEXT",
+                b"__PRELINK_TEXT",
+                b"__DATA_CONST",
+                b"__LATE_CONST",
+            ]),
+        ),
+        ("rx", span(&[b"__TEXT_EXEC", b"__LAST"])),
+        ("bx", span(&[b"__TEXT_BOOT_EXEC"])),
+        ("rw", span(&[b"__DATA", b"__BOOTDATA"])),
+        ("le", span(&[b"__LINKEDIT"])),
+        ("rs", span(&[b"__DATA_SPTM"])),
+        ("virt", Some((base, end))),
+        ("entry", entry),
+    ];
+    Ok(spans
+        .into_iter()
+        .filter_map(|(name, range)| range.map(|(lo, hi)| Part { name, lo, hi }))
+        .collect())
+}
+
+/// Copies the link span of `part` from `image` to physical `pa`: the file bytes of each
+/// segment inside it, zeros elsewhere.
+pub fn write_part(
+    memory: &mut impl GuestMemory,
+    image: &[u8],
+    part: &Part,
+    pa: u64,
+) -> Result<(), Error> {
+    let kernel = xnu::parse(image).map_err(Error::Image)?;
+    let mut bytes = vec![0u8; (part.hi - part.lo) as usize];
+    for segment in &kernel.segments {
+        let lo = segment.vmaddr.max(part.lo);
+        let hi = (segment.vmaddr + segment.filesize).min(part.hi);
+        if lo >= hi {
+            continue;
+        }
+        let from = segment.fileoff + (lo - segment.vmaddr);
+        let file = &image[from as usize..][..(hi - lo) as usize];
+        bytes[(lo - part.lo) as usize..(hi - part.lo) as usize].copy_from_slice(file);
+    }
+    memory.write(pa, &bytes)?;
+    Ok(())
+}
+
+/// Writes every part of `image` at the address `place` gives it, and returns the image's
+/// `chosen/memory-map` regions as `(prefix-part, address, size)`. `entry` is not written:
+/// it lies at the same offset within the part that holds the entry point.
+pub fn place_parts(
+    memory: &mut impl GuestMemory,
+    image: &[u8],
+    prefix: &str,
+    place: impl Fn(&Part) -> u64,
+) -> Result<Vec<(String, u64, u64)>, Error> {
+    let parts = image_parts(image)?;
+    let mut regions = Vec::new();
+    for part in parts.iter().filter(|p| p.name != "entry") {
+        let pa = place(part);
+        write_part(memory, image, part, pa)?;
+        regions.push((format!("{prefix}-{}", part.name), pa, part.hi - part.lo));
+    }
+    if let Some(entry) = parts.iter().find(|p| p.name == "entry") {
+        let holder = parts
+            .iter()
+            .find(|p| !matches!(p.name, "entry" | "virt") && p.lo <= entry.lo && entry.hi <= p.hi)
+            .ok_or(Error::NoEntryPart)?;
+        let pa = place(holder) + (entry.lo - holder.lo);
+        regions.push((format!("{prefix}-entry"), pa, entry.hi - entry.lo));
+    }
+    Ok(regions)
+}
+
+/// Appends every region of `regions` to `chosen/memory-map` of `tree`, in order.
+pub fn add_memory_map_regions(
+    tree: &[u8],
+    regions: &[(String, u64, u64)],
+) -> Result<Vec<u8>, Error> {
+    let mut tree = tree.to_vec();
+    for (name, address, size) in regions {
+        tree = add_memory_map_region(&tree, name, *address, *size)?;
+    }
+    Ok(tree)
 }
 
 /// Sets the CPU to the state the firmware leaves for the monitor: EL2, MMU off, at the
