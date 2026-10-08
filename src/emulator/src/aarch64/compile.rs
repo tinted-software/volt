@@ -2443,7 +2443,10 @@ fn system_offset(r: SystemRegister) -> Option<usize> {
         IccBpr0El1 => offset_of!(CpuSystem, icc_bpr0_el1),
         IccCtlrEl1 => offset_of!(CpuSystem, icc_ctlr_el1),
         IccIgrpen0El1 => offset_of!(CpuSystem, icc_igrpen0_el1),
+        IccIgrpen1El1 => offset_of!(CpuSystem, icc_igrpen1_el1),
+        IccBpr1El1 => offset_of!(CpuSystem, icc_bpr1_el1),
         CntpCtlEl0 => offset_of!(CpuSystem, cntp_ctl_el0),
+        CntpCvalEl0 => offset_of!(CpuSystem, cntp_cval_el0),
         ActlrEl1 => offset_of!(CpuSystem, actlr_el1),
         VbarEl1 => offset_of!(CpuSystem, vbar_el1),
         SctlrEl2 => offset_of!(CpuSystem, sctlr_el2),
@@ -2724,11 +2727,17 @@ fn lower_system(l: &Lower, a: System) {
                 l.sel(l.u64, is(0), l.k(l.u64, CCSIDR_L1D), l1_instruction),
             );
         }
-        CntvTvalEl0 => {
+        CntvTvalEl0 | CntpTvalEl0 => {
             // The timer value is the signed 32-bit distance to the compare value:
             // reads give the low 32 bits of `CVAL - count`, writes `CVAL = count + sext(value)`.
+            // The physical timer shares the virtual count, as CNTVOFF_EL2 is zero without EL2.
             let counter = l.load(l.u64, at + offset_of!(CpuSystem, cntvct_el0));
-            let compare = at + offset_of!(CpuSystem, cntv_cval_el0);
+            let compare = at
+                + if a.register == CntpTvalEl0 {
+                    offset_of!(CpuSystem, cntp_cval_el0)
+                } else {
+                    offset_of!(CpuSystem, cntv_cval_el0)
+                };
             if a.read {
                 let distance = l.bin(l.u64, B::Sub, l.load(l.u64, compare), counter);
                 l.put(a.rt, l.imm(l.u64, B::BitAnd, distance, 0xffff_ffff));
@@ -2737,6 +2746,19 @@ fn lower_system(l: &Lower, a: System) {
                 l.store(compare, l.bin(l.u64, B::Add, counter, delta));
             }
         }
+        CntpctEl0 => {
+            // Writes are ignored: the counter is not writable from software.
+            if a.read {
+                l.put(a.rt, l.load(l.u64, at + offset_of!(CpuSystem, cntvct_el0)));
+            }
+        }
+        IccIar1El1 => {
+            // No group 1 interrupt is delivered by this model, so acknowledge reads spurious.
+            if a.read {
+                l.put(a.rt, l.k(l.u64, 1023));
+            }
+        }
+        IccEoir1El1 => {}
         Daif => {
             let p = at + offset_of!(CpuSystem, daif);
             if a.read {

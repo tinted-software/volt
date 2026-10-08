@@ -169,7 +169,9 @@ pub fn translate<M: GuestMemory + ?Sized>(
     }
     let regime = Regime::of(cpu);
     let t1sz = ((regime.tcr >> 16) & 63) as u32;
-    if regime.split && t1sz == 0 {
+    // TTBR1's region size only means something while EPD1 leaves its walk enabled.
+    let upper_walk = regime.split && regime.tcr & (1 << 23) == 0;
+    if upper_walk && t1sz == 0 {
         return Err(TranslateError::MalformedTables);
     }
     if ((virtual_address >> 55) & 1 != 0 && virtual_address >> 48 != 0xffff)
@@ -181,7 +183,7 @@ pub fn translate<M: GuestMemory + ?Sized>(
     let upper_bits = 64 - t1sz;
     let upper = if virtual_address >> lower_bits == 0 {
         false
-    } else if regime.split && virtual_address >> upper_bits == u64::MAX >> upper_bits {
+    } else if upper_walk && virtual_address >> upper_bits == u64::MAX >> upper_bits {
         true
     } else {
         return Err(TranslateError::TranslationFault);
@@ -274,9 +276,6 @@ fn walk<M: GuestMemory + ?Sized>(
         let descriptor = u64::from_le_bytes(word);
         let kind = descriptor & 3;
         if kind == 3 && level != 0 {
-            if descriptor & 0x3f0 != 0 {
-                return Err(TranslateError::MalformedTables);
-            }
             no_user |= descriptor & (1 << 61) != 0;
             read_only |= descriptor & (1 << 62) != 0;
             pxn_table |= descriptor & (1 << 59) != 0;
@@ -505,7 +504,7 @@ mod tests {
         assert_eq!(memory.reads.get(), reads, "same page must not walk again");
     }
     #[test]
-    fn invalid_descriptors_and_malformed_tables_fail_closed() {
+    fn invalid_descriptors_fail_closed() {
         let cpu = cpu();
         let mut memory = Memory::new();
         let mut tlb = Tlb::new();
@@ -521,11 +520,22 @@ mod tests {
         );
         // A fault is not cached: the repeated access walks the tables again.
         assert!(memory.reads.get() > count);
-        tlb.flush();
-        memory.put(0, 0x1013);
+    }
+    #[test]
+    fn table_descriptor_bits_eleven_to_two_are_ignored() {
+        // Table descriptors ignore bits 11:2 (ARM ARM D8.3.1). Set them on every table on the
+        // walk for address 0: the page at 0x4000_0000 must still resolve.
+        let cpu = cpu();
+        let mut memory = Memory::new();
+        let mut tlb = Tlb::new();
+        memory.chain(0, 0, 12, 4, 0, 0x4000_0403);
+        for table in [0usize, 0x1000, 0x2000] {
+            let descriptor = memory.get(table);
+            memory.put(table as u64, descriptor | 0x3f0);
+        }
         assert_eq!(
             translate(&mut tlb, &cpu, &mut memory, 0, Access::Read),
-            Err(TranslateError::MalformedTables)
+            Ok(0x4000_0000)
         );
     }
     #[test]
@@ -759,6 +769,31 @@ mod tests {
         );
         assert_eq!(physical_bits(&cpu), Ok(40));
         // Bit 55 set with an all-ones upper half: a TTBR1 address, which EL2 lacks.
+        assert_eq!(
+            translate(
+                &mut tlb,
+                &cpu,
+                &mut memory,
+                0xffff_8000_0000_0000,
+                Access::Read
+            ),
+            Err(TranslateError::TranslationFault)
+        );
+    }
+    #[test]
+    fn epd1_disables_the_upper_walk_so_its_t1sz_is_never_checked() {
+        // The tinted-boot firmware's TCR_EL1: T0SZ 25 (a 39-bit lower range), EPD1 set,
+        // and T1SZ 0, which is only meaningful while the TTBR1 walk is enabled.
+        let mut cpu = cpu();
+        cpu.system.tcr_el1 = 25 | (1 << 23) | (2 << 30) | (4 << 32);
+        let mut memory = Memory::new();
+        let mut tlb = Tlb::new();
+        // A 1 GiB block at 0x4000_0000 in the TTBR0 root table, which sits at 0.
+        memory.chain(0, 0x4000_0000, 12, 3, 2, 0x4000_0401);
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, 0x4000_0000, Access::Execute),
+            Ok(0x4000_0000)
+        );
         assert_eq!(
             translate(
                 &mut tlb,

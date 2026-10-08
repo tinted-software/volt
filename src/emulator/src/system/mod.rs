@@ -34,6 +34,10 @@ pub const DEFAULT_CMDLINE: &str = "console=ttyAMA0 earlycon=pl011,0x9000000 noka
 pub const DEFAULT_XNU_CMDLINE: &str = "-v serial=3 debug=0x14e keepsyms=1 serial-device-name=uart0";
 /// XNU sizes its zones from RAM; 128 MiB leaves it little to work with.
 pub const XNU_RAM_SIZE: usize = 1 << 30;
+/// RAM a firmware boot gets by default: 4 GiB, which is the RAM the firmware's built-in
+/// platform description assumes when no device tree is passed (QEMU's run script uses `-m 4G`).
+/// The region is zero-filled lazily by the host, so it costs what the guest touches.
+pub const FIRMWARE_RAM_SIZE: usize = 4 << 30;
 
 #[derive(Debug)]
 pub enum Error {
@@ -419,6 +423,33 @@ pub fn boot_with_options(
 pub fn boot_system<B: crate::devices::BlockBackend>(
     image: &[u8],
     config: SystemConfig<B>,
+    sink: impl FnMut(u8) + Send + 'static,
+) -> Result<BootReport, Error> {
+    boot_machine(Payload::Kernel(image), config, sink)
+}
+
+/// Boot a firmware image the way QEMU's `-bios` does: the image is mapped read-only at
+/// [`boot::FIRMWARE_BASE`], the core resets there, and no kernel is loaded. The machine
+/// is the `virt` board with a GICv3, as tinted-boot is run. As under QEMU's `-bios`, `x0`
+/// is zero and a device tree sits at RAM base. Firmware boots take no initrd or disk yet.
+pub fn boot_firmware<B: crate::devices::BlockBackend>(
+    firmware: &[u8],
+    config: SystemConfig<B>,
+    sink: impl FnMut(u8) + Send + 'static,
+) -> Result<BootReport, Error> {
+    boot_machine(Payload::Firmware(firmware), config, sink)
+}
+
+/// What a boot starts: a kernel loaded into RAM, or firmware run from flash.
+#[derive(Clone, Copy)]
+enum Payload<'a> {
+    Kernel(&'a [u8]),
+    Firmware(&'a [u8]),
+}
+
+fn boot_machine<B: crate::devices::BlockBackend>(
+    payload: Payload<'_>,
+    config: SystemConfig<B>,
     mut sink: impl FnMut(u8) + Send + 'static,
 ) -> Result<BootReport, Error> {
     let ram_size = if config.ram_size > 0 {
@@ -430,21 +461,39 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
     let idle_mode = config.idle_mode;
     let apple = matches!(config.board, Board::AppleM1 { .. });
     let ram_base = if apple { m1::RAM_BASE } else { RAM_BASE };
-    let region = Region::ram(ram_base, vec![0; ram_size]).map_err(Error::Memory)?;
-    let memory = PhysicalMemory::new(vec![region]).map_err(Error::Memory)?;
+    let is_xnu = matches!(payload, Payload::Kernel(image) if xnu::is_macho(image));
+    let mut regions = vec![Region::ram(ram_base, vec![0; ram_size]).map_err(Error::Memory)?];
+    if let Payload::Firmware(flash) = payload {
+        regions.push(Region::rom(boot::FIRMWARE_BASE, flash.to_vec()).map_err(Error::Memory)?);
+    }
+    let memory = PhysicalMemory::new(regions).map_err(Error::Memory)?;
     let mut shared_mem = SharedMemory::new(memory);
     let has_virtio = config.disk.is_some();
-    let is_xnu = xnu::is_macho(image);
-    let layout = match config.board {
-        Board::AppleM1 { device_tree } if is_xnu => xnu::prepare_boot_with_tree(
-            &mut shared_mem,
-            image,
-            &config.cmdline,
-            &device_tree,
-            ram_base,
-            ram_size as u64,
-        ),
-        Board::AppleM1 { device_tree } => {
+    let layout = match (payload, config.board) {
+        (Payload::Firmware(_), Board::AppleM1 { .. }) => {
+            return Err(Error::Boot(boot::Error::Unsupported(
+                "the Apple M1 SoC boots no firmware image yet",
+            )));
+        }
+        (Payload::Firmware(_), Board::Virt) => {
+            if config.initrd.is_some() || has_virtio {
+                return Err(Error::Boot(boot::Error::Unsupported(
+                    "firmware boot has no initrd or virtio-blk yet; the firmware reads its disk over PCI",
+                )));
+            }
+            boot::prepare_firmware(&mut shared_mem, ram_base, ram_size as u64)
+        }
+        (Payload::Kernel(image), Board::AppleM1 { device_tree }) if is_xnu => {
+            xnu::prepare_boot_with_tree(
+                &mut shared_mem,
+                image,
+                &config.cmdline,
+                &device_tree,
+                ram_base,
+                ram_size as u64,
+            )
+        }
+        (Payload::Kernel(image), Board::AppleM1 { device_tree }) => {
             if has_virtio || config.initrd.is_some() {
                 return Err(Error::Boot(boot::Error::Unsupported(
                     "the Apple M1 SoC has no initrd or virtio disk support yet",
@@ -458,7 +507,7 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
                 ram_size as u64,
             )
         }
-        Board::Virt if is_xnu => {
+        (Payload::Kernel(image), Board::Virt) if is_xnu => {
             if config.initrd.is_some() || has_virtio {
                 return Err(Error::Boot(boot::Error::Unsupported(
                     "XNU boot has no initrd or virtio disk support",
@@ -472,7 +521,7 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
                 ram_size as u64,
             )
         }
-        Board::Virt => boot::prepare_boot(
+        (Payload::Kernel(image), Board::Virt) => boot::prepare_boot(
             &mut shared_mem,
             image,
             config.initrd.as_deref(),
@@ -497,7 +546,7 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
     } else {
         let serial =
             Pl011::new(emit).with_line(move |level| serial_line.store(level, Ordering::Release));
-        let gic = if is_xnu {
+        let gic = if is_xnu || matches!(payload, Payload::Firmware(_)) {
             Intc::V3(Gicv3::default())
         } else {
             Intc::V2(Gicv2::default())
@@ -514,10 +563,15 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
     if apple {
         m1::identify(&mut machine.cpu);
     }
+    if matches!(payload, Payload::Firmware(_)) {
+        // The firmware drives a GICv3 through `ICC_*` system registers, and checks the GIC
+        // field of ID_AA64PFR0_EL1 before it uses them, as QEMU reports for gic-version=3.
+        machine.cpu.system.id_aa64pfr0_el1 |= 1 << 24;
+    }
     machine.cpu.pc = layout.entry;
     machine.cpu.x[0] = layout.boot_info;
     machine.cpu.x[1..4].fill(0);
-    if is_xnu && xnu::is_fileset(image) {
+    if matches!(payload, Payload::Kernel(image) if is_xnu && xnu::is_fileset(image)) {
         // A kernel collection enters at its reset trampoline: x0 is the reset type (0 for
         // a cold boot) and x1 the boot arguments.
         machine.cpu.x[0] = 0;
@@ -928,5 +982,66 @@ mod tests {
         .unwrap();
         assert_eq!(report.reason, StopReason::Shutdown);
         assert_eq!(report.console, b"C");
+    }
+
+    /// A raw little-endian instruction stream, as a firmware image is laid out in flash.
+    fn flash_image(instructions: &[u32]) -> Vec<u8> {
+        instructions.iter().flat_map(|i| i.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn firmware_runs_from_flash_with_x0_zero_as_under_qemu_bios() {
+        // mov x19, x0 keeps the entry value of x0; then 'F' to the PL011, then PSCI off.
+        let flash = flash_image(&[
+            0xaa0003f3, // mov x19, x0
+            0xd2a12001, // movz x1, #0x900, lsl #16 (PL011)
+            0x528008c2, // movz w2, #70 ('F')
+            0x39000022, // strb w2, [x1]
+            0xd2b08000, // movz x0, #0x8400, lsl #16
+            0xf2800100, // movk x0, #8 (PSCI_SYSTEM_OFF)
+            0xd4000002, // hvc #0
+        ]);
+        let report = boot_firmware(
+            &flash,
+            SystemConfig::<Vec<u8>> {
+                timeout: Duration::from_secs(5),
+                cmdline: String::new(),
+                idle_mode: IdleMode::Paced,
+                ram_size: 256 << 20,
+                initrd: None,
+                disk: None,
+                board: Board::Virt,
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.reason, StopReason::Shutdown, "{report}");
+        assert_eq!(report.console, b"F");
+        assert_eq!(report.layout.entry, boot::FIRMWARE_BASE);
+        assert_eq!(report.layout.boot_info, 0);
+        assert_eq!(report.cpu.x[19], 0);
+        assert_eq!(report.unmapped_accesses, 0);
+    }
+
+    #[test]
+    fn firmware_boot_refuses_a_disk_it_cannot_reach() {
+        let flash = flash_image(&[0xd4000002]);
+        let result = boot_firmware(
+            &flash,
+            SystemConfig {
+                timeout: Duration::from_secs(5),
+                cmdline: String::new(),
+                idle_mode: IdleMode::Paced,
+                ram_size: 256 << 20,
+                initrd: None,
+                disk: Some(vec![0u8; 512]),
+                board: Board::Virt,
+            },
+            |_| {},
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Boot(boot::Error::Unsupported(_)))
+        ));
     }
 }

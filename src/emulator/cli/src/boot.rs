@@ -1,4 +1,5 @@
-//! Raw Linux arm64 Image, or XNU Mach-O kernel, boot through Volt's full-system JIT.
+//! Raw Linux arm64 Image, XNU Mach-O kernel, or `-bios` firmware image, booted through Volt's
+//! full-system JIT.
 
 use std::{
     io::Write,
@@ -8,8 +9,8 @@ use std::{
 };
 use volt_emulator::devices::BlockBackend;
 use volt_emulator::system::{
-    Board, DEFAULT_CMDLINE, DEFAULT_XNU_CMDLINE, IdleMode, RAM_SIZE, SystemConfig, XNU_RAM_SIZE,
-    m1, smp::SmpConfig,
+    Board, DEFAULT_CMDLINE, DEFAULT_XNU_CMDLINE, FIRMWARE_RAM_SIZE, IdleMode, RAM_SIZE,
+    SystemConfig, XNU_RAM_SIZE, m1, smp::SmpConfig,
 };
 use winnow_args::{Args, ValueEnum};
 
@@ -36,12 +37,12 @@ impl From<IdleModeArg> for IdleMode {
 #[derive(Args, Debug)]
 #[arg(
     name = "volt-boot",
-    about = "AArch64 Linux or XNU boot with PL011, GICv2/GICv3, VirtIO-Blk, or the Apple M1 SoC"
+    about = "AArch64 Linux, XNU or firmware boot with PL011, GICv2/GICv3, VirtIO-Blk, or the Apple M1 SoC"
 )]
 struct Cli {
-    /// Path to a raw Linux AArch64 Image, or an XNU kernel (Mach-O).
+    /// Path to a raw Linux AArch64 Image, or an XNU kernel (Mach-O). Omit with --bios.
     #[arg(positional)]
-    image: PathBuf,
+    image: Option<PathBuf>,
 
     /// Timeout in seconds (default: 20).
     #[arg(positional)]
@@ -63,6 +64,15 @@ struct Cli {
     /// `t8103-j274.dtb`. Selects that machine in place of the QEMU `virt` board.
     #[arg(long)]
     dtb: Option<PathBuf>,
+
+    /// Firmware image to run from flash at address 0, as QEMU's `-bios` does (e.g. an EDK2
+    /// `QEMU_EFI.fd` or tinted-boot's `tinted-boot-aarch64.bin`). Boots no kernel.
+    #[arg(long)]
+    bios: Option<PathBuf>,
+
+    /// Timeout in seconds, for any boot (default: 20). Alternative to the seconds positional.
+    #[arg(long)]
+    timeout: Option<u64>,
 
     /// Guest RAM size (e.g. 128M, 256M, 512M, 1G).
     #[arg(short, long, alias = "ram")]
@@ -161,6 +171,12 @@ fn main() -> ExitCode {
             } else if s == "-smp" {
                 args.push("--smp".into());
                 continue;
+            } else if s == "-bios" {
+                args.push("--bios".into());
+                continue;
+            } else if let Some(rest) = s.strip_prefix("-bios=") {
+                args.push(format!("--bios={rest}").into());
+                continue;
             }
         }
         args.push(arg);
@@ -196,8 +212,15 @@ fn run(cli: Cli) -> Result<(), String> {
         IdleMode::Paced
     };
 
-    let seconds = cli.seconds.unwrap_or(20);
-    let image = std::fs::read(&cli.image).map_err(|e| format!("{}: {e}", cli.image.display()))?;
+    let seconds = cli.timeout.or(cli.seconds).unwrap_or(20);
+    if let Some(bios) = &cli.bios {
+        return run_firmware(&cli, bios, idle_mode, seconds);
+    }
+    let image_path = cli
+        .image
+        .as_ref()
+        .ok_or("no kernel image given: pass a Linux Image or XNU kernel, or --bios FIRMWARE")?;
+    let image = std::fs::read(image_path).map_err(|e| format!("{}: {e}", image_path.display()))?;
     let board = match &cli.dtb {
         Some(path) => Board::AppleM1 {
             device_tree: std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?,
@@ -288,6 +311,54 @@ fn run(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
+/// Boots a firmware image as QEMU's `-bios` does: no kernel, the image run from flash at 0.
+fn run_firmware(cli: &Cli, bios: &Path, idle_mode: IdleMode, seconds: u64) -> Result<(), String> {
+    if cli.image.is_some() {
+        return Err(
+            "--bios boots firmware without a kernel; drop the positional arguments and use --timeout"
+                .into(),
+        );
+    }
+    if cli.dtb.is_some() {
+        return Err("--bios and --dtb select different machines".into());
+    }
+    if cli.cpus > 1 {
+        return Err("firmware boot has one vCPU for now; pass --smp 1".into());
+    }
+    let firmware = std::fs::read(bios).map_err(|e| format!("{}: {e}", bios.display()))?;
+    let ram_size = match cli.memory.as_deref() {
+        Some(s) => parse_memory_size(s)?,
+        None => FIRMWARE_RAM_SIZE,
+    };
+    let initrd = match &cli.initrd {
+        Some(path) => Some(load_initrd(path)?),
+        None => None,
+    };
+    let disk = match &cli.disk {
+        Some(path) => Some(FileBackend::open(path)?),
+        None => None,
+    };
+    let config = SystemConfig {
+        timeout: Duration::from_secs(seconds),
+        cmdline: String::new(),
+        idle_mode,
+        ram_size,
+        initrd,
+        disk,
+        board: Board::Virt,
+    };
+    let mut output = std::io::BufWriter::new(std::io::stdout());
+    let report = volt_emulator::system::boot_firmware(&firmware, config, move |byte| {
+        let _ = output.write_all(&[byte]);
+        if byte == b'\n' {
+            let _ = output.flush();
+        }
+    })
+    .map_err(|e| format!("{e}"))?;
+    println!("\n{report}");
+    Ok(())
+}
+
 fn load_initrd(path: &Path) -> Result<Vec<u8>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if bytes.len() >= 4 && bytes[..4] == [0x28, 0xb5, 0x2f, 0xfd] {
@@ -366,6 +437,18 @@ mod tests {
 
         let cli = Cli::parse_from(["--initrd=initramfs.cpio", "Image"]).unwrap();
         assert_eq!(cli.initrd, Some(PathBuf::from("initramfs.cpio")));
+    }
+
+    #[test]
+    fn test_winnow_args_bios_needs_no_kernel() {
+        let cli = Cli::parse_from(["--bios", "tinted-boot-aarch64.bin", "--timeout", "7"]).unwrap();
+        assert_eq!(cli.bios, Some(PathBuf::from("tinted-boot-aarch64.bin")));
+        assert!(cli.image.is_none());
+        assert_eq!(cli.timeout, Some(7));
+
+        let cli = Cli::parse_from(["Image"]).unwrap();
+        assert!(cli.bios.is_none());
+        assert_eq!(cli.image, Some(PathBuf::from("Image")));
     }
 
     #[test]

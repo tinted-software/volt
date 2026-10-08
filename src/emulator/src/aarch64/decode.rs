@@ -609,8 +609,20 @@ pub enum SystemRegister {
     IccBpr0El1,
     IccCtlrEl1,
     IccIgrpen0El1,
+    /// Group 1 enable and binary point: the group the firmware and Linux use for IRQs.
+    IccIgrpen1El1,
+    IccBpr1El1,
+    /// Group 1 acknowledge and end of interrupt. No group 1 interrupt is delivered by this
+    /// model, so an acknowledge reads spurious and an end of interrupt has nothing to end.
+    IccIar1El1,
+    IccEoir1El1,
     /// Stored, but the physical timer never fires.
     CntpCtlEl0,
+    /// The physical counter (the virtual count, as CNTVOFF_EL2 is zero without EL2).
+    CntpctEl0,
+    /// Physical timer compare value and its 32-bit view, sharing the counter. It never fires.
+    CntpTvalEl0,
+    CntpCvalEl0,
     ActlrEl1,
     Nzcv,
     RazWi,
@@ -1304,7 +1316,14 @@ fn system_register(
         0x0c83 => IccBpr0El1,
         0x0cc4 => IccCtlrEl1,
         0x0cc6 => IccIgrpen0El1,
+        0x0cc7 => IccIgrpen1El1,
+        0x0cc3 => IccBpr1El1,
         0x3e21 => CntpCtlEl0,
+        0x3e01 => CntpctEl0,
+        0x3e20 => CntpTvalEl0,
+        0x3e22 => CntpCvalEl0,
+        0x0cc0 => IccIar1El1,
+        0x0cc1 => IccEoir1El1,
         0x0101 => ActlrEl1,
         0x0000 => MidrEl1,
         0x0005 => MpidrEl1,

@@ -216,7 +216,10 @@ pub struct System {
     pub icc_bpr0_el1: u64,
     pub icc_ctlr_el1: u64,
     pub icc_igrpen0_el1: u64,
+    pub icc_igrpen1_el1: u64,
+    pub icc_bpr1_el1: u64,
     pub cntp_ctl_el0: u64,
+    pub cntp_cval_el0: u64,
     pub actlr_el1: u64,
     /// EL2 banks (SPTM runs at EL2, GL2). `SP_EL2` is `sp_el[2]`.
     pub sctlr_el2: u64,
@@ -298,7 +301,10 @@ impl Default for System {
             // PRIbits 7: eight priority bits.
             icc_ctlr_el1: 7 << 8,
             icc_igrpen0_el1: 0,
+            icc_igrpen1_el1: 0,
+            icc_bpr1_el1: 0,
             cntp_ctl_el0: 0,
+            cntp_cval_el0: 0,
             actlr_el1: 0,
             apple: [0; crate::aarch64::decode::APPLE_SLOTS],
             midr_el1: crate::aarch64::identification::DEFAULT_MIDR_EL1,
