@@ -115,17 +115,17 @@ monitor's own image stays linear, because it runs position-independently before 
 is on. With that packing, validation passes and the monitor reaches `/chosen/dram-base`.
 
 It then stops in a data abort. The monitor maps physical ranges through a table of
-`{VA base, PA base, pages}` entries (the PAPT table, at `0xfffffff027105000 + 0x9d0`) that
-its DRAM registrar (`0xfffffff0270bd224`) fills. The registrar checks each physical base
-against `sptm_first_dram`/`sptm_last_dram`, so the physical addresses volt supplies are the
-right kind. The registrar is never entered: its only reference is a function-pointer table
-in `__DATA_CONST`, and the code that dispatches that table is not yet traced. With the table
-empty, a lookup misses and the zeroing routine at `0xfffffff0270d05f4` clears a masked
-address (`0x3fe820000000`). Earlier notes read the masked values (`VA & 0x0000_ffff_ffff_ffff`
-in the TTBR writes) as a physical-address convention; they are artifacts of the same miss.
-GXF (`genter`,
-`gexit`, `GXF_*`, `VBAR_GL1`) and SPRR are not modelled; `genter` raises an undefined
-instruction.
+`{VA base, PA base, pages}` entries (the PAPT table, at `0xfffffff027105000 + 0x9d0`) that its registrar
+(`0xfffffff0270bd224`) fills. That function is `SPTM_FUNCTIONID_SLIDE_REGION`
+(found in a dispatch table at `0xfffffff027021dd0`): it registers one physical range into
+the PAPT table for callers that send the command; it checks each physical base against
+`sptm_first_dram`/`sptm_last_dram`. The bootstrap does not call it. The bootstrap fills
+the table in its own DRAM walk (`0xfffffff0270d05f4`, the entry writes at `0xfffffff0270d0804`),
+then zeroes authored pages at `0xfffffff0270d0b0c` through the same table. The abort is a
+lookup miss in that walk (`0x3fe820000000`), after which earlier notes about a
+`VA & 0x0000_ffff_ffff_ffff` physical-address convention are artifacts of the miss, not a
+register convention. GXF (`genter`, `gexit`, `GXF_*`, `VBAR_GL1`) and SPRR are not
+modelled; `genter` raises an undefined instruction.
 
 Two debugging hooks make this tractable. `Machine::set_step_trace` runs one instruction
 per block and reports each step with the system registers it changed, exception entries
