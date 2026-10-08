@@ -1124,6 +1124,9 @@ fn apple_register(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> Option<Sy
         (5, 3, 1) => Apple(19),
         (7, 0, 4) => Apple(20),
         (7, 6, 4) => AppleZero,
+        // The S3_5_c15_cN_0 state registers early init reads, none named in the XNU
+        // source tree. Read as zero until their roles are identified.
+        (5, 2..=7, 0) => AppleZero,
         _ => return None,
     })
 }

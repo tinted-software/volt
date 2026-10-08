@@ -89,8 +89,9 @@ at `0x2_3520_0000`. The machine is one vCPU with the M1 Icestorm identity
 The Linux kernel boots through the AIC and the S5L console, probes its power domains,
 and panics on the missing root filesystem (`VFS: Unable to mount root fs`), which is
 the expected result without one. `--initrd`, `--disk` and `--smp` above 1 are rejected
-on this board, and a Mach-O kernel is refused: XNU needs the SoC's own ADT and
-firmware interfaces, which are not modelled.
+on this board. A kernelcache from the restore image (`MH_FILESET`) loads, with its ADT
+as `--dtb`, and runs its first blocks; it does not get past the early boot CPU
+table yet, and it needs PAuth and chained fixups before it can go further.
 
 Not modelled: any arm-io device other than the AIC, the UART and the power-state
 blocks. Those addresses read as zero and writes are dropped, and the boot report counts

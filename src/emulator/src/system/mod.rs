@@ -435,12 +435,15 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
     let has_virtio = config.disk.is_some();
     let is_xnu = xnu::is_macho(image);
     let layout = match config.board {
+        Board::AppleM1 { device_tree } if is_xnu => xnu::prepare_boot_with_tree(
+            &mut shared_mem,
+            image,
+            &config.cmdline,
+            &device_tree,
+            ram_base,
+            ram_size as u64,
+        ),
         Board::AppleM1 { device_tree } => {
-            if is_xnu {
-                return Err(Error::Boot(boot::Error::Unsupported(
-                    "XNU boot on the Apple M1 SoC is not supported yet",
-                )));
-            }
             if has_virtio || config.initrd.is_some() {
                 return Err(Error::Boot(boot::Error::Unsupported(
                     "the Apple M1 SoC has no initrd or virtio disk support yet",
