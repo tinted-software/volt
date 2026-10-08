@@ -114,10 +114,16 @@ contiguous link span (`monitor::image_parts`), copied whole (`monitor::place_par
 monitor's own image stays linear, because it runs position-independently before its MMU
 is on. With that packing, validation passes and the monitor reaches `/chosen/dram-base`.
 
-It then stops in a data abort. It zeroes a page at `VA & 0x3fff_ffff_ffff` of a linear-map
-address, so its convention for converting a linear-map address to a physical one is not
-the one volt's boot structure implies (`VA = PA + x22 - x23`). Which convention it uses, and
-where iBoot places DRAM relative to the image, is not yet established. GXF (`genter`,
+It then stops in a data abort. The monitor maps physical ranges through a table of
+`{VA base, PA base, pages}` entries (the PAPT table, at `0xfffffff027105000 + 0x9d0`) that
+its DRAM registrar (`0xfffffff0270bd224`) fills. The registrar checks each physical base
+against `sptm_first_dram`/`sptm_last_dram`, so the physical addresses volt supplies are the
+right kind. The registrar is never entered: its only reference is a function-pointer table
+in `__DATA_CONST`, and the code that dispatches that table is not yet traced. With the table
+empty, a lookup misses and the zeroing routine at `0xfffffff0270d05f4` clears a masked
+address (`0x3fe820000000`). Earlier notes read the masked values (`VA & 0x0000_ffff_ffff_ffff`
+in the TTBR writes) as a physical-address convention; they are artifacts of the same miss.
+GXF (`genter`,
 `gexit`, `GXF_*`, `VBAR_GL1`) and SPRR are not modelled; `genter` raises an undefined
 instruction.
 
