@@ -32,6 +32,41 @@ The disk form supplies `root=/dev/vda rw` by default. `--cpus`, `--idle`,
 `--fast`, and `--spin` control the virtual CPU count and WFI policy. Use
 `volt-boot --help` for the complete generated interface.
 
+## XNU boot
+
+`volt-boot` also boots an XNU kernel. A Mach-O image is detected by its magic, so no
+flag is needed:
+
+```sh
+cargo run --release --bin volt-boot -- \
+  path/to/kernel.development.qemu 20 --fast
+```
+
+The loader follows the `bootxnu` U-Boot command: it places the Mach-O segments at a
+`physBase` that is congruent to the link-time `virtBase` modulo a 32 MiB L2 block,
+builds an Apple flattened device tree (the equivalent of `mkafdt.py`) and a `boot_args`
+block, and enters at the kernel entry with the MMU off and `x0` pointing at
+`boot_args`. The machine is the QEMU `virt` layout XNU's QEMU platform expects:
+PL011 `uart0` at `0x09000000`, and a GICv3 (distributor `0x08000000`, redistributor
+`0x080a0000`, `ICC_*` system registers) that forwards the virtual timer as a FIQ. The
+last 512 KiB of RAM is the panic log (`chosen/pram`), and `memSize` excludes it.
+
+Defaults for a Mach-O kernel are 1 GiB of RAM and the boot-args
+`-v serial=3 debug=0x14e keepsyms=1 serial-device-name=uart0`. To pass your own, the
+first word must not start with a dash (`serial=3 -v ...`), or it is read as a flag.
+`--initrd`, `--disk` and `--cpus` above 1 are rejected for XNU.
+
+The bare kernel boots through the pmap and VM bootstrap, zone and IOKit start-up, the
+scheduler and IONVRAM, and then panics in `read_random`: the corecrypto kext that
+registers the kernel PRNG is not part of the kernel image. That is the kernel's own
+behavior on any machine, and the panic message and backtrace appear on the console.
+Going further needs a kernelcache with corecrypto prelinked.
+
+Not modelled: privileged-access-never is stored and saved in `SPSR_EL1` but not
+enforced by translation, the physical timer is stored but never fires, floating point
+rounds to nearest even and sets no `FPSR` flags, and the GICv3 carries only the
+virtual timer (no SPIs, SGIs or group 1).
+
 ## Performance
 
 Translating a block costs much more than running it once, and a kernel boot runs most

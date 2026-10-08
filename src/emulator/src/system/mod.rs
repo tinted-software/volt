@@ -1,16 +1,19 @@
-//! AArch64 Linux full-system execution on the Volt native JIT.
-//! Ports Mirage's JIT Machine, raw Image launch and one-vCPU serial/GIC runner.
+//! AArch64 Linux and XNU full-system execution on the Volt native JIT.
+//! Ports Mirage's JIT Machine, raw Image launch and one-vCPU serial/GIC runner; a
+//! Mach-O kernel boots through [`xnu`] on a GICv3 instead of the Linux GICv2.
 
+pub mod afdt;
 pub mod boot;
 pub mod esr;
 pub mod fdt;
 pub mod machine;
 pub mod psci;
 pub mod smp;
+pub mod xnu;
 
 use crate::aarch64::{Cpu, decode, translate};
 use crate::devices::bus::Device;
-use crate::devices::{gicv2::Gicv2, pl011::Pl011};
+use crate::devices::{gicv2::Gicv2, gicv3::Gicv3, pl011::Pl011};
 use crate::memory::{GuestMemory, PhysicalMemory, Region, SharedMemory};
 use alloc::sync::Arc;
 use core::{
@@ -23,6 +26,11 @@ use std::{io::Write, time::Instant};
 pub const RAM_BASE: u64 = 0x4000_0000;
 pub const RAM_SIZE: usize = 128 << 20;
 pub const DEFAULT_CMDLINE: &str = "console=ttyAMA0 earlycon=pl011,0x9000000 nokaslr loglevel=8";
+/// Boot arguments for an XNU kernel: verbose boot, console and debug output on the
+/// PL011 that the device tree describes as `uart0`.
+pub const DEFAULT_XNU_CMDLINE: &str = "-v serial=3 debug=0x14e keepsyms=1 serial-device-name=uart0";
+/// XNU sizes its zones from RAM; 128 MiB leaves it little to work with.
+pub const XNU_RAM_SIZE: usize = 1 << 30;
 
 #[derive(Debug)]
 pub enum Error {
@@ -95,8 +103,8 @@ impl core::fmt::Display for BootReport {
         writeln!(f, "--- stopped: {:?}", self.reason)?;
         writeln!(
             f,
-            "entry {:x}, device tree {:x}",
-            self.layout.entry, self.layout.device_tree
+            "entry {:x}, boot info {:x}",
+            self.layout.entry, self.layout.boot_info
         )?;
         if let Some(at) = self.stalled_at {
             writeln!(f, "refused at {at:x}")?;
@@ -196,9 +204,48 @@ impl<B> Default for SystemConfig<B> {
     }
 }
 
+/// The interrupt controller a boot configures: the GICv2 a Linux device tree
+/// describes, or the GICv3 XNU's platform expects. Shared peripherals (UART, virtio)
+/// are wired to the GICv2 only; the GICv3 carries the virtual timer, which the
+/// machine evaluates live from the timer registers.
+enum Intc {
+    V2(Gicv2),
+    V3(Gicv3),
+}
+impl Intc {
+    fn raise(&mut self, intid: u32) {
+        if let Self::V2(gic) = self {
+            gic.raise(intid);
+        }
+    }
+    fn lower(&mut self, intid: u32) {
+        if let Self::V2(gic) = self {
+            gic.lower(intid);
+        }
+    }
+    fn raise_on(&mut self, cpu: u32, intid: u32) {
+        if let Self::V2(gic) = self {
+            gic.raise_on(cpu, intid);
+        }
+    }
+    fn signalled(&self, cpu: u32) -> bool {
+        match self {
+            Self::V2(gic) => gic.signalled(cpu),
+            Self::V3(_) => false,
+        }
+    }
+    /// See [`machine::Machine::vtimer_fiq`].
+    fn vtimer_fiq(&self) -> Option<u8> {
+        match self {
+            Self::V2(_) => None,
+            Self::V3(gic) => gic.vtimer_fiq_priority(),
+        }
+    }
+}
+
 struct SystemDevices<'a, V> {
     serial: &'a mut Pl011,
-    gic: &'a mut Gicv2,
+    gic: &'a mut Intc,
     virtio: Option<&'a mut V>,
 }
 
@@ -210,16 +257,41 @@ impl<V: crate::devices::VirtioIo> machine::DeviceIo for SystemDevices<'_, V> {
         self.serial.write(offset, size, value);
     }
     fn read_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64 {
-        self.gic.read_distributor_for(cpu_id, offset, size)
+        match self.gic {
+            Intc::V2(gic) => gic.read_distributor_for(cpu_id, offset, size),
+            Intc::V3(gic) => gic.read_distributor(offset, size),
+        }
     }
     fn write_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64) {
-        self.gic.write_distributor_for(cpu_id, offset, size, value);
+        match self.gic {
+            Intc::V2(gic) => {
+                gic.write_distributor_for(cpu_id, offset, size, value);
+            }
+            Intc::V3(gic) => gic.write_distributor(offset, size, value),
+        }
     }
     fn read_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64 {
-        self.gic.read_cpu_for(cpu_id, offset, size)
+        match self.gic {
+            Intc::V2(gic) => gic.read_cpu_for(cpu_id, offset, size),
+            // The GICv3 CPU interface is the `ICC_*` system registers.
+            Intc::V3(_) => 0,
+        }
     }
     fn write_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64) {
-        self.gic.write_cpu_for(cpu_id, offset, size, value);
+        if let Intc::V2(gic) = self.gic {
+            gic.write_cpu_for(cpu_id, offset, size, value);
+        }
+    }
+    fn read_gic_redistributor(&mut self, offset: u64, size: u8) -> u64 {
+        match self.gic {
+            Intc::V3(gic) => gic.read_redistributor(offset, size),
+            Intc::V2(_) => 0,
+        }
+    }
+    fn write_gic_redistributor(&mut self, offset: u64, size: u8, value: u64) {
+        if let Intc::V3(gic) = self.gic {
+            gic.write_redistributor(offset, size, value);
+        }
     }
     fn read_virtio(&mut self, offset: u64, size: u8) -> u64 {
         if let Some(v) = &mut self.virtio {
@@ -307,16 +379,32 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
     let memory = PhysicalMemory::new(vec![region]).map_err(Error::Memory)?;
     let mut shared_mem = SharedMemory::new(memory);
     let has_virtio = config.disk.is_some();
-    let layout = boot::prepare_boot(
-        &mut shared_mem,
-        image,
-        config.initrd.as_deref(),
-        &config.cmdline,
-        RAM_BASE,
-        ram_size as u64,
-        1,
-        has_virtio,
-    )
+    let is_xnu = xnu::is_macho(image);
+    let layout = if is_xnu {
+        if config.initrd.is_some() || has_virtio {
+            return Err(Error::Boot(boot::Error::Unsupported(
+                "XNU boot has no initrd or virtio disk support",
+            )));
+        }
+        xnu::prepare_boot(
+            &mut shared_mem,
+            image,
+            &config.cmdline,
+            RAM_BASE,
+            ram_size as u64,
+        )
+    } else {
+        boot::prepare_boot(
+            &mut shared_mem,
+            image,
+            config.initrd.as_deref(),
+            &config.cmdline,
+            RAM_BASE,
+            ram_size as u64,
+            1,
+            has_virtio,
+        )
+    }
     .map_err(Error::Boot)?;
     let console = Arc::new(Mutex::new(Vec::new()));
     let serial_console = console.clone();
@@ -327,7 +415,11 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
         sink(byte);
     })
     .with_line(move |level| serial_line.store(level, Ordering::Release));
-    let mut gic = Gicv2::default();
+    let mut gic = if is_xnu {
+        Intc::V3(Gicv3::default())
+    } else {
+        Intc::V2(Gicv2::default())
+    };
     let virtio_line = Arc::new(AtomicBool::new(false));
     let virtio_notify = virtio_line.clone();
     let mut virtio = config.disk.map(|backend| {
@@ -336,7 +428,7 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
     });
     let mut machine = machine::Machine::new(shared_mem);
     machine.cpu.pc = layout.entry;
-    machine.cpu.x[0] = layout.device_tree;
+    machine.cpu.x[0] = layout.boot_info;
     machine.cpu.x[1..4].fill(0);
     let started = Instant::now();
     let mut exits = 0;
@@ -356,6 +448,7 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
             gic.lower(fdt::VIRTIO_INTID);
         }
         machine.irq_line = gic.signalled(0);
+        machine.vtimer_fiq = gic.vtimer_fiq();
         let mut dev = SystemDevices {
             serial: &mut serial,
             gic: &mut gic,
@@ -425,7 +518,9 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
         }
         exits += 1;
         let sp = machine.cpu.sp;
-        if machine.cpu.system.sctlr_el1 & 1 == 0
+        // XNU points `sp` at a kernel virtual address before it enables the MMU.
+        if !is_xnu
+            && machine.cpu.system.sctlr_el1 & 1 == 0
             && sp != 0
             && !(RAM_BASE..=RAM_BASE + ram_size as u64).contains(&sp)
         {

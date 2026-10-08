@@ -1,3 +1,5 @@
+use super::simd_struct::{Shape, StructDesc};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
     UnsupportedInstruction,
@@ -176,6 +178,13 @@ pub struct MultiplyHigh {
     pub rd: u8,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdLiteral {
+    /// 4, 8 or 16.
+    pub bytes: u8,
+    pub rt: u8,
+    pub offset: i64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Literal {
     pub size: Size,
     pub rt: u8,
@@ -189,17 +198,134 @@ pub struct Exclusive {
     pub rt: u8,
     pub rs: u8,
 }
+
+/// Operation of an LSE atomic. Acquire and release ordering are not modelled
+/// separately: each host read-modify-write is sequentially consistent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AtomicKind {
+    #[default]
+    Add,
+    Clr,
+    Eor,
+    Set,
+    SMax,
+    SMin,
+    UMax,
+    UMin,
+    Swap,
+    /// `CAS`, `CASB`, `CASH`: compare with `Rs`, store `Rt` on a match.
+    Cas,
+    /// `CASP`: compare `Rs`, `Rs+1` with the pair, store `Rt`, `Rt+1` on a match.
+    Casp,
+    /// `LDXP`: load a pair and set the exclusive monitor on it.
+    LoadPair,
+    /// `STXP`: store a pair if the monitor still holds and memory is unchanged.
+    StorePair,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Atomic {
+    pub kind: AtomicKind,
+    pub size: Size,
+    pub rs: u8,
+    pub rn: u8,
+    pub rt: u8,
+    /// The second register of `LoadPair` and `StorePair`.
+    pub rt2: u8,
+}
+impl AtomicKind {
+    /// Number of adjacent words the operation reads and writes.
+    pub fn words(self) -> usize {
+        if matches!(self, Self::Casp | Self::LoadPair | Self::StorePair) {
+            2
+        } else {
+            1
+        }
+    }
+    /// `LDXP` or `STXP`: the monitor-based pair accesses.
+    pub fn is_exclusive_pair(self) -> bool {
+        matches!(self, Self::LoadPair | Self::StorePair)
+    }
+    /// The words left in memory after the operation. `memory` holds the words read
+    /// (the second one only matters to `Casp`). `operands` are `[Rs]` for the memory
+    /// ops, `[Rs, Rt]` for `Cas`, and `[Rs, Rs+1, Rt, Rt+1]` for `Casp`. Results are
+    /// masked to `width` bytes.
+    pub fn apply(self, memory: [u64; 2], operands: [u64; 4], width: u8) -> [u64; 2] {
+        let mask = if width >= 8 {
+            u64::MAX
+        } else {
+            (1u64 << (width * 8)) - 1
+        };
+        let [old, second] = memory.map(|v| v & mask);
+        let [a, b, c, d] = operands.map(|v| v & mask);
+        match self {
+            Self::Add => [old.wrapping_add(a) & mask, second],
+            Self::Clr => [old & !a, second],
+            Self::Eor => [old ^ a, second],
+            Self::Set => [old | a, second],
+            Self::SMax => [
+                if sext_width(old, width) >= sext_width(a, width) {
+                    old
+                } else {
+                    a
+                },
+                second,
+            ],
+            Self::SMin => [
+                if sext_width(old, width) <= sext_width(a, width) {
+                    old
+                } else {
+                    a
+                },
+                second,
+            ],
+            Self::UMax => [old.max(a), second],
+            Self::UMin => [old.min(a), second],
+            Self::Swap => [a, second],
+            Self::Cas => [if old == a { b } else { old }, second],
+            // Exclusive pairs are completed by `Cpu::exclusive_pair`, which owns the
+            // monitor; memory is not combined with anything here.
+            Self::LoadPair | Self::StorePair => [old, second],
+            Self::Casp => {
+                if old == a && second == b {
+                    [c, d]
+                } else {
+                    [old, second]
+                }
+            }
+        }
+    }
+}
+/// Sign-extend the low `width` bytes of `value`.
+fn sext_width(value: u64, width: u8) -> i64 {
+    let drop = 64 - 8 * u32::from(width);
+    ((value << drop) as i64) >> drop
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Address {
     pub page: bool,
     pub rd: u8,
     pub offset: i64,
 }
+/// How a modified-immediate instruction combines its immediate with `rd`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImmCombine {
+    /// `movi`, `mvni`, `fmov`: replace the register.
+    Set,
+    /// `orr`: `rd |= imm`.
+    Or,
+    /// `bic`: `rd &= !imm`.
+    AndNot,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SimdImmediate {
     pub rd: u8,
+    /// The expanded immediate: the low and high 64 bits (the high half is zero for
+    /// a 64-bit `q == false` form, which also clears the register's upper half).
     pub low: u64,
     pub high: u64,
+    pub combine: ImmCombine,
+    pub q: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SimdPair {
@@ -216,10 +342,29 @@ pub struct SimdMemory {
     pub bytes: u8,
     pub rn: u8,
     pub rt: u8,
-    /// Consecutive vector registers touched, starting at `rt`. The
-    /// multi-structure forms use 2..4; the single-register forms use 1.
-    pub registers: u8,
     pub addressing: Addressing,
+}
+/// How a SIMD structure access updates its base register afterwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructPost {
+    None,
+    /// Advance by the bytes transferred.
+    Immediate,
+    Register(u8),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdStruct {
+    pub desc: StructDesc,
+    pub rn: u8,
+    pub post: StructPost,
+}
+/// `at s1e{1,0}{r,w}, Xt`: a stage-1 walk whose result lands in `PAR_EL1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddressTranslate {
+    pub rt: u8,
+    pub write: bool,
+    /// Translate as EL0 (`s1e0*`) rather than EL1.
+    pub user: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SimdCompareZero {
@@ -256,6 +401,16 @@ pub struct SimdInsert {
     pub esize: u8,
     pub index: u8,
 }
+/// `mov Vd.T[dst], Vn.T[src]`: copy one lane, keeping the rest of the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimdInsertElement {
+    pub rd: u8,
+    pub rn: u8,
+    /// Log2 of the element width in bytes.
+    pub esize: u8,
+    pub dst: u8,
+    pub src: u8,
+}
 /// `mov <R>, <Vn>.<T>[index]` / `umov`: extract one lane into a general register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SimdExtract {
@@ -273,23 +428,6 @@ pub struct SimdFmov {
     pub to_fp: bool,
     /// True for 64-bit (`x`/`d`), false for 32-bit (`w`/`s`).
     pub double: bool,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PermuteOp {
-    Uzp1,
-    Uzp2,
-    Zip1,
-    Zip2,
-    Trn1,
-    Trn2,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SimdPermute {
-    pub op: PermuteOp,
-    pub rd: u8,
-    pub rn: u8,
-    pub rm: u8,
-    pub size: u8,
 }
 /// Three-registers-same integer vector operation (`U`, `size` and `opcode`
 /// fields verified against `llvm-mc` encodings).
@@ -339,6 +477,12 @@ pub enum SimdAluOp {
     /// Horizontal add of all lanes (only the low byte/half/word of the result
     /// is meaningful; the rest of the destination is zeroed).
     AddV,
+    /// Minimum (unsigned) across all lanes; result layout matches `AddV`.
+    UMinV,
+    /// Maximum (unsigned) across all lanes; result layout matches `AddV`.
+    UMaxV,
+    /// Sum of all lanes into a lane twice as wide (`uaddlv`).
+    UAddLV,
     /// Adjacent-lane pair operations between two registers.
     UMaxP,
     SMaxP,
@@ -381,6 +525,7 @@ pub enum SystemRegister {
     ElrEl1,
     EsrEl1,
     FarEl1,
+    ParEl1,
     VbarEl1,
     CpacrEl1,
     SctlrEl1,
@@ -393,7 +538,9 @@ pub enum SystemRegister {
     CntvctEl0,
     CntvCtlEl0,
     CntvCvalEl0,
+    CntvTvalEl0,
     TpidrEl1,
+    ContextidrEl1,
     MdscrEl1,
     CntkctlEl1,
     OslarEl1,
@@ -409,6 +556,9 @@ pub enum SystemRegister {
     DczidEl0,
     CntfrqEl0,
     ClidrEl1,
+    /// Geometry of the cache selected by `CsselrEl1` (see `identification`).
+    CcsidrEl1,
+    CsselrEl1,
     IdAa64pfr0El1,
     IdAa64pfr1El1,
     IdAa64pfr2El1,
@@ -429,6 +579,26 @@ pub enum SystemRegister {
     IdAa64mmfr4El1,
     DaifSet,
     DaifClear,
+    /// `mrs`/`msr SPSel, Xt`.
+    SpSel,
+    /// `msr SPSel, #imm`.
+    SpSelSet,
+    /// `mrs`/`msr PAN, Xt`: PSTATE.PAN, stored but not enforced by the page walk.
+    Pan,
+    /// `msr PAN, #imm`.
+    PanSet,
+    /// Pending-interrupt status (bit 7 IRQ, bit 6 FIQ), kept current by the machine.
+    IsrEl1,
+    /// GICv3 CPU interface registers, held as plain state: the redistributor and
+    /// the machine consult them when deciding whether the timer FIQ is delivered.
+    IccSreEl1,
+    IccPmrEl1,
+    IccBpr0El1,
+    IccCtlrEl1,
+    IccIgrpen0El1,
+    /// Stored, but the physical timer never fires.
+    CntpCtlEl0,
+    ActlrEl1,
     Nzcv,
     RazWi,
 }
@@ -445,6 +615,8 @@ impl SystemRegister {
                 | DczidEl0
                 | CntfrqEl0
                 | ClidrEl1
+                | CcsidrEl1
+                | IsrEl1
                 | IdAa64pfr0El1
                 | IdAa64pfr1El1
                 | IdAa64pfr2El1
@@ -623,11 +795,14 @@ pub enum Instruction {
     MulLong(MultiplyLong),
     MulHigh(MultiplyHigh),
     Literal(Literal),
+    SimdLiteral(SimdLiteral),
     Exclusive(Exclusive),
+    Atomic(Atomic),
     Clrex,
     Adr(Address),
     System(System),
     DcZva(u8),
+    AddressTranslate(AddressTranslate),
     Eret,
     CacheOp,
     Tlbi,
@@ -652,15 +827,26 @@ pub enum Instruction {
     SimdImm(SimdImmediate),
     SimdPair(SimdPair),
     SimdMemory(SimdMemory),
+    SimdStruct(SimdStruct),
     SimdCompareZero(SimdCompareZero),
     SimdFmov(SimdFmov),
-    SimdMove { rd: u8, rn: u8 },
-    SimdDup { rd: u8, rn: u8, esize: u8, q: bool },
+    SimdMove {
+        rd: u8,
+        rn: u8,
+    },
+    SimdDup {
+        rd: u8,
+        rn: u8,
+        esize: u8,
+        q: bool,
+    },
     SimdDupElement(SimdDupElement),
+    /// An instruction the host executes from its raw word (see `host`).
+    Host(u32),
     SimdInsert(SimdInsert),
+    SimdInsertElement(SimdInsertElement),
     SimdExtract(SimdExtract),
     SimdExt(SimdExt),
-    SimdPermute(SimdPermute),
     SimdAlu(SimdAlu),
     SimdTable(SimdTable),
     Svc,
@@ -692,10 +878,13 @@ impl Instruction {
             self,
             Memory(_)
                 | Exclusive(_)
+                | Atomic(_)
                 | Literal(_)
+                | SimdLiteral(_)
                 | Pair(_)
                 | SimdPair(_)
                 | SimdMemory(_)
+                | SimdStruct(_)
                 | B(_)
                 | BCond(_)
                 | TestBranch(_)
@@ -708,12 +897,27 @@ impl Instruction {
                 | Trap
                 | Isb
                 | DcZva(_)
+                | AddressTranslate(_)
+                | Host(_)
                 | Eret
                 | Tlbi
         )
     }
 }
 
+/// Whether `word` is architecturally UNDEFINED on this CPU, as opposed to an
+/// instruction the emulator does not implement. Execution takes an Undefined
+/// Instruction exception (XNU's `TRAP_DEBUGGER` word `0xe7ffdeff` relies on it). These
+/// are the permanently-undefined `udf` space and the unallocated top-level groups, plus
+/// the SVE group: the CPU does not advertise SVE.
+pub fn is_undefined(word: u32) -> bool {
+    match (word >> 25) & 0xf {
+        // `udf #imm16` is the reserved group with bits 31:16 clear.
+        0b0000 => word >> 16 == 0,
+        0b0001 | 0b0010 | 0b0011 => true,
+        _ => false,
+    }
+}
 fn reg(word: u32, shift: u32) -> u8 {
     ((word >> shift) & 31) as u8
 }
@@ -810,6 +1014,73 @@ fn bitmask(word: u32, width: Width) -> Result<u64, DecodeError> {
     }
     Ok(immediate)
 }
+/// Decode an Advanced SIMD structure load/store word (`word & 0xbe00_0000 ==
+/// 0x0c00_0000`) into its descriptor and post-index, or `None` for the
+/// whole-register LD1/ST1 forms that `SimdMemory` handles.
+fn simd_struct(word: u32) -> Result<Option<(StructDesc, StructPost)>, DecodeError> {
+    use DecodeError::UnsupportedInstruction as Bad;
+    let q = word & 0x4000_0000 != 0;
+    let rm = reg(word, 16);
+    let size = ((word >> 10) & 3) as u8;
+    let post = if word & 0x0080_0000 == 0 {
+        // Without post-index the Rm field is zero.
+        if rm != 0 {
+            return Err(Bad);
+        }
+        StructPost::None
+    } else if rm == 31 {
+        StructPost::Immediate
+    } else {
+        StructPost::Register(rm)
+    };
+    let mut desc = StructDesc {
+        store: word & 0x0040_0000 == 0,
+        q,
+        rt: reg(word, 0),
+        esize: 1 << size,
+        ..StructDesc::default()
+    };
+    if word & 0x0100_0000 == 0 {
+        if word & 0x0020_0000 != 0 {
+            return Err(Bad);
+        }
+        (desc.registers, desc.interleaved) = match (word >> 12) & 0xf {
+            0b0000 => (4, true),
+            0b0100 => (3, true),
+            0b1000 => (2, true),
+            0b0010 => (4, false),
+            0b0110 => (3, false),
+            0b1010 => (2, false),
+            0b0111 => (1, false),
+            _ => return Err(Bad),
+        };
+        // `.1d` exists only for LD1/ST1.
+        if desc.interleaved && !q && size == 3 {
+            return Err(Bad);
+        }
+        if desc.registers == 1 && !matches!(post, StructPost::Register(_)) {
+            return Ok(None);
+        }
+    } else {
+        // Bits 15:13 give the element scale (and, with R, the structure count);
+        // the lane index is spread over Q, S and size.
+        let opcode = (word >> 13) & 7;
+        let s = u8::from(word & 0x1000 != 0);
+        let qbit = u8::from(q);
+        desc.registers = ((opcode & 1) << 1 | u32::from(word & 0x0020_0000 != 0)) as u8 + 1;
+        let (shape, esize, lane) = match opcode >> 1 {
+            0 => (Shape::Lane, 1, qbit << 3 | s << 2 | size),
+            1 if size & 1 == 0 => (Shape::Lane, 2, qbit << 2 | s << 1 | size >> 1),
+            2 if size == 0 => (Shape::Lane, 4, qbit << 1 | s),
+            2 if size == 1 && s == 0 => (Shape::Lane, 8, qbit),
+            // Replication is a load, and has no lane or S bit.
+            3 if !desc.store && s == 0 => (Shape::Replicate, 1 << size, 0),
+            _ => return Err(Bad),
+        };
+        (desc.shape, desc.esize, desc.lane) = (shape, esize, lane);
+    }
+    Ok(Some((desc, post)))
+}
 fn system_register(
     op0: u32,
     op1: u32,
@@ -820,6 +1091,12 @@ fn system_register(
     use SystemRegister::*;
     if op0 == 2 && op1 == 0 && crn == 0 && (4..=7).contains(&op2) {
         return Ok(RazWi);
+    }
+    if op1 == 0 && crn == 4 && op2 == 5 {
+        return Ok(SpSelSet);
+    }
+    if op1 == 0 && crn == 4 && op2 == 4 {
+        return Ok(PanSet);
     }
     if op1 == 3 && crn == 4 {
         if op2 == 6 {
@@ -838,6 +1115,7 @@ fn system_register(
         0x0401 => ElrEl1,
         0x0520 => EsrEl1,
         0x0600 => FarEl1,
+        0x0740 => ParEl1,
         0x0c00 => VbarEl1,
         0x0102 => CpacrEl1,
         0x0100 => SctlrEl1,
@@ -850,7 +1128,9 @@ fn system_register(
         0x3e02 => CntvctEl0,
         0x3e31 => CntvCtlEl0,
         0x3e32 => CntvCvalEl0,
+        0x3e30 => CntvTvalEl0,
         0x0d04 => TpidrEl1,
+        0x0d01 => ContextidrEl1,
         0x0022 => MdscrEl1,
         0x0104 => OslarEl1,
         0x0134 => OsdlrEl1,
@@ -859,6 +1139,16 @@ fn system_register(
         0x3440 => Fpcr,
         0x3441 => Fpsr,
         0x3421 => Daif,
+        0x0420 => SpSel,
+        0x0423 => Pan,
+        0x0c10 => IsrEl1,
+        0x0cc5 => IccSreEl1,
+        0x0460 => IccPmrEl1,
+        0x0c83 => IccBpr0El1,
+        0x0cc4 => IccCtlrEl1,
+        0x0cc6 => IccIgrpen0El1,
+        0x3e21 => CntpCtlEl0,
+        0x0101 => ActlrEl1,
         0x0000 => MidrEl1,
         0x0005 => MpidrEl1,
         0x0006 => RevidrEl1,
@@ -866,6 +1156,8 @@ fn system_register(
         0x3007 => DczidEl0,
         0x3e00 => CntfrqEl0,
         0x1001 => ClidrEl1,
+        0x1000 => CcsidrEl1,
+        0x2000 => CsselrEl1,
         0x0040 => IdAa64pfr0El1,
         0x0041 => IdAa64pfr1El1,
         0x0042 => IdAa64pfr2El1,
@@ -1093,9 +1385,109 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             offset: sign_extend(word >> 5, 19) << 2,
         }));
     }
+    // LDR (literal, SIMD&FP): S, D or Q register from a PC-relative address.
+    if word & 0x3f00_0000 == 0x1c00_0000 {
+        let bytes = match word >> 30 {
+            0 => 4,
+            1 => 8,
+            2 => 16,
+            _ => return Err(UnsupportedInstruction),
+        };
+        return Ok(SimdLiteral(self::SimdLiteral {
+            bytes,
+            rt: rd,
+            offset: sign_extend(word >> 5, 19) << 2,
+        }));
+    }
+    // LSE atomics (ARMv8.1): LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN and
+    // SWP share one encoding, split by o3 (bit 15) and opc (bits 14:12). LDAPR, the
+    // RCpc load, is the o3=1, opc=100 slot with Rs unused.
+    if word & 0x3f20_0c00 == 0x3820_0000 {
+        let kind = match (word & 0x8000 != 0, (word >> 12) & 7) {
+            (false, 0) => AtomicKind::Add,
+            (false, 1) => AtomicKind::Clr,
+            (false, 2) => AtomicKind::Eor,
+            (false, 3) => AtomicKind::Set,
+            (false, 4) => AtomicKind::SMax,
+            (false, 5) => AtomicKind::SMin,
+            (false, 6) => AtomicKind::UMax,
+            (false, 7) => AtomicKind::UMin,
+            (true, 0) => AtomicKind::Swap,
+            (true, 4) if rm == 31 => {
+                return Ok(Memory(self::Memory {
+                    op: MemoryOp::Load,
+                    size: size(word),
+                    rn,
+                    rt: rd,
+                    addressing: Addressing::Offset(0),
+                    signed: SignExtend::None,
+                }));
+            }
+            _ => return Err(UnsupportedInstruction),
+        };
+        return Ok(Atomic(self::Atomic {
+            kind,
+            size: size(word),
+            rs: rm,
+            rn,
+            rt: rd,
+            rt2: 0,
+        }));
+    }
+    // CAS/CASP (ARMv8.1): compare with Rs (the pair Rs, Rs+1 for CASP); store Rt on a match.
+    if word & 0x3fa0_7c00 == 0x08a0_7c00 {
+        return Ok(Atomic(self::Atomic {
+            kind: AtomicKind::Cas,
+            size: size(word),
+            rs: rm,
+            rn,
+            rt: rd,
+            rt2: 0,
+        }));
+    }
+    if word & 0xbfa0_7c00 == 0x0820_7c00 {
+        // CASP register pairs must be even; odd pairs are unallocated.
+        if rm % 2 != 0 || rd % 2 != 0 {
+            return Err(UnsupportedInstruction);
+        }
+        let size = if word & 0x4000_0000 != 0 {
+            Size::Double
+        } else {
+            Size::Word
+        };
+        return Ok(Atomic(self::Atomic {
+            kind: AtomicKind::Casp,
+            size,
+            rs: rm,
+            rn,
+            rt: rd,
+            rt2: 0,
+        }));
+    }
     if word & 0x3f00_0000 == 0x0800_0000 {
         if word & 0x0020_0000 != 0 {
-            return Err(UnsupportedInstruction);
+            // LDXP/LDAXP/STXP/STLXP: a pair of words or doublewords; the load form has
+            // no status register.
+            let load = word & 0x0040_0000 != 0;
+            if word & 0x8000_0000 == 0 || word & 0x0080_0000 != 0 || (load && rm != 31) {
+                return Err(UnsupportedInstruction);
+            }
+            return Ok(Atomic(self::Atomic {
+                kind: if load {
+                    AtomicKind::LoadPair
+                } else {
+                    AtomicKind::StorePair
+                },
+                size: if word & 0x4000_0000 != 0 {
+                    Size::Double
+                } else {
+                    Size::Word
+                },
+                rs: rm,
+                rn,
+                rt: rd,
+                rt2: reg(word, 10),
+            }));
         }
         let size = size(word);
         let load = word & 0x0040_0000 != 0;
@@ -1132,47 +1524,13 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             rs,
         }));
     }
-    // LD1/ST1 (multiple structures): the opcode field at bits 15:12 selects
-    // how many consecutive vector registers the structure spans, starting at
-    // `rt`: `1010` -> 2, `0110` -> 3, `0010` -> 4. The `0111` opcode is the
-    // single-register form handled below; the remaining encodings are the
-    // interleaved LD2/LD3/LD4 single-structure forms, which spread one
-    // element across registers and are not supported here.
-    if word & 0x3e00_0000 == 0x0c00_0000 && word & 0x0000_f000 != 0x0000_7000 {
-        let registers = match (word >> 12) & 0xf {
-            0b1010 => 2,
-            0b0110 => 3,
-            0b0010 => 4,
-            _ => return Err(UnsupportedInstruction),
-        };
-        // Each register holds the full vector width selected by Q.
-        let bytes = if word & 0x4000_0000 != 0 { 16 } else { 8 };
-        let post_index = word & 0x0080_0000 != 0;
-        let index = (word >> 16) & 0x3f;
-        let span = (registers as u32 * bytes) as u64;
-        let addressing = if post_index {
-            if index != 31 {
-                return Err(UnsupportedInstruction);
-            }
-            Addressing::PostIndex(span as i64)
-        } else {
-            if index != 0 {
-                return Err(UnsupportedInstruction);
-            }
-            Addressing::Offset(0)
-        };
-        return Ok(SimdMemory(self::SimdMemory {
-            op: if word & 0x0040_0000 != 0 {
-                MemoryOp::Load
-            } else {
-                MemoryOp::Store
-            },
-            bytes: bytes as u8,
-            rn,
-            rt: rd,
-            registers: registers as u8,
-            addressing,
-        }));
+    // LD1..LD4 / ST1..ST4 (multiple and single structures) and LD1R..LD4R.
+    // A single-register LD1/ST1 without a register post-index is left to the
+    // `SimdMemory` blocks below, which the JIT inlines.
+    if word & 0xbe00_0000 == 0x0c00_0000
+        && let Some((desc, post)) = simd_struct(word)?
+    {
+        return Ok(SimdStruct(self::SimdStruct { desc, rn, post }));
     }
     // LD1/ST1 (one structure): a full or half-width SIMD register.
     //
@@ -1203,7 +1561,6 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             bytes: bytes as u8,
             rn,
             rt: rd,
-            registers: 1,
             addressing,
         }));
     }
@@ -1265,7 +1622,6 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
                 bytes,
                 rn,
                 rt: rd,
-                registers: 1,
                 addressing,
             }));
         }
@@ -1343,6 +1699,15 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
     if word & 0xffff_ffe0 == 0xd50b_7420 {
         return Ok(DcZva(rd));
     }
+    // AT S1E1R / S1E1W / S1E0R / S1E0W: op1 = 0, CRn = 7, CRm = 8, op2 = 0..=3.
+    if word & 0xffff_ff00 == 0xd508_7800 && (word >> 5) & 7 < 4 {
+        let op2 = (word >> 5) & 7;
+        return Ok(AddressTranslate(self::AddressTranslate {
+            rt: rd,
+            write: op2 & 1 != 0,
+            user: op2 & 2 != 0,
+        }));
+    }
     if word & 0xfff8_0000 == 0xd508_0000 {
         let crn = (word >> 12) & 15;
         let crm = (word >> 8) & 15;
@@ -1367,7 +1732,10 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             return Err(UnsupportedInstruction);
         }
         let expected = match register {
-            SystemRegister::DaifSet | SystemRegister::DaifClear => 0,
+            SystemRegister::DaifSet
+            | SystemRegister::DaifClear
+            | SystemRegister::SpSelSet
+            | SystemRegister::PanSet => 0,
             SystemRegister::MdscrEl1
             | SystemRegister::OslarEl1
             | SystemRegister::OsdlrEl1
@@ -1513,43 +1881,59 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             },
         }));
     }
-    if word & 0x9f00_0400 == 0x0f00_0400 {
-        let q = (word >> 30) & 1;
-        let op = (word >> 29) & 1;
+    // Advanced SIMD modified immediate: MOVI, MVNI, ORR, BIC and FMOV (vector).
+    // `AdvSIMDExpandImm` selects the lane pattern from `cmode` and `op`.
+    // `immh` (bits 22:19) is zero here; a non-zero `immh` is a shift by immediate.
+    if word & 0x9ff8_0400 == 0x0f00_0400 {
+        let q = word & 0x4000_0000 != 0;
+        let op = word & 0x2000_0000 != 0;
         let cmode = (word >> 12) & 0xf;
-        let abc = (word >> 16) & 7;
-        let defgh = (word >> 5) & 0x1f;
-        let imm8 = (abc << 5) | defgh;
+        let imm8 = u64::from((((word >> 16) & 7) << 5) | ((word >> 5) & 0x1f));
         let rd = (word & 0x1f) as u8;
-
-        let val32: u64 = match cmode {
-            0 | 1 => imm8 as u64,
-            2 | 3 => (imm8 as u64) << 8,
-            4 | 5 => (imm8 as u64) << 16,
-            6 | 7 => (imm8 as u64) << 24,
-            8 | 9 => {
-                let v16 = imm8 as u64;
-                v16 | (v16 << 16)
+        let twice = |v: u64| v | (v << 32);
+        let imm = match cmode {
+            // 32-bit lanes, shifted left by 0, 8, 16 or 24.
+            0..=7 => twice(imm8 << (8 * (cmode >> 1))),
+            // 16-bit lanes, shifted left by 0 or 8.
+            8..=11 => {
+                let lane = imm8 << (8 * ((cmode >> 1) & 1));
+                twice(lane | (lane << 16))
             }
-            10 | 11 => {
-                let v16 = (imm8 as u64) << 8;
-                v16 | (v16 << 16)
-            }
-            14 => {
-                let b = imm8 as u64;
-                b | (b << 8) | (b << 16) | (b << 24)
-            }
-            _ => imm8 as u64,
+            // 32-bit lanes with the vacated low bits set to ones.
+            12 => twice((imm8 << 8) | 0xff),
+            13 => twice((imm8 << 16) | 0xffff),
+            // Bytes: imm8 in every byte, or each bit of imm8 as a 0x00/0xff byte.
+            14 if !op => imm8 * 0x0101_0101_0101_0101,
+            14 => (0..8).fold(0, |acc, bit| {
+                acc | (if (imm8 >> bit) & 1 != 0 { 0xff } else { 0 }) << (8 * bit)
+            }),
+            // FMOV: the 8-bit float immediate widened to f32 (twice) or f64.
+            _ if !op => twice(super::fp::expand_immediate(imm8, false)),
+            _ if q => super::fp::expand_immediate(imm8, true),
+            _ => return Err(UnsupportedInstruction),
         };
-
-        let mut val64 = val32 | (val32 << 32);
-        if op == 1 {
-            val64 = !val64;
-        }
-
-        let low = val64;
-        let high = if q == 1 { val64 } else { 0 };
-        return Ok(SimdImm(SimdImmediate { rd, low, high }));
+        // Odd cmode below 12 is ORR/BIC; MOVI becomes MVNI (inverted) with op set.
+        let (value, combine) = if cmode < 12 && cmode & 1 == 1 {
+            (
+                imm,
+                if op {
+                    ImmCombine::AndNot
+                } else {
+                    ImmCombine::Or
+                },
+            )
+        } else if cmode < 14 && op {
+            (!imm, ImmCombine::Set)
+        } else {
+            (imm, ImmCombine::Set)
+        };
+        return Ok(SimdImm(SimdImmediate {
+            rd,
+            low: value,
+            high: if q { value } else { 0 },
+            combine,
+            q,
+        }));
     }
     if word & 0xbf3f_fc00 == 0x0e20_9800 {
         let q = word & 0x4000_0000 != 0;
@@ -1573,8 +1957,44 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             double: double64,
         }));
     }
+    // Scalar floating point and integer SIMD the JIT does not compile: `host::run`
+    // executes the word.
+    if super::host::is_supported(word) {
+        return Ok(Host(word));
+    }
+    // Across-lanes reductions: bits 21:17 = 11000, bits 11:10 = 10. They share
+    // the three-same class bits, so they are matched first. ADDV (U=0, opcode
+    // 11011) and, with U=1, UMAXV (01010), UMINV (11010) and UADDLV (00011).
+    if word & 0xbf3f_fc00 == 0x0e31_b800
+        || word & 0xbf3f_fc00 == 0x2e30_a800
+        || word & 0xbf3f_fc00 == 0x2e31_a800
+        || word & 0xbf3f_fc00 == 0x2e30_3800
+    {
+        let q = word & 0x4000_0000 != 0;
+        let size = ((word >> 22) & 3) as u8;
+        // 64-bit lanes need Q, and `.2s` is reserved for every reduction.
+        if size == 3 || (size == 2 && !q) {
+            return Err(UnsupportedInstruction);
+        }
+        let op = match (word & 0x2000_0000 != 0, (word >> 12) & 0x1f) {
+            (false, 0b11011) => SimdAluOp::AddV,
+            (true, 0b01010) => SimdAluOp::UMaxV,
+            (true, 0b11010) => SimdAluOp::UMinV,
+            (true, 0b00011) => SimdAluOp::UAddLV,
+            _ => return Err(UnsupportedInstruction),
+        };
+        return Ok(SimdAlu(self::SimdAlu {
+            op,
+            rd,
+            rn,
+            rm: 0,
+            size,
+            q,
+        }));
+    }
     // Integer three-registers-same (`U`, `size`, `opcode` verified with llvm-mc).
-    if word & 0x9f20_0000 == 0x0e20_0000 {
+    // Bit 10 is 1 in this class; bit-10-clear encodings are handled above.
+    if word & 0x9f20_0400 == 0x0e20_0400 {
         use SimdAluOp::*;
         let q = word & 0x4000_0000 != 0;
         let u = word & 0x2000_0000 != 0;
@@ -1617,13 +2037,11 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             (true, 0b01001) => UQShl,
             (false, 0b01011) => SQRShl,
             (true, 0b01011) => UQRShl,
-            (false, 0b10111) if rm == 0b10001 => AddV,
-            (false, 0b10111) if rm != 0b10001 => AddP,
+            (false, 0b10111) => AddP,
             (true, 0b10100) => UMaxP,
             (false, 0b10100) => SMaxP,
             (true, 0b10101) => UMinP,
             (false, 0b10101) => SMinP,
-            (false, 0b10111) if size != 3 => AddP,
             // The two low opcode bits select AND/BIC/ORR/ORN (and, with U=1,
             // EOR/BSL/BIT/BIF).
             (false, 0b00011) if size == 0 => And,
@@ -1684,6 +2102,21 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             }
         }
     }
+    // `mov Vd.T[i], Vn.T[j]` (`ins`, element): imm5 gives the size and the
+    // destination index; imm4 gives the source index, scaled by the size.
+    if word & 0xffe0_8400 == 0x6e00_0400 {
+        let imm5 = (word >> 16) & 0x1f;
+        let esize = imm5.trailing_zeros();
+        if imm5 != 0 && esize <= 3 {
+            return Ok(SimdInsertElement(self::SimdInsertElement {
+                rd,
+                rn,
+                esize: esize as u8,
+                dst: (imm5 >> (esize + 1)) as u8,
+                src: (((word >> 11) & 0xf) >> esize) as u8,
+            }));
+        }
+    }
     // `dup` from an element: the imm5 field encodes the element size as the
     // position of its lowest set bit and the index in the bits above.
     if word & 0xbf80_fc00 == 0x0e00_0400 {
@@ -1740,28 +2173,6 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
         let rn = ((word >> 5) & 0x1f) as u8;
         let rd = (word & 0x1f) as u8;
         return Ok(SimdExt(self::SimdExt { rd, rn, rm, imm }));
-    }
-    if word & 0xbf20_8400 == 0x0e00_0000 {
-        let op = match (word >> 10) & 0x3f {
-            0b000110 => PermuteOp::Uzp1,
-            0b001110 => PermuteOp::Uzp2,
-            0b000101 => PermuteOp::Zip1,
-            0b001101 => PermuteOp::Zip2,
-            0b000111 => PermuteOp::Trn1,
-            0b001111 => PermuteOp::Trn2,
-            _ => return Err(UnsupportedInstruction),
-        };
-        let size = ((word >> 22) & 3) as u8;
-        let rm = ((word >> 16) & 0x1f) as u8;
-        let rn = ((word >> 5) & 0x1f) as u8;
-        let rd = (word & 0x1f) as u8;
-        return Ok(SimdPermute(self::SimdPermute {
-            op,
-            rd,
-            rn,
-            rm,
-            size,
-        }));
     }
     if word & 0x7fff_0000 == 0x5ac0_0000 {
         let op = match (word >> 10) & 63 {
@@ -2015,6 +2426,8 @@ mod tests {
             (0xd53be040, CntvctEl0),
             (0xd53b4220, Daif),
             (0xd53b4200, Nzcv),
+            (0xd5390000, CcsidrEl1),
+            (0xd53a0000, CsselrEl1),
         ] {
             assert_eq!(
                 decode(word),
@@ -2031,6 +2444,8 @@ mod tests {
             (0xd51bd040, TpidrEl0),
             (0xd5184000, SpsrEl1),
             (0xd518c000, VbarEl1),
+            (0xd518d020, ContextidrEl1),
+            (0xd51a0000, CsselrEl1),
         ] {
             assert_eq!(
                 decode(word),
@@ -2042,7 +2457,10 @@ mod tests {
                 }))
             );
         }
-        for word in [0xd5380060, 0xd5383000, 0xd53b0000, 0xd5385000, 0xd5180000] {
+        // Writing the read-only CCSIDR_EL1 is unallocated.
+        for word in [
+            0xd5380060, 0xd5383000, 0xd53b0000, 0xd5385000, 0xd5180000, 0xd5190000,
+        ] {
             assert_eq!(decode(word), Err(DecodeError::UnsupportedInstruction));
         }
         assert_eq!(
@@ -2119,7 +2537,6 @@ mod tests {
             0x13808000,              // W EXTR bit position 32
             0x5400000e,              // unconditional condition in conditional branch
             0xd61f0001,              // reserved low branch bits
-            0x887f7c00,              // pair-exclusive class
             0xb8c00000,              // reserved signed word to W load
             0xf8620800,              // unsupported index extension
             0x5ac00c00,              // W REV64
@@ -2141,6 +2558,94 @@ mod tests {
         assert_eq!(simd.rd, 31);
         assert_eq!(simd.low, 0);
         assert_eq!(simd.high, 0);
+    }
+    #[test]
+    fn simd_modified_immediates_follow_the_architectural_expansion() {
+        // (word, low, high, combine): the vector `movi`/`mvni`/`orr`/`bic`/`fmov` families.
+        use ImmCombine::*;
+        for (word, low, high, combine) in [
+            // `movi v0.2d, #0` is cmode 1110 with op 1: a per-bit byte mask, not a NOT.
+            (0x6f00e400, 0, 0, Set),
+            (
+                0x6f05e540,
+                0xff00_ff00_ff00_ff00,
+                0xff00_ff00_ff00_ff00,
+                Set,
+            ),
+            // `movi d1, #imm` is the scalar form: the upper half is cleared.
+            (0x2f04e421, 0xff00_0000_0000_00ff, 0, Set),
+            (
+                0x4f02e6a1,
+                0x5555_5555_5555_5555,
+                0x5555_5555_5555_5555,
+                Set,
+            ),
+            (
+                0x6f000422,
+                0xffff_fffe_ffff_fffe,
+                0xffff_fffe_ffff_fffe,
+                Set,
+            ),
+            (0x2f006489, 0xfbff_ffff_fbff_ffff, 0, Set),
+            (
+                0x4f00a468,
+                0x0300_0300_0300_0300,
+                0x0300_0300_0300_0300,
+                Set,
+            ),
+            // The ones-shifting `msl` forms.
+            (
+                0x4f00c427,
+                0x0000_01ff_0000_01ff,
+                0x0000_01ff_0000_01ff,
+                Set,
+            ),
+            (
+                0x4f00d427,
+                0x0001_ffff_0001_ffff,
+                0x0001_ffff_0001_ffff,
+                Set,
+            ),
+            (
+                0x4f03f605,
+                0x3f80_0000_3f80_0000,
+                0x3f80_0000_3f80_0000,
+                Set,
+            ),
+            (
+                0x6f04f406,
+                0xc000_0000_0000_0000,
+                0xc000_0000_0000_0000,
+                Set,
+            ),
+            // `orr`/`bic` combine with the register instead of replacing it.
+            (0x4f001443, 0x0000_0002_0000_0002, 0x0000_0002_0000_0002, Or),
+            (
+                0x6f00b424,
+                0x0100_0100_0100_0100,
+                0x0100_0100_0100_0100,
+                AndNot,
+            ),
+        ] {
+            let Ok(Instruction::SimdImm(simd)) = decode(word) else {
+                panic!("{word:08x} is not a simd immediate")
+            };
+            assert_eq!(
+                (simd.low, simd.high, simd.combine),
+                (low, high, combine),
+                "{word:08x}"
+            );
+        }
+        // `fmov v.2d` needs Q = 1; `fmov d, #imm` is a different instruction.
+        assert_eq!(decode(0x2f04f406), Err(DecodeError::UnsupportedInstruction));
+        // `ushll.8h v1, v0.8b, #0`, `shl.4s` and `sshr.16b` share the class bits of a
+        // modified immediate but have a non-zero `immh`; they are not `movi`.
+        for word in [0x2f08a401, 0x4f255420, 0x4f090420, 0x0f0c8420] {
+            assert!(
+                matches!(decode(word), Ok(Instruction::Host(_))),
+                "{word:08x}"
+            );
+        }
     }
     #[test]
     fn signed_branches_and_address_generation_preserve_negative_offsets() {
@@ -2213,7 +2718,6 @@ mod tests {
                 bytes: 16,
                 rn: 1,
                 rt: 0,
-                registers: 1,
                 addressing: Addressing::Offset(0),
             }))
         );
@@ -2224,10 +2728,295 @@ mod tests {
                 bytes: 16,
                 rn: 1,
                 rt: 0,
-                registers: 1,
                 addressing: Addressing::PostIndex(16),
             }))
         );
+    }
+    #[test]
+    fn only_architecturally_undefined_words_are_undefined() {
+        // `udf #0`, XNU's `TRAP_DEBUGGER`, and an SVE word (the CPU has no SVE).
+        for word in [0x0000_0000, 0x0000_ffff, 0xe7ff_deff, 0x0420_0000] {
+            assert!(is_undefined(word), "{word:08x}");
+            assert!(decode(word).is_err(), "{word:08x} is not an instruction");
+        }
+        // Valid instructions, and an instruction that is real but not implemented
+        // (half-precision `fadd`), are not undefined.
+        for word in [0xd503_201f, 0x8b00_0000, 0x1ee2_2820] {
+            assert!(!is_undefined(word), "{word:08x}");
+        }
+    }
+    #[test]
+    fn exclusive_pairs_decode_with_both_transfer_registers() {
+        let pair = |kind, size, rs, rn, rt, rt2| {
+            Ok(Instruction::Atomic(Atomic {
+                kind,
+                size,
+                rs,
+                rn,
+                rt,
+                rt2,
+            }))
+        };
+        // ldxp x9, x21, [x8]; stxp w11, x19, x10, [x8]; ldxp w0, wzr, [x0]
+        // (verified against llvm-mc).
+        assert_eq!(
+            decode(0xc87f5509),
+            pair(AtomicKind::LoadPair, Size::Double, 31, 8, 9, 21)
+        );
+        assert_eq!(
+            decode(0xc82b2913),
+            pair(AtomicKind::StorePair, Size::Double, 11, 8, 19, 10)
+        );
+        assert_eq!(
+            decode(0x887f7c00),
+            pair(AtomicKind::LoadPair, Size::Word, 31, 0, 0, 31)
+        );
+        // The load form has no status register; byte and halfword pairs do not exist.
+        assert!(decode(0xc87e5509).is_err());
+        assert!(decode(0x487f5509).is_err());
+    }
+    #[test]
+    fn structure_loads_and_stores_decode_to_descriptors() {
+        use StructPost::*;
+        // (word, store, shape, registers, interleaved, esize, lane, q, rt, rn, post),
+        // every word verified against llvm-mc.
+        let cases = [
+            (
+                0x4c400044,
+                false,
+                Shape::Multiple,
+                4,
+                true,
+                1,
+                0,
+                true,
+                4,
+                2,
+                None,
+            ), // ld4.16b
+            (
+                0x4cdf4c20,
+                false,
+                Shape::Multiple,
+                3,
+                true,
+                8,
+                0,
+                true,
+                0,
+                1,
+                Immediate,
+            ), // ld3.2d, #48
+            (
+                0x4c9f8c7e,
+                true,
+                Shape::Multiple,
+                2,
+                true,
+                8,
+                0,
+                true,
+                30,
+                3,
+                Immediate,
+            ), // st2.2d
+            (
+                0x0c408481,
+                false,
+                Shape::Multiple,
+                2,
+                true,
+                2,
+                0,
+                false,
+                1,
+                4,
+                None,
+            ), // ld2.4h
+            // LD1 of whole registers is a structure access too; only with one register
+            // and no register post-index does it stay a `SimdMemory`.
+            (
+                0x4c402d50,
+                false,
+                Shape::Multiple,
+                4,
+                false,
+                8,
+                0,
+                true,
+                16,
+                10,
+                None,
+            ),
+            (
+                0x4cc2a800,
+                false,
+                Shape::Multiple,
+                2,
+                false,
+                4,
+                0,
+                true,
+                0,
+                0,
+                Register(2),
+            ),
+            (
+                0x0d4090a3,
+                false,
+                Shape::Lane,
+                1,
+                false,
+                4,
+                1,
+                false,
+                3,
+                5,
+                None,
+            ), // ld1.s[1]
+            (
+                0x4ddf84a3,
+                false,
+                Shape::Lane,
+                1,
+                false,
+                8,
+                1,
+                true,
+                3,
+                5,
+                Immediate,
+            ), // ld1.d[1]
+            (
+                0x4dc61ca3,
+                false,
+                Shape::Lane,
+                1,
+                false,
+                1,
+                15,
+                true,
+                3,
+                5,
+                Register(6),
+            ), // ld1.b[15]
+            (
+                0x4d4058a3,
+                false,
+                Shape::Lane,
+                1,
+                false,
+                2,
+                7,
+                true,
+                3,
+                5,
+                None,
+            ), // ld1.h[7]
+            (
+                0x4d40cc20,
+                false,
+                Shape::Replicate,
+                1,
+                false,
+                8,
+                0,
+                true,
+                0,
+                1,
+                None,
+            ), // ld1r.2d
+            (
+                0x0ddfc020,
+                false,
+                Shape::Replicate,
+                1,
+                false,
+                1,
+                0,
+                false,
+                0,
+                1,
+                Immediate,
+            ), // ld1r.8b
+            (
+                0x4d40e820,
+                false,
+                Shape::Replicate,
+                3,
+                false,
+                4,
+                0,
+                true,
+                0,
+                1,
+                None,
+            ), // ld3r.4s
+            (
+                0x4d60a020,
+                false,
+                Shape::Lane,
+                4,
+                false,
+                4,
+                2,
+                true,
+                0,
+                1,
+                None,
+            ), // ld4.s[2]
+            (
+                0x4d9fb020,
+                true,
+                Shape::Lane,
+                3,
+                false,
+                4,
+                3,
+                true,
+                0,
+                1,
+                Immediate,
+            ), // st3.s[3]
+            (
+                0x0d008020,
+                true,
+                Shape::Lane,
+                1,
+                false,
+                4,
+                0,
+                false,
+                0,
+                1,
+                None,
+            ), // st1.s[0]
+        ];
+        for (word, store, shape, registers, interleaved, esize, lane, q, rt, rn, post) in cases {
+            let expected = Instruction::SimdStruct(SimdStruct {
+                desc: StructDesc {
+                    store,
+                    shape,
+                    registers,
+                    interleaved,
+                    esize,
+                    lane,
+                    q,
+                    rt,
+                },
+                rn,
+                post,
+            });
+            assert_eq!(decode(word), Ok(expected), "{word:08x}");
+        }
+        // A single register with no or an immediate post-index stays the inlinable form.
+        assert!(matches!(decode(0x4c407020), Ok(Instruction::SimdMemory(_))));
+        assert!(matches!(decode(0x4c9f7020), Ok(Instruction::SimdMemory(_))));
+        // `ld2`..`ld4` of `.1d` and a stray Rm without post-index are reserved.
+        assert!(decode(0x0c408c00).is_err());
+        assert!(decode(0x4c428c00).is_err());
+        // `st1r` does not exist: replicate is a load.
+        assert!(decode(0x4d00c020).is_err());
     }
     #[test]
     fn decodes_simd_compare_zero() {

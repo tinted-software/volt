@@ -34,6 +34,7 @@ pub mod status {
 pub fn take(cpu: &mut Cpu, reason: Reason, fault_address: u64) -> u64 {
     let from = cpu.system.el;
     cpu.system.spsr_el1 = (u64::from(cpu.flags) & 0xf000_0000)
+        | (cpu.system.pan << 22)
         | ((cpu.system.daif & 15) << 6)
         | (u64::from(from & 3) << 2)
         | u64::from(cpu.system.spsel);
@@ -64,6 +65,10 @@ pub fn take(cpu: &mut Cpu, reason: Reason, fault_address: u64) -> u64 {
     cpu.system.spsel = true;
     cpu.sp = cpu.system.sp_el[1];
     cpu.system.daif = 15;
+    // SCTLR_EL1.SPAN clear: entry to EL1 sets PAN.
+    if cpu.system.sctlr_el1 & (1 << 23) == 0 {
+        cpu.system.pan = 1;
+    }
     cpu.monitor_valid = false;
     cpu.fault_address = fault_address;
     cpu.pc = vector;
@@ -84,6 +89,7 @@ pub fn eret(cpu: &mut Cpu) -> u64 {
     let live_stack = if to == 1 && !cpu.system.spsel { 0 } else { to };
     cpu.sp = cpu.system.sp_el[live_stack as usize];
     cpu.system.daif = (spsr >> 6) & 15;
+    cpu.system.pan = (spsr >> 22) & 1;
     cpu.flags = (spsr & 0xf000_0000) as u32;
     cpu.pc = cpu.system.elr_el1;
     cpu.pc
@@ -92,6 +98,31 @@ pub fn eret(cpu: &mut Cpu) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pan_is_set_on_entry_unless_span_and_comes_back_with_eret() {
+        let mut cpu = Cpu::default();
+        cpu.pc = 0x4000;
+        cpu.system.vbar_el1 = 0x10000;
+        // SCTLR_EL1.SPAN clear: entry sets PAN, and the SPSR records the old value.
+        cpu.system.pan = 0;
+        take(&mut cpu, Reason::default(), 0);
+        assert_eq!(cpu.system.pan, 1);
+        assert_eq!((cpu.system.spsr_el1 >> 22) & 1, 0);
+        cpu.system.pan = 1;
+        take(&mut cpu, Reason::default(), 0);
+        assert_eq!((cpu.system.spsr_el1 >> 22) & 1, 1);
+        // SCTLR_EL1.SPAN set: PAN keeps the interrupted value.
+        cpu.system.sctlr_el1 = 1 << 23;
+        cpu.system.pan = 0;
+        take(&mut cpu, Reason::default(), 0);
+        assert_eq!(cpu.system.pan, 0);
+        // ERET restores PAN from SPSR bit 22.
+        for saved in [1u64, 0] {
+            cpu.system.spsr_el1 = saved << 22;
+            eret(&mut cpu);
+            assert_eq!(cpu.system.pan, saved);
+        }
+    }
     #[test]
     fn el1t_exception_banks_both_stacks_and_restores_status() {
         let mut cpu = Cpu::default();

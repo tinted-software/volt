@@ -273,7 +273,7 @@ impl fmt::Display for SmpReport {
             f,
             "entry {:x}, device tree {:x}, cpus: {}",
             self.layout.entry,
-            self.layout.device_tree,
+            self.layout.boot_info,
             self.cpus.len()
         )?;
         for (idx, c) in self.cpus.iter().enumerate() {
@@ -300,6 +300,11 @@ pub fn boot_smp<B: crate::devices::BlockBackend + 'static>(
     config: SmpConfig<B>,
     mut sink: impl FnMut(u8) + Send + 'static,
 ) -> Result<SmpReport, Error> {
+    if super::xnu::is_macho(image) {
+        return Err(Error::Boot(boot::Error::Unsupported(
+            "XNU boot is single-CPU: omit --cpus",
+        )));
+    }
     let cpu_count = config.cpus.clamp(1, gicv2::MAX_CPUS as u32);
     let ram_size = if config.ram_size > 0 {
         config.ram_size
@@ -381,7 +386,7 @@ pub fn boot_smp<B: crate::devices::BlockBackend + 'static>(
         let idle_mode = config.idle_mode;
         let timeout = config.timeout;
         let entry = layout.entry;
-        let dtb = layout.device_tree;
+        let dtb = layout.boot_info;
 
         let handle = thread::Builder::new()
             .name(alloc::format!("vcpu-{cpu_id}"))

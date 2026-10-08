@@ -344,8 +344,17 @@ impl Cache {
             let word = u32::from_le_bytes(room.try_into().unwrap());
             let instruction = match decode(word) {
                 Ok(insn) => insn,
+                // Run the decoded prefix first: the undecodable word then heads the
+                // next block, where it is reported at its own address.
+                Err(_) if count > 4 => {
+                    count -= 4;
+                    break;
+                }
                 Err(_) => {
-                    eprintln!("cache decode failure at pc {at:x}: word {word:08x}");
+                    // Architecturally undefined words are the guest's to handle.
+                    if !super::decode::is_undefined(word) {
+                        eprintln!("cache decode failure at pc {at:x}: word {word:08x}");
+                    }
                     return Err(Error::Decode { word, pc: at });
                 }
             };

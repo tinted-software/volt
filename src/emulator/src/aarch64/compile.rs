@@ -966,6 +966,10 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     l.trap(pc.wrapping_add(4), Trap::Load);
                 }
             }
+            Instruction::SimdLiteral(a) => {
+                let address = l.k(l.u64, pc.wrapping_add(a.offset as u64));
+                l.simd_trap_access(address, a.bytes as u64, a.rt, None, None, pc, Trap::Load);
+            }
             Instruction::Exclusive(a) => {
                 setup_memory(
                     &l,
@@ -995,6 +999,85 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     },
                 );
             }
+            Instruction::Atomic(a) => {
+                // Read-modify-write needs a host atomic, so it always takes the machine
+                // slow path. `dests` receive the words read (31 discards) and `operands`
+                // are what the machine combines with memory (see `AtomicKind::apply`).
+                let (dests, operands): ([u8; 2], &[u8]) = match a.kind {
+                    AtomicKind::Casp => ([a.rs, a.rs + 1], &[a.rs, a.rs + 1, a.rt, a.rt + 1]),
+                    AtomicKind::Cas => ([a.rs, 31], &[a.rs, a.rt]),
+                    AtomicKind::LoadPair => ([a.rt, a.rt2], &[]),
+                    AtomicKind::StorePair => ([31, 31], &[a.rt, a.rt2]),
+                    _ => ([a.rt, 31], &[a.rs]),
+                };
+                l.store(offset_of!(Cpu, address), l.reg(l.u64, a.rn, false));
+                l.byte(offset_of!(Cpu, width), a.size as u64);
+                l.byte(offset_of!(Cpu, dest), dests[0] as u64);
+                l.byte(offset_of!(Cpu, atomic_kind), a.kind as u64);
+                for (slot, &dest) in dests.iter().enumerate() {
+                    l.byte(offset_of!(Cpu, atomic_dests) + slot, dest as u64);
+                }
+                for (slot, &reg) in operands.iter().enumerate() {
+                    // Register numbers past 30 read as XZR.
+                    l.store(
+                        offset_of!(Cpu, atomic_operands) + slot * 8,
+                        l.reg(l.u64, reg, true),
+                    );
+                }
+                if a.kind == AtomicKind::StorePair {
+                    l.byte(offset_of!(Cpu, status_dest), a.rs as u64);
+                }
+                l.trap(pc.wrapping_add(4), Trap::Atomic);
+            }
+            Instruction::SimdStruct(a) => {
+                use super::simd_struct::StructDesc;
+                // Element-wise accesses with lane merging need the machine slow path.
+                let d = a.desc;
+                let address = l.reg(l.u64, a.rn, false);
+                l.store(offset_of!(Cpu, address), address);
+                for (field, value) in [
+                    (offset_of!(StructDesc, store), u64::from(d.store)),
+                    (offset_of!(StructDesc, shape), d.shape as u64),
+                    (offset_of!(StructDesc, registers), u64::from(d.registers)),
+                    (
+                        offset_of!(StructDesc, interleaved),
+                        u64::from(d.interleaved),
+                    ),
+                    (offset_of!(StructDesc, esize), u64::from(d.esize)),
+                    (offset_of!(StructDesc, lane), u64::from(d.lane)),
+                    (offset_of!(StructDesc, q), u64::from(d.q)),
+                    (offset_of!(StructDesc, rt), u64::from(d.rt)),
+                ] {
+                    l.byte(offset_of!(Cpu, structure) + field, value);
+                }
+                let step = match a.post {
+                    StructPost::None => None,
+                    StructPost::Immediate => Some(l.k(l.u64, d.bytes())),
+                    StructPost::Register(rm) => Some(l.reg(l.u64, rm, true)),
+                };
+                if let Some(step) = step {
+                    l.store(
+                        offset_of!(Cpu, writeback_value),
+                        l.bin(l.u64, B::Add, address, step),
+                    );
+                    l.byte(offset_of!(Cpu, writeback_dest), a.rn as u64);
+                    l.byte(offset_of!(Cpu, writeback), 1);
+                }
+                l.trap(pc.wrapping_add(4), Trap::SimdStruct);
+            }
+            Instruction::AddressTranslate(a) => {
+                l.store(offset_of!(Cpu, address), l.reg(l.u64, a.rt, true));
+                l.store(
+                    offset_of!(Cpu, value),
+                    l.k(l.u64, u64::from(a.write) | u64::from(a.user) << 1),
+                );
+                l.trap(pc.wrapping_add(4), Trap::AddressTranslate);
+            }
+            Instruction::Host(word) => {
+                // The host runs this word: see `host::run`.
+                l.store(offset_of!(Cpu, value), l.k(l.u64, word as u64));
+                l.trap(pc.wrapping_add(4), Trap::Host);
+            }
             Instruction::Pair(a) => {
                 let trap = if a.op == MemoryOp::Store {
                     Trap::Store
@@ -1022,8 +1105,28 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
             Instruction::Sev | Instruction::Sevl => l.byte(offset_of!(Cpu, event_set), 1),
             Instruction::SimdImm(a) => {
                 let at = offset_of!(Cpu, v) + a.rd as usize * 16;
-                l.store(at, l.k(l.u64, a.low));
-                l.store(at + 8, l.k(l.u64, a.high));
+                match a.combine {
+                    ImmCombine::Set => {
+                        l.store(at, l.k(l.u64, a.low));
+                        l.store(at + 8, l.k(l.u64, a.high));
+                    }
+                    ImmCombine::Or | ImmCombine::AndNot => {
+                        // A 64-bit form (`q == false`) also clears the upper half.
+                        let (op, imm) = match a.combine {
+                            ImmCombine::Or => (B::BitOr, a.low),
+                            _ => (B::BitAnd, !a.low),
+                        };
+                        l.store(at, l.imm(l.u64, op, l.load(l.u64, at), imm));
+                        l.store(
+                            at + 8,
+                            if a.q {
+                                l.imm(l.u64, op, l.load(l.u64, at + 8), imm)
+                            } else {
+                                l.k(l.u64, 0)
+                            },
+                        );
+                    }
+                }
             }
             Instruction::SimdMove { rd, rn } => {
                 let at_d = offset_of!(Cpu, v) + rd as usize * 16;
@@ -1056,6 +1159,45 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 l.store(
                     at_d + word * 8,
                     l.bin(l.u64, B::BitOr, cleared, l.imm(l.u64, B::Shl, value, shift)),
+                );
+            }
+            Instruction::SimdInsertElement(a) => {
+                // Copy one lane of Vn over one lane of Vd. The source is read before
+                // the store, so `rd == rn` is fine.
+                let ebits = (1u64 << a.esize) * 8;
+                let emask = if ebits == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << ebits) - 1
+                };
+                let per_dw = (64 / ebits) as usize;
+                let at_d = offset_of!(Cpu, v) + a.rd as usize * 16;
+                let at_n = offset_of!(Cpu, v) + a.rn as usize * 16;
+                let (src_word, src_shift) = (
+                    a.src as usize / per_dw,
+                    (a.src as usize % per_dw) as u64 * ebits,
+                );
+                let (dst_word, dst_shift) = (
+                    a.dst as usize / per_dw,
+                    (a.dst as usize % per_dw) as u64 * ebits,
+                );
+                let source = l.load(l.u64, at_n + src_word * 8);
+                let value = l.imm(
+                    l.u64,
+                    B::BitAnd,
+                    l.imm(l.u64, B::Shr, source, src_shift),
+                    emask,
+                );
+                let old = l.load(l.u64, at_d + dst_word * 8);
+                let cleared = l.imm(l.u64, B::BitAnd, old, !(emask << dst_shift));
+                l.store(
+                    at_d + dst_word * 8,
+                    l.bin(
+                        l.u64,
+                        B::BitOr,
+                        cleared,
+                        l.imm(l.u64, B::Shl, value, dst_shift),
+                    ),
                 );
             }
             Instruction::SimdExtract(a) => {
@@ -1176,97 +1318,6 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                         l.imm(l.u64, B::Shl, vm_hi, r),
                     );
                     (lo, hi)
-                };
-                l.store(at_d, lo);
-                l.store(at_d + 8, hi);
-            }
-            Instruction::SimdPermute(a) => {
-                use crate::aarch64::decode::PermuteOp;
-                let at_d = offset_of!(Cpu, v) + a.rd as usize * 16;
-                let at_n = offset_of!(Cpu, v) + a.rn as usize * 16;
-                let at_m = offset_of!(Cpu, v) + a.rm as usize * 16;
-                let vn_lo = l.load(l.u64, at_n);
-                let vn_hi = l.load(l.u64, at_n + 8);
-                let vm_lo = l.load(l.u64, at_m);
-                let vm_hi = l.load(l.u64, at_m + 8);
-                let (lo, hi) = match a.op {
-                    PermuteOp::Uzp1 | PermuteOp::Zip1 | PermuteOp::Trn1 if a.size == 3 => {
-                        (vn_lo, vm_lo)
-                    }
-                    PermuteOp::Uzp2 | PermuteOp::Zip2 | PermuteOp::Trn2 if a.size == 3 => {
-                        (vn_hi, vm_hi)
-                    }
-                    PermuteOp::Uzp1 if a.size == 2 => {
-                        let lo = l.bin(
-                            l.u64,
-                            B::BitOr,
-                            l.imm(l.u64, B::BitAnd, vn_lo, 0xffff_ffff),
-                            l.imm(l.u64, B::Shl, vn_hi, 32),
-                        );
-                        let hi = l.bin(
-                            l.u64,
-                            B::BitOr,
-                            l.imm(l.u64, B::BitAnd, vm_lo, 0xffff_ffff),
-                            l.imm(l.u64, B::Shl, vm_hi, 32),
-                        );
-                        (lo, hi)
-                    }
-                    PermuteOp::Uzp2 if a.size == 2 => {
-                        let lo = l.bin(
-                            l.u64,
-                            B::BitOr,
-                            l.imm(l.u64, B::Shr, vn_lo, 32),
-                            l.imm(l.u64, B::BitAnd, vn_hi, 0xffff_ffff_0000_0000),
-                        );
-                        let hi = l.bin(
-                            l.u64,
-                            B::BitOr,
-                            l.imm(l.u64, B::Shr, vm_lo, 32),
-                            l.imm(l.u64, B::BitAnd, vm_hi, 0xffff_ffff_0000_0000),
-                        );
-                        (lo, hi)
-                    }
-                    PermuteOp::Zip1 if a.size == 2 => {
-                        let lo = l.bin(
-                            l.u64,
-                            B::BitOr,
-                            l.imm(l.u64, B::BitAnd, vn_lo, 0xffff_ffff),
-                            l.imm(
-                                l.u64,
-                                B::Shl,
-                                l.imm(l.u64, B::BitAnd, vm_lo, 0xffff_ffff),
-                                32,
-                            ),
-                        );
-                        let hi = l.bin(
-                            l.u64,
-                            B::BitOr,
-                            l.imm(l.u64, B::Shr, vn_lo, 32),
-                            l.imm(l.u64, B::BitAnd, vm_lo, 0xffff_ffff_0000_0000),
-                        );
-                        (lo, hi)
-                    }
-                    PermuteOp::Zip2 if a.size == 2 => {
-                        let lo = l.bin(
-                            l.u64,
-                            B::BitOr,
-                            l.imm(l.u64, B::BitAnd, vn_hi, 0xffff_ffff),
-                            l.imm(
-                                l.u64,
-                                B::Shl,
-                                l.imm(l.u64, B::BitAnd, vm_hi, 0xffff_ffff),
-                                32,
-                            ),
-                        );
-                        let hi = l.bin(
-                            l.u64,
-                            B::BitOr,
-                            l.imm(l.u64, B::Shr, vn_hi, 32),
-                            l.imm(l.u64, B::BitAnd, vm_hi, 0xffff_ffff_0000_0000),
-                        );
-                        (lo, hi)
-                    }
-                    _ => (vn_lo, vm_lo),
                 };
                 l.store(at_d, lo);
                 l.store(at_d + 8, hi);
@@ -1412,31 +1463,58 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
             Instruction::SimdAlu(a) => {
                 use crate::aarch64::decode::SimdAluOp;
                 // Bitwise logical operations work on whole halves, lane width free.
-                if matches!(a.op, SimdAluOp::AddV) {
-                    // Horizontal add: sum every lane of the full 128-bit source
-                    // and store the result in lane 0, zeroing the rest.
+                if matches!(
+                    a.op,
+                    SimdAluOp::AddV | SimdAluOp::UMinV | SimdAluOp::UMaxV | SimdAluOp::UAddLV
+                ) {
+                    // Horizontal add, minimum, maximum or widening add: reduce every
+                    // lane of the source and store the result in lane 0, zeroing the
+                    // rest. `UAddLV` keeps twice the lane width.
                     let ebits = (1u64 << a.size) * 8;
-                    let emask = if ebits == 64 {
-                        u64::MAX
+                    let mask_of = |bits: u64| {
+                        if bits >= 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << bits) - 1
+                        }
+                    };
+                    let emask = mask_of(ebits);
+                    let result_mask = if a.op == SimdAluOp::UAddLV {
+                        mask_of(ebits * 2)
                     } else {
-                        (1u64 << ebits) - 1
+                        emask
                     };
                     let at_n = offset_of!(Cpu, v) + a.rn as usize * 16;
                     let at_d = offset_of!(Cpu, v) + a.rd as usize * 16;
                     let vn_lo = l.load(l.u64, at_n);
                     let vn_hi = l.load(l.u64, at_n + 8);
                     let halves = if a.q { 2 } else { 1 };
-                    let mut total = l.k(l.u64, 0);
+                    let mut total = if a.op == SimdAluOp::UMinV {
+                        l.k(l.u64, emask)
+                    } else {
+                        l.k(l.u64, 0)
+                    };
                     for half in 0..halves {
                         let v = if half == 0 { vn_lo } else { vn_hi };
                         for lane in 0..(8 >> a.size) {
                             let shift = lane as u64 * ebits;
                             let field =
                                 l.imm(l.u64, B::BitAnd, l.imm(l.u64, B::Shr, v, shift), emask);
-                            total = l.bin(l.u64, B::Add, total, field);
+                            total = match a.op {
+                                SimdAluOp::UMinV => {
+                                    l.sel(l.u64, l.cmp(C::Lt, field, total), field, total)
+                                }
+                                SimdAluOp::UMaxV => {
+                                    l.sel(l.u64, l.cmp(C::Gt, field, total), field, total)
+                                }
+                                _ => l.bin(l.u64, B::Add, total, field),
+                            };
                         }
                     }
-                    l.store(at_d, l.bin(l.u64, B::BitAnd, total, l.k(l.u64, emask)));
+                    l.store(
+                        at_d,
+                        l.bin(l.u64, B::BitAnd, total, l.k(l.u64, result_mask)),
+                    );
                     l.store(at_d + 8, l.k(l.u64, 0));
                 } else if matches!(
                     a.op,
@@ -2355,6 +2433,15 @@ fn system_offset(r: SystemRegister) -> Option<usize> {
         ElrEl1 => offset_of!(CpuSystem, elr_el1),
         EsrEl1 => offset_of!(CpuSystem, esr_el1),
         FarEl1 => offset_of!(CpuSystem, far_el1),
+        ParEl1 => offset_of!(CpuSystem, par_el1),
+        IsrEl1 => offset_of!(CpuSystem, isr_el1),
+        IccSreEl1 => offset_of!(CpuSystem, icc_sre_el1),
+        IccPmrEl1 => offset_of!(CpuSystem, icc_pmr_el1),
+        IccBpr0El1 => offset_of!(CpuSystem, icc_bpr0_el1),
+        IccCtlrEl1 => offset_of!(CpuSystem, icc_ctlr_el1),
+        IccIgrpen0El1 => offset_of!(CpuSystem, icc_igrpen0_el1),
+        CntpCtlEl0 => offset_of!(CpuSystem, cntp_ctl_el0),
+        ActlrEl1 => offset_of!(CpuSystem, actlr_el1),
         VbarEl1 => offset_of!(CpuSystem, vbar_el1),
         CpacrEl1 => offset_of!(CpuSystem, cpacr_el1),
         SctlrEl1 => offset_of!(CpuSystem, sctlr_el1),
@@ -2368,6 +2455,8 @@ fn system_offset(r: SystemRegister) -> Option<usize> {
         CntvCtlEl0 => offset_of!(CpuSystem, cntv_ctl_el0),
         CntvCvalEl0 => offset_of!(CpuSystem, cntv_cval_el0),
         TpidrEl1 => offset_of!(CpuSystem, tpidr_el1),
+        ContextidrEl1 => offset_of!(CpuSystem, contextidr_el1),
+        CsselrEl1 => offset_of!(CpuSystem, csselr_el1),
         MdscrEl1 => offset_of!(CpuSystem, mdscr_el1),
         CntkctlEl1 => offset_of!(CpuSystem, cntkctl_el1),
         OslarEl1 => offset_of!(CpuSystem, oslar_el1),
@@ -2430,10 +2519,52 @@ fn lower_system(l: &Lower, a: System) {
                 2,
             ),
         ),
+        Pan | PanSet => {
+            // PSTATE.PAN lives in bit 22 of the register form.
+            let pan = at + offset_of!(CpuSystem, pan);
+            if a.read {
+                l.put(a.rt, l.imm(l.u64, B::Shl, l.load(l.u64, pan), 22));
+            } else if a.register == PanSet {
+                l.store(pan, l.k(l.u64, u64::from(a.immediate & 1)));
+            } else {
+                let bit = l.imm(l.u64, B::Shr, l.reg(l.u64, a.rt, true), 22);
+                l.store(pan, l.imm(l.u64, B::BitAnd, bit, 1));
+            }
+        }
         RazWi => {
             if a.read {
                 l.put(a.rt, l.k(l.u64, 0));
             }
+        }
+        SpSel | SpSelSet => {
+            let selected = l.load(l.u8, at + offset_of!(CpuSystem, spsel));
+            if a.read {
+                l.put(a.rt, l.cv(l.u64, selected));
+                return;
+            }
+            let new = if a.register == SpSelSet {
+                l.k(l.u8, u64::from(a.immediate & 1))
+            } else {
+                l.cv(l.u8, l.imm(l.u64, B::BitAnd, l.reg(l.u64, a.rt, true), 1))
+            };
+            // The live stack pointer belongs to bank `SP_EL1` when SPSel is 1
+            // and `SP_EL0` when it is 0. Park it in its bank, then load the
+            // other one. Selecting the bank already in use is a store and a
+            // reload of the same slot.
+            let banks = at + offset_of!(CpuSystem, sp_el);
+            let bank = |select: Value| {
+                l.sel(
+                    l.ptr,
+                    l.cmp(C::Ne, select, l.k(l.u8, 0)),
+                    l.addr(banks + 8),
+                    l.addr(banks),
+                )
+            };
+            let live = l.load(l.u64, Lower::reg_at(31));
+            l.store_ptr(bank(selected), live);
+            let incoming = l.load_ptr(l.u64, bank(new));
+            l.store(Lower::reg_at(31), incoming);
+            l.store(at + offset_of!(CpuSystem, spsel), new);
         }
         DaifSet | DaifClear => {
             let p = at + offset_of!(CpuSystem, daif);
@@ -2478,6 +2609,35 @@ fn lower_system(l: &Lower, a: System) {
             );
             let locked = l.cmp(C::Ne, either, l.k(l.u64, 0));
             l.put(a.rt, l.sel(l.u64, locked, l.k(l.u64, 2), l.k(l.u64, 0)));
+        }
+        CcsidrEl1 => {
+            // CSSELR bit 0 is InD, bits 3:1 the level - 1; L2 has no separate I-side.
+            use super::identification::{CCSIDR_L1D, CCSIDR_L1I, CCSIDR_L2};
+            let select = l.imm(
+                l.u64,
+                B::BitAnd,
+                l.load(l.u64, at + offset_of!(CpuSystem, csselr_el1)),
+                0xf,
+            );
+            let is = |n: u64| l.cmp(C::Eq, select, l.k(l.u64, n));
+            let l1_instruction = l.sel(l.u64, is(1), l.k(l.u64, CCSIDR_L1I), l.k(l.u64, CCSIDR_L2));
+            l.put(
+                a.rt,
+                l.sel(l.u64, is(0), l.k(l.u64, CCSIDR_L1D), l1_instruction),
+            );
+        }
+        CntvTvalEl0 => {
+            // The timer value is the signed 32-bit distance to the compare value:
+            // reads give the low 32 bits of `CVAL - count`, writes `CVAL = count + sext(value)`.
+            let counter = l.load(l.u64, at + offset_of!(CpuSystem, cntvct_el0));
+            let compare = at + offset_of!(CpuSystem, cntv_cval_el0);
+            if a.read {
+                let distance = l.bin(l.u64, B::Sub, l.load(l.u64, compare), counter);
+                l.put(a.rt, l.imm(l.u64, B::BitAnd, distance, 0xffff_ffff));
+            } else {
+                let delta = l.extend(l.reg(l.u64, a.rt, true), Extend::Sxtw);
+                l.store(compare, l.bin(l.u64, B::Add, counter, delta));
+            }
         }
         Daif => {
             let p = at + offset_of!(CpuSystem, daif);
@@ -2624,24 +2784,6 @@ mod tests {
         cpu.x[0] = 0x10008;
         run_inline(&mut cpu, &[0xf9400001, SVC]); // ldr x1,[x0]; svc
         assert_eq!(cpu.x[1], 0x1122334455667788);
-        assert_eq!(cpu.trap, Trap::Svc, "continued past the load");
-    }
-    #[test]
-    fn inline_ld1_multi_register_loads_lanes() {
-        let mut ram = [0u8; 4096];
-        // Source bytes 0x00..0x3f at offset 8.
-        for (i, cell) in ram[8..72].iter_mut().enumerate() {
-            *cell = i as u8;
-        }
-        let mut cpu = Cpu::default();
-        map_page(&mut cpu, &mut ram, false);
-        cpu.x[8] = 0x10008;
-        // ld1 {v1.16b, v2.16b}, [x8]; svc
-        run_inline(&mut cpu, &[0x4c40a101, SVC]);
-        assert_eq!(cpu.v[1][0], 0x0706050403020100);
-        assert_eq!(cpu.v[1][1], 0x0f0e0d0c0b0a0908);
-        assert_eq!(cpu.v[2][0], 0x1716151413121110);
-        assert_eq!(cpu.v[2][1], 0x1f1e1d1c1b1a1918);
         assert_eq!(cpu.trap, Trap::Svc, "continued past the load");
     }
     #[test]
