@@ -1,4 +1,5 @@
-use super::decode::SignExtend;
+use super::decode::{AtomicKind, SignExtend};
+use super::simd_struct::StructDesc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -29,6 +30,15 @@ pub enum Trap {
     DcZva,
     Eret,
     Undefined,
+    /// LSE atomic (`ldadd`, `cas`, `swp`, ...); see `Cpu::atomic_kind`.
+    Atomic,
+    /// SIMD structure load/store (`ld2`, `st4`, `ld1r`, ...); see `Cpu::structure`.
+    SimdStruct,
+    /// `at s1e*`: translate `Cpu::address` (`value` bit 0 = write, bit 1 = as EL0)
+    /// into `PAR_EL1`.
+    AddressTranslate,
+    /// An instruction the host runs: `Cpu::value` holds its word (see `host::run`).
+    Host,
 }
 
 /// Number of data-TLB entries. The JIT indexes with `(va >> 12) & (DTLB_ENTRIES - 1)`.
@@ -102,6 +112,16 @@ pub struct Cpu {
     pub dest: u8,
     pub load_signed: SignExtend,
     pub vector_dest: bool,
+    /// LSE atomic in flight (`Trap::Atomic`): the operation, with `address`,
+    /// `width` and `dest` as for a load. `atomic_operands` is `[Rs]` for the memory
+    /// ops, `[Rs, Rt]` for CAS and `[Rs, Rs+1, Rt, Rt+1]` for CASP.
+    pub atomic_kind: AtomicKind,
+    pub atomic_operands: [u64; 4],
+    /// Registers that receive the words read (31 discards): `[Rt, Rt2]` for `LDXP`,
+    /// `[Rs, Rs+1]` for `CASP`, `[Rt, _]` for the memory operations.
+    pub atomic_dests: [u8; 2],
+    /// SIMD structure access in flight (`Trap::SimdStruct`), with `address` as its base.
+    pub structure: StructDesc,
 
     pub exclusive: Exclusive,
     pub status_dest: u8,
@@ -113,6 +133,8 @@ pub struct Cpu {
     /// stays correct with other vCPUs and inline stores that never touch a
     /// shared monitor.
     pub monitor_value: u64,
+    /// The second word of an exclusive pair (`LDXP`); `monitor_value` is the first.
+    pub monitor_value2: u64,
     pub event_set: bool,
     pub second_pending: bool,
     pub second_address: u64,
@@ -143,6 +165,7 @@ pub struct System {
     pub elr_el1: u64,
     pub esr_el1: u64,
     pub far_el1: u64,
+    pub par_el1: u64,
     pub vbar_el1: u64,
     pub cpacr_el1: u64,
     pub sctlr_el1: u64,
@@ -153,6 +176,8 @@ pub struct System {
     pub tpidr_el0: u64,
     pub tpidrro_el0: u64,
     pub tpidr_el1: u64,
+    pub contextidr_el1: u64,
+    pub csselr_el1: u64,
     pub mdscr_el1: u64,
     pub cntkctl_el1: u64,
     pub oslar_el1: u64,
@@ -163,6 +188,17 @@ pub struct System {
     pub cntv_ctl_el0: u64,
     pub cntv_cval_el0: u64,
     pub daif: u64,
+    /// PSTATE.PAN (0 or 1). Saved in `SPSR_EL1` bit 22 and set on exception entry
+    /// when `SCTLR_EL1.SPAN` is clear; not enforced by translation.
+    pub pan: u64,
+    pub isr_el1: u64,
+    pub icc_sre_el1: u64,
+    pub icc_pmr_el1: u64,
+    pub icc_bpr0_el1: u64,
+    pub icc_ctlr_el1: u64,
+    pub icc_igrpen0_el1: u64,
+    pub cntp_ctl_el0: u64,
+    pub actlr_el1: u64,
 }
 impl Default for System {
     fn default() -> Self {
@@ -174,6 +210,7 @@ impl Default for System {
             elr_el1: 0,
             esr_el1: 0,
             far_el1: 0,
+            par_el1: 0,
             vbar_el1: 0,
             cpacr_el1: 0,
             sctlr_el1: 0,
@@ -184,6 +221,8 @@ impl Default for System {
             tpidr_el0: 0,
             tpidrro_el0: 0,
             tpidr_el1: 0,
+            contextidr_el1: 0,
+            csselr_el1: 0,
             mdscr_el1: 0,
             cntkctl_el1: 0,
             oslar_el1: 1,
@@ -194,6 +233,16 @@ impl Default for System {
             cntv_ctl_el0: 0,
             cntv_cval_el0: 0,
             daif: 0xf,
+            pan: 0,
+            isr_el1: 0,
+            icc_sre_el1: 0,
+            icc_pmr_el1: 0,
+            icc_bpr0_el1: 0,
+            // PRIbits 7: eight priority bits.
+            icc_ctlr_el1: 7 << 8,
+            icc_igrpen0_el1: 0,
+            cntp_ctl_el0: 0,
+            actlr_el1: 0,
         }
     }
 }
@@ -227,6 +276,34 @@ mod tests {
 }
 
 impl Cpu {
+    /// Complete `LDXP`/`STXP` against the `memory` pair just read at `address`, and
+    /// return the pair to leave in memory. The monitor is value-based like the
+    /// single-register exclusives: `STXP` succeeds if the monitor is held on the same
+    /// address and the pair still has the values `LDXP` saw. The status goes to
+    /// `status_dest`.
+    pub fn exclusive_pair(&mut self, kind: AtomicKind, memory: [u64; 2]) -> [u64; 2] {
+        if kind == AtomicKind::LoadPair {
+            self.monitor_valid = true;
+            self.monitor_address = self.address;
+            self.monitor_width = self.width;
+            self.monitor_value = memory[0];
+            self.monitor_value2 = memory[1];
+            return memory;
+        }
+        let held = self.monitor_valid
+            && self.monitor_address == self.address
+            && self.monitor_width == self.width
+            && [self.monitor_value, self.monitor_value2] == memory;
+        self.monitor_valid = false;
+        if self.status_dest != 31 {
+            self.x[usize::from(self.status_dest)] = u64::from(!held);
+        }
+        if held {
+            [self.atomic_operands[0], self.atomic_operands[1]]
+        } else {
+            memory
+        }
+    }
     /// Reads the byte-sized memory-request fields JIT code stores one byte at a
     /// time. Plain reads of these adjacent bytes get merged into a single wide
     /// load, which cannot be store-forwarded from several narrow stores and

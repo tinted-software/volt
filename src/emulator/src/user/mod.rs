@@ -105,6 +105,13 @@ pub fn run(path: &Path, args: &[OsString], env: &[(OsString, OsString)]) -> Resu
             match cpu.trap {
                 Trap::None => {}
                 Trap::Load | Trap::Store => service(&mut space, &mut cpu)?,
+                Trap::Atomic => atomic(&mut space, &mut cpu)?,
+                Trap::SimdStruct => simd_struct(&mut space, &mut cpu)?,
+                Trap::Host => {
+                    let word = cpu.value as u32;
+                    crate::aarch64::host::run(&mut cpu, word);
+                    cpu.trap = Trap::None;
+                }
                 Trap::Svc => {
                     cpu.trap = Trap::None;
                     cpu.monitor_valid = false;
@@ -178,7 +185,11 @@ fn user_instruction(instruction: &Instruction) -> bool {
             | SystemRegister::CntfrqEl0 => operand.read,
             _ => false,
         },
-        Instruction::Eret | Instruction::Psci | Instruction::Tlbi | Instruction::Wfi => false,
+        Instruction::Eret
+        | Instruction::Psci
+        | Instruction::Tlbi
+        | Instruction::Wfi
+        | Instruction::AddressTranslate(_) => false,
         _ => true,
     }
 }
@@ -257,6 +268,80 @@ pub fn service(space: &mut Space, cpu: &mut Cpu) -> Result<(), Error> {
     }
     cpu.exclusive = Exclusive::None;
     cpu.load_signed = SignExtend::None;
+    cpu.trap = Trap::None;
+    Ok(())
+}
+/// Retire a SIMD structure load/store through the address space, then apply the
+/// post-index writeback. The registers change only if every element succeeded.
+fn simd_struct(space: &mut Space, cpu: &mut Cpu) -> Result<(), Error> {
+    let desc = cpu.structure;
+    let mut registers = cpu.v;
+    crate::aarch64::simd_struct::execute(
+        &desc,
+        &mut registers,
+        cpu.address,
+        |address, width, store| -> Result<u64, Error> {
+            let step = usize::from(width);
+            if let Some(value) = store {
+                space.check(address, step, 2)?;
+                space.write(address, &value.to_le_bytes()[..step])?;
+                return Ok(0);
+            }
+            space.check(address, step, 1)?;
+            let mut bytes = [0; 8];
+            space.read(address, &mut bytes[..step])?;
+            Ok(u64::from_le_bytes(bytes))
+        },
+    )?;
+    cpu.v = registers;
+    if cpu.writeback {
+        if cpu.writeback_dest == 31 {
+            cpu.sp = cpu.writeback_value;
+        } else {
+            cpu.x[cpu.writeback_dest as usize] = cpu.writeback_value;
+        }
+        cpu.writeback = false;
+    }
+    cpu.trap = Trap::None;
+    Ok(())
+}
+/// Retire an LSE atomic. The user-mode machine runs a single vCPU, so a plain
+/// read-modify-write through the address space is atomic.
+fn atomic(space: &mut Space, cpu: &mut Cpu) -> Result<(), Error> {
+    let (kind, address, width) = (cpu.atomic_kind, cpu.address, cpu.width);
+    if !matches!(width, 1 | 2 | 4 | 8) {
+        return Err(Error::InvalidAccessWidth);
+    }
+    let (words, step) = (kind.words(), usize::from(width));
+    let span = words * step;
+    // Read and write permission: the operation does both.
+    space.check(address, span, 1 | 2)?;
+    let mut bytes = [0u8; 16];
+    space.read(address, &mut bytes[..span])?;
+    let mut old = [0u64; 2];
+    for (slot, value) in old.iter_mut().enumerate().take(words) {
+        let mut word = [0u8; 8];
+        word[..step].copy_from_slice(&bytes[slot * step..][..step]);
+        *value = u64::from_le_bytes(word);
+    }
+    let new = if kind.is_exclusive_pair() {
+        cpu.exclusive_pair(kind, old)
+    } else {
+        kind.apply(old, cpu.atomic_operands, width)
+    };
+    if new != old {
+        for (slot, value) in new.iter().enumerate().take(words) {
+            bytes[slot * step..][..step].copy_from_slice(&value.to_le_bytes()[..step]);
+        }
+        space.write(address, &bytes[..span])?;
+        cpu.monitor_valid = false;
+    }
+    for (slot, value) in old.into_iter().enumerate().take(words) {
+        let dest = usize::from(cpu.atomic_dests[slot]);
+        if dest < 31 {
+            cpu.x[dest] = value;
+        }
+    }
     cpu.trap = Trap::None;
     Ok(())
 }

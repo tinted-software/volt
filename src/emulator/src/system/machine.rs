@@ -1,7 +1,9 @@
 //! One-vCPU machine over native translated blocks (Mirage aarch64/Machine.zig).
+use super::afdt;
 use super::fdt;
 use crate::aarch64::cpu::{Exclusive, Trap};
 use crate::aarch64::decode::SignExtend;
+use crate::aarch64::simd_struct;
 use crate::aarch64::{Cache, Cpu};
 use crate::aarch64::{exception, translate};
 use crate::devices::{bus::Device, gicv2::Gicv2, pl011::Pl011};
@@ -12,6 +14,8 @@ pub enum Error {
     Compile(crate::aarch64::compile::Error),
     Memory(MemoryError),
     InvalidAccessWidth(u8),
+    /// An LSE atomic on memory that is not host RAM, or not aligned to its size.
+    UnsupportedAtomic(u64),
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -26,6 +30,13 @@ pub trait DeviceIo {
     fn write_gic_distributor(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64);
     fn read_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8) -> u64;
     fn write_gic_cpu(&mut self, cpu_id: u32, offset: u64, size: u8, value: u64);
+    fn read_gic_redistributor(&mut self, offset: u64, size: u8) -> u64 {
+        let _ = (offset, size);
+        0
+    }
+    fn write_gic_redistributor(&mut self, offset: u64, size: u8, value: u64) {
+        let _ = (offset, size, value);
+    }
     fn read_virtio(&mut self, offset: u64, size: u8) -> u64 {
         let _ = (offset, size);
         0
@@ -153,6 +164,9 @@ pub struct Machine<M> {
     /// `CodeTracker::epoch` the inline data TLB's write permissions reflect.
     watch_epoch: u64,
     pub irq_line: bool,
+    /// Set when a GICv3 forwards PPI 27 (the virtual timer) as a group 0 FIQ: the
+    /// priority it was given. `None` leaves the timer to the GICv2 path.
+    pub vtimer_fiq: Option<u8>,
     timer_fired: bool,
     pub stalled_at: u64,
     pub stalled: Option<String>,
@@ -186,6 +200,7 @@ impl<M: GuestMemory> Machine<M> {
             dtlb_generation: 0,
             watch_epoch: 0,
             irq_line: false,
+            vtimer_fiq: None,
             timer_fired: false,
             stalled_at: 0,
             stalled: None,
@@ -232,6 +247,19 @@ impl<M: GuestMemory> Machine<M> {
         self.timer_fired = true;
         true
     }
+    /// Whether the interrupt controller presents the virtual timer to this CPU as
+    /// a FIQ right now: the GIC forwards it (`vtimer_fiq`), the CPU interface has
+    /// group 0 enabled and its priority mask lets the interrupt through, and the
+    /// timer's condition holds. Evaluated from live state, so the line drops as soon
+    /// as the guest masks the timer or moves its compare value.
+    fn fiq_asserted(&self) -> bool {
+        let system = &self.cpu.system;
+        self.vtimer_fiq.is_some_and(|priority| {
+            system.icc_igrpen0_el1 & 1 != 0
+                && u64::from(priority) < system.icc_pmr_el1 & 0xff
+                && self.timer_due()
+        })
+    }
     pub fn run(&mut self, serial: &mut Pl011, gic: &mut Gicv2) -> Result<Exit, Error> {
         self.run_with_devices(&mut (serial, gic))
     }
@@ -241,12 +269,21 @@ impl<M: GuestMemory> Machine<M> {
             if self.timer_edge() {
                 return Ok(Exit::Timer);
             }
-            if self.irq_line && self.cpu.system.daif & 2 == 0 {
+            let fiq = self.fiq_asserted();
+            self.cpu.system.isr_el1 = u64::from(self.irq_line) << 7 | u64::from(fiq) << 6;
+            let kind = if fiq && self.cpu.system.daif & 1 == 0 {
+                Some(exception::Kind::Fiq)
+            } else if self.irq_line && self.cpu.system.daif & 2 == 0 {
+                Some(exception::Kind::Irq)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
                 let pc = self.cpu.pc;
                 exception::take(
                     &mut self.cpu,
                     exception::Reason {
-                        kind: exception::Kind::Irq,
+                        kind,
                         ..Default::default()
                     },
                     pc,
@@ -272,6 +309,23 @@ impl<M: GuestMemory> Machine<M> {
                     // the failing instruction itself is now the architectural PC.
                     self.cpu.pc = address;
                     self.abort(address, permission, true, false);
+                    continue;
+                }
+                if let crate::aarch64::compile::Error::Decode { word, pc } = &error
+                    && crate::aarch64::decode::is_undefined(*word)
+                {
+                    // An Undefined Instruction exception (EC 0, 32-bit instruction).
+                    self.cpu.pc = *pc;
+                    exception::take(
+                        &mut self.cpu,
+                        exception::Reason {
+                            ec: 0,
+                            instruction: true,
+                            status: 0,
+                            ..Default::default()
+                        },
+                        0,
+                    );
                     continue;
                 }
                 self.stalled_at = self.cpu.pc;
@@ -365,6 +419,17 @@ impl<M: GuestMemory> Machine<M> {
                     self.tlb.flush();
                     self.cpu.trap = Trap::None;
                 }
+                Trap::Host => {
+                    let word = self.cpu.value as u32;
+                    crate::aarch64::host::run(&mut self.cpu, word);
+                    self.cpu.trap = Trap::None;
+                }
+                Trap::AddressTranslate => {
+                    let (address, flags) = (self.cpu.address, self.cpu.value);
+                    self.cpu.system.par_el1 =
+                        self.address_translate(address, flags & 1 != 0, flags & 2 != 0);
+                    self.cpu.trap = Trap::None;
+                }
                 Trap::Translation => {
                     let pc = self.cpu.pc;
                     self.abort(pc, false, true, false);
@@ -445,6 +510,44 @@ impl<M: GuestMemory> Machine<M> {
                     }
                     self.cpu.vector_dest = false;
                     if self.cpu.writeback && !self.faulted {
+                        if self.cpu.writeback_dest == 31 {
+                            self.cpu.sp = self.cpu.writeback_value;
+                        } else {
+                            self.cpu.x[self.cpu.writeback_dest as usize] = self.cpu.writeback_value;
+                        }
+                    }
+                    self.cpu.writeback = false;
+                    if self.device_access {
+                        return Ok(Exit::Interrupted);
+                    }
+                }
+                Trap::Atomic => {
+                    self.faulted = false;
+                    let Some(old) = self.atomic()? else {
+                        continue;
+                    };
+                    // The words read go to the registers the instruction named;
+                    // register 31 is XZR and discards them.
+                    for (slot, value) in old
+                        .into_iter()
+                        .enumerate()
+                        .take(self.cpu.atomic_kind.words())
+                    {
+                        let dest = usize::from(self.cpu.atomic_dests[slot]);
+                        if dest < 31 {
+                            self.cpu.x[dest] = value;
+                        }
+                    }
+                }
+                Trap::SimdStruct => {
+                    self.faulted = false;
+                    self.device_access = false;
+                    self.simd_struct(devices)?;
+                    if self.faulted {
+                        self.cpu.writeback = false;
+                        continue;
+                    }
+                    if self.cpu.writeback {
                         if self.cpu.writeback_dest == 31 {
                             self.cpu.sp = self.cpu.writeback_value;
                         } else {
@@ -611,6 +714,167 @@ impl<M: GuestMemory> Machine<M> {
         self.access(address, width, 31, value, devices)?;
         Ok(!self.faulted)
     }
+    /// `AT S1E{1,0}{R,W}`: the `PAR_EL1` value of a stage-1 walk of `address`. Success
+    /// holds the page's physical address; failure sets `F` with a fault status code
+    /// (level 3 translation or permission fault).
+    fn address_translate(&mut self, address: u64, write: bool, user: bool) -> u64 {
+        let access = if write {
+            translate::Access::Write
+        } else {
+            translate::Access::Read
+        };
+        let result = if user {
+            // Walk with EL0 permissions on a scratch TLB: switching the context of
+            // the real one would flush it.
+            let mut cpu = self.cpu.clone();
+            cpu.system.el = 0;
+            translate::translate(
+                &mut translate::Tlb::new(),
+                &cpu,
+                &mut self.memory,
+                address,
+                access,
+            )
+        } else {
+            translate::translate(&mut self.tlb, &self.cpu, &mut self.memory, address, access)
+        };
+        match result {
+            Ok(physical) => (physical & 0x0000_ffff_ffff_f000) | 1 << 11,
+            Err(translate::TranslateError::PermissionFault) => 1 | 0b001111 << 1,
+            Err(_) => 1 | 0b000111 << 1,
+        }
+    }
+    /// SIMD structure load/store: `simd_struct::execute` over the vector registers,
+    /// one element per `access`. The registers change only if every element succeeded.
+    fn simd_struct(&mut self, devices: &mut impl DeviceIo) -> Result<(), Error> {
+        let desc = self.cpu.structure;
+        let saved = self.cpu.v;
+        let mut registers = saved;
+        // `access` takes its direction from the trap kind.
+        self.cpu.trap = if desc.store { Trap::Store } else { Trap::Load };
+        // `Err(None)` is a guest fault `access` already recorded; `Some` is fatal.
+        let result = simd_struct::execute(
+            &desc,
+            &mut registers,
+            self.cpu.address,
+            |address, width, store| {
+                if let Some(value) = store {
+                    self.cpu.vector_dest = false;
+                    self.access(address, width, 31, value, devices)
+                        .map_err(Some)?;
+                } else {
+                    // `access` loads whole registers: use v0 as scratch and merge the
+                    // element into `registers` (v0 is restored below).
+                    self.cpu.vector_dest = true;
+                    self.access(address, width, 0, 0, devices).map_err(Some)?;
+                }
+                if self.faulted {
+                    return Err(None);
+                }
+                Ok(self.cpu.v[0][0])
+            },
+        );
+        self.cpu.vector_dest = false;
+        self.cpu.trap = Trap::None;
+        self.cpu.v = saved;
+        match result {
+            Ok(()) => {
+                self.cpu.v = registers;
+                Ok(())
+            }
+            Err(None) => Ok(()),
+            Err(Some(error)) => Err(error),
+        }
+    }
+    /// LSE atomic (`ldadd`, `swp`, `cas`, `casp`, ...) on RAM. Every LSE operation
+    /// holds one global lock while it reads, combines and writes back, so a CASP
+    /// pair stays consistent against every other LSE operation on any vCPU; each
+    /// word is still accessed through a host atomic. Plain stores that bypass this
+    /// path (inline JIT stores, `stxr`) are not ordered against the lock.
+    /// Returns the words read, or `None` if translation faulted.
+    fn atomic(&mut self) -> Result<Option<[u64; 2]>, Error> {
+        static LSE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let (kind, address, width) = (self.cpu.atomic_kind, self.cpu.address, self.cpu.width);
+        if !matches!(width, 1 | 2 | 4 | 8) {
+            return Err(Error::InvalidAccessWidth(width));
+        }
+        let words = kind.words();
+        let span = u64::from(width) * words as u64;
+        let physical = match translate::translate(
+            &mut self.tlb,
+            &self.cpu,
+            &mut self.memory,
+            address,
+            translate::Access::Write,
+        ) {
+            Ok(physical) => physical,
+            Err(error) => {
+                self.abort(
+                    address,
+                    matches!(error, translate::TranslateError::PermissionFault),
+                    false,
+                    true,
+                );
+                return Ok(None);
+            }
+        };
+        // Aligned to the whole span, so every word lies in this one page.
+        let page = (physical % span == 0)
+            .then(|| self.memory.host_page(physical & !0xfff))
+            .flatten()
+            .ok_or(Error::UnsupportedAtomic(address))?;
+        let width_bytes = usize::from(width);
+        // SAFETY: `page` is a live RAM page and `physical` is aligned to `span`, so
+        // each word's address is inside the page and aligned to `width`.
+        let word =
+            |slot: usize| unsafe { page.add((physical & 0xfff) as usize + slot * width_bytes) };
+        let guard = LSE.lock();
+        let mut old = [0u64; 2];
+        for (slot, value) in old.iter_mut().enumerate().take(words) {
+            *value = Self::load_word(word(slot), width);
+        }
+        let new = if kind.is_exclusive_pair() {
+            self.cpu.exclusive_pair(kind, old)
+        } else {
+            kind.apply(old, self.cpu.atomic_operands, width)
+        };
+        let mut changed = false;
+        for slot in 0..words {
+            if new[slot] != old[slot] {
+                Self::store_word(word(slot), width, new[slot]);
+                changed = true;
+            }
+        }
+        drop(guard);
+        if changed && let Some(tracker) = self.memory.code_tracker() {
+            tracker.note_write(physical, span as usize);
+        }
+        Ok(Some(old))
+    }
+    fn load_word(at: *mut u8, width: u8) -> u64 {
+        use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering::SeqCst};
+        // SAFETY: callers pass an address inside a live RAM page, aligned to `width`.
+        unsafe {
+            match width {
+                1 => u64::from(AtomicU8::from_ptr(at).load(SeqCst)),
+                2 => u64::from(AtomicU16::from_ptr(at.cast()).load(SeqCst)),
+                4 => u64::from(AtomicU32::from_ptr(at.cast()).load(SeqCst)),
+                _ => AtomicU64::from_ptr(at.cast()).load(SeqCst),
+            }
+        }
+    }
+    fn store_word(at: *mut u8, width: u8, value: u64) {
+        use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering::SeqCst};
+        // SAFETY: callers pass an address inside a live RAM page, aligned to `width`.
+        unsafe {
+            match width {
+                1 => AtomicU8::from_ptr(at).store(value as u8, SeqCst),
+                2 => AtomicU16::from_ptr(at.cast()).store(value as u16, SeqCst),
+                4 => AtomicU32::from_ptr(at.cast()).store(value as u32, SeqCst),
+                _ => AtomicU64::from_ptr(at.cast()).store(value, SeqCst),
+            }
+        }
+    }
     fn access(
         &mut self,
         address: u64,
@@ -718,7 +982,7 @@ impl<M: GuestMemory> Machine<M> {
                         devices.write_uart(physical - fdt::UART_BASE, width, value);
                         None
                     }
-                } else if window(fdt::GICD_BASE, crate::devices::gicv2::DISTRIBUTOR_SIZE) {
+                } else if window(fdt::GICD_BASE, crate::devices::gicv3::DISTRIBUTOR_SIZE) {
                     if load {
                         Some(devices.read_gic_distributor(
                             self.cpu_id,
@@ -744,6 +1008,13 @@ impl<M: GuestMemory> Machine<M> {
                             width,
                             value,
                         );
+                        None
+                    }
+                } else if window(afdt::GICR_BASE, crate::devices::gicv3::REDISTRIBUTOR_SIZE) {
+                    if load {
+                        Some(devices.read_gic_redistributor(physical - afdt::GICR_BASE, width))
+                    } else {
+                        devices.write_gic_redistributor(physical - afdt::GICR_BASE, width, value);
                         None
                     }
                 } else if window(fdt::VIRTIO_MMIO_BASE, fdt::VIRTIO_MMIO_SIZE) {
@@ -895,6 +1166,97 @@ mod tests {
         assert_eq!(machine.cpu.system.cntvct_el0, 2);
     }
 
+    #[test]
+    fn an_architecturally_undefined_word_raises_undef_after_the_decoded_prefix_ran() {
+        let mut machine = machine();
+        machine.cpu.pc = 0x40000000;
+        machine.cpu.system.vbar_el1 = 0x40000000;
+        // movz x0, #1; XNU's TRAP_DEBUGGER word; the guest's synchronous vector.
+        for (at, word) in [
+            (0x40000000, 0xd2800020u32),
+            (0x40000004, 0xe7ffdeff),
+            (0x40000200, 0xd4000002),
+        ] {
+            machine.memory.write(at, &word.to_le_bytes()).unwrap();
+        }
+        let mut serial = Pl011::new(|_| {});
+        let mut gic = Gicv2::default();
+        let exit = machine.run(&mut serial, &mut gic).unwrap();
+        assert!(matches!(exit, Exit::Psci { function: 1, .. }));
+        assert_eq!(machine.cpu.x[0], 1, "the instruction before it ran");
+        assert_eq!(
+            machine.cpu.system.elr_el1, 0x40000004,
+            "the exception is taken at the word"
+        );
+        assert_eq!(machine.cpu.system.esr_el1 >> 26, 0, "unknown reason");
+        assert_ne!(
+            machine.cpu.system.esr_el1 & (1 << 25),
+            0,
+            "32-bit instruction"
+        );
+    }
+
+    #[test]
+    fn the_virtual_timer_is_a_fiq_only_while_every_gate_is_open() {
+        // (F masked, forwarded by the GIC, ICC_IGRPEN0, ICC_PMR, timer CTL, expect FIQ)
+        let cases = [
+            (false, true, 1, 0xff, 1, true),
+            (true, true, 1, 0xff, 1, false),
+            (false, false, 1, 0xff, 1, false),
+            (false, true, 0, 0xff, 1, false),
+            (false, true, 1, 0x00, 1, false),
+            (false, true, 1, 0xff, 3, false),
+        ];
+        for (masked, forwarded, group0, pmr, ctl, expect) in cases {
+            let mut machine = machine();
+            machine.cpu.pc = 0x40000000;
+            machine.cpu.system.vbar_el1 = 0x40000000;
+            machine.cpu.system.daif = u64::from(masked);
+            machine.vtimer_fiq = forwarded.then_some(0);
+            machine.cpu.system.icc_igrpen0_el1 = group0;
+            machine.cpu.system.icc_pmr_el1 = pmr;
+            machine.cpu.system.cntv_ctl_el0 = ctl;
+            // The mainline code and the FIQ vector (current EL, SPx: +0x200 + 2 * 0x80)
+            // both end in `hvc`; only a taken FIQ sets ELR.
+            for at in [0x40000000, 0x40000300] {
+                machine
+                    .memory
+                    .write(at, &0xd4000002u32.to_le_bytes())
+                    .unwrap();
+            }
+            let mut serial = Pl011::new(|_| {});
+            let mut gic = Gicv2::default();
+            let exit = loop {
+                match machine.run(&mut serial, &mut gic).unwrap() {
+                    Exit::Timer => continue,
+                    other => break other,
+                }
+            };
+            assert!(matches!(exit, Exit::Psci { .. }));
+            assert_eq!(
+                machine.cpu.system.elr_el1 == 0x40000000,
+                expect,
+                "masked={masked} forwarded={forwarded} group0={group0} pmr={pmr:#x} ctl={ctl}"
+            );
+            // `ISR_EL1.F` reports the asserted line whether or not the CPU masks it.
+            let asserted = forwarded && group0 == 1 && pmr > 0 && ctl == 1;
+            assert_eq!(machine.cpu.system.isr_el1 & (1 << 6) != 0, asserted);
+        }
+    }
+
+    #[test]
+    fn address_translation_reports_the_physical_page_in_par() {
+        // `at s1e1r, x0` with the MMU off translates to the same address.
+        let mut machine = machine();
+        machine.cpu.x[0] = 0x40000123;
+        run_to_hvc(&mut machine, &[0xd5087800, HVC]);
+        assert_eq!(machine.cpu.system.par_el1 & 1, 0, "no fault");
+        assert_eq!(
+            machine.cpu.system.par_el1 & 0x0000_ffff_ffff_f000,
+            0x40000000
+        );
+    }
+
     /// Run guest code at `0x40000000` until it hits the `hvc` that ends it.
     fn run_to_hvc(machine: &mut Machine<PhysicalMemory>, words: &[u32]) {
         for (i, word) in words.iter().enumerate() {
@@ -914,6 +1276,71 @@ mod tests {
     const LDXR_X1_X0: u32 = 0xc85f7c01;
     const STXR_W2_X3_X0: u32 = 0xc8027c03;
     const HVC: u32 = 0xd4000002;
+    #[test]
+    fn ld1_of_several_registers_loads_every_register_and_post_indexes() {
+        // `ld1.2d {v16, v17, v18, v19}, [x10]`, then the same with `, #64`.
+        for (word, advance) in [(0x4c402d50, 0), (0x4cdf2d50, 64)] {
+            let mut machine = machine();
+            machine.cpu.x[10] = 0x40000800;
+            for i in 0..8u64 {
+                machine
+                    .memory
+                    .write(0x40000800 + 8 * i, &(11 + i).to_le_bytes())
+                    .unwrap();
+            }
+            run_to_hvc(&mut machine, &[word, HVC]);
+            assert_eq!(machine.cpu.v[16], [11, 12]);
+            assert_eq!(machine.cpu.v[17], [13, 14]);
+            assert_eq!(machine.cpu.v[18], [15, 16]);
+            assert_eq!(machine.cpu.v[19], [17, 18]);
+            assert_eq!(machine.cpu.x[10], 0x40000800 + advance);
+        }
+    }
+
+    const LDXP_X9_X21_X8: u32 = 0xc87f5509;
+    /// `stxp w11, x19, x10, [x8]`.
+    const STXP_W11_X19_X10_X8: u32 = 0xc82b2913;
+
+    #[test]
+    fn exclusive_pair_stores_only_while_both_words_are_unchanged() {
+        let read_pair = |machine: &mut Machine<PhysicalMemory>| {
+            let mut bytes = [0u8; 16];
+            machine.memory.read(0x40000800, &mut bytes).unwrap();
+            [
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            ]
+        };
+        for (interfere, status, stored) in [(false, 0, [30, 40]), (true, 1, [1, 99])] {
+            let mut machine = machine();
+            machine.cpu.x[8] = 0x40000800;
+            machine.cpu.x[19] = 30;
+            machine.cpu.x[10] = 40;
+            let mut init = [0u8; 16];
+            init[..8].copy_from_slice(&1u64.to_le_bytes());
+            init[8..].copy_from_slice(&2u64.to_le_bytes());
+            machine.memory.write(0x40000800, &init).unwrap();
+            run_to_hvc(&mut machine, &[LDXP_X9_X21_X8, HVC]);
+            assert_eq!(
+                (machine.cpu.x[9], machine.cpu.x[21]),
+                (1, 2),
+                "ldxp loads both words"
+            );
+            if interfere {
+                // Another agent changes the second word before the store.
+                machine
+                    .memory
+                    .write(0x40000808, &99u64.to_le_bytes())
+                    .unwrap();
+            }
+            run_to_hvc(&mut machine, &[STXP_W11_X19_X10_X8, HVC]);
+            assert_eq!(machine.cpu.x[11], status, "interfere = {interfere}");
+            assert_eq!(read_pair(&mut machine), stored);
+            // The monitor is spent: a second stxp without a new ldxp fails.
+            run_to_hvc(&mut machine, &[STXP_W11_X19_X10_X8, HVC]);
+            assert_eq!(machine.cpu.x[11], 1);
+        }
+    }
 
     #[test]
     fn store_exclusive_succeeds_when_memory_is_unchanged() {

@@ -17,7 +17,7 @@ volt-ir = { path = "src/ir" }
 volt-target = { path = "src/target" }
 volt-emulator = { path = "src/emulator" }
 
-object = { version = "0.40.0", default-features = false, features = ["read_core", "write_core", "elf"] }
+object = { version = "0.40.0", default-features = false, features = ["read_core", "write_core", "elf", "macho"] }
 libc = "0.2"
 parking_lot = "0.12"
 winnow-args = "0.1"

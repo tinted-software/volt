@@ -1,4 +1,4 @@
-//! Raw Linux arm64 Image boot through Volt's full-system JIT with VirtIO-Blk.
+//! Raw Linux arm64 Image, or XNU Mach-O kernel, boot through Volt's full-system JIT.
 
 use std::{
     io::Write,
@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 use volt_emulator::devices::BlockBackend;
-use volt_emulator::system::{DEFAULT_CMDLINE, IdleMode, RAM_SIZE, SystemConfig, smp::SmpConfig};
+use volt_emulator::system::{
+    DEFAULT_CMDLINE, DEFAULT_XNU_CMDLINE, IdleMode, RAM_SIZE, SystemConfig, XNU_RAM_SIZE,
+    smp::SmpConfig,
+};
 use winnow_args::{Args, ValueEnum};
 
 #[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -33,10 +36,10 @@ impl From<IdleModeArg> for IdleMode {
 #[derive(Args, Debug)]
 #[arg(
     name = "volt-boot",
-    about = "AArch64 Linux boot with PL011, GICv2, and VirtIO-Blk"
+    about = "AArch64 Linux or XNU boot with PL011, GICv2/GICv3, and VirtIO-Blk (Linux)"
 )]
 struct Cli {
-    /// Path to the raw Linux AArch64 Image.
+    /// Path to a raw Linux AArch64 Image, or an XNU kernel (Mach-O).
     #[arg(positional)]
     image: PathBuf,
 
@@ -44,7 +47,7 @@ struct Cli {
     #[arg(positional)]
     seconds: Option<u64>,
 
-    /// Kernel command line.
+    /// Kernel command line (Linux) or boot-args (XNU; start with a non-dash word).
     #[arg(positional)]
     cmdline: Option<String>,
 
@@ -189,14 +192,17 @@ fn run(cli: Cli) -> Result<(), String> {
     };
 
     let seconds = cli.seconds.unwrap_or(20);
-    let default_cmdline = if cli.disk.is_some() {
+    let image = std::fs::read(&cli.image).map_err(|e| format!("{}: {e}", cli.image.display()))?;
+    // A Mach-O image is an XNU kernel; anything else is a raw Linux Image.
+    let xnu = volt_emulator::system::xnu::is_macho(&image);
+    let default_cmdline = if xnu {
+        DEFAULT_XNU_CMDLINE
+    } else if cli.disk.is_some() {
         "root=/dev/vda rw console=ttyAMA0 earlycon=pl011,0x9000000 nokaslr loglevel=8"
     } else {
         DEFAULT_CMDLINE
     };
     let cmdline = cli.cmdline.unwrap_or_else(|| default_cmdline.to_string());
-
-    let image = std::fs::read(&cli.image).map_err(|e| format!("{}: {e}", cli.image.display()))?;
 
     let initrd_data = match &cli.initrd {
         Some(path) => Some(load_initrd(path)?),
@@ -205,6 +211,8 @@ fn run(cli: Cli) -> Result<(), String> {
 
     let default_ram = if let Some(initrd) = &initrd_data {
         RAM_SIZE.max((initrd.len() * 3 + (128 << 20)).next_power_of_two())
+    } else if xnu {
+        XNU_RAM_SIZE
     } else {
         RAM_SIZE
     };

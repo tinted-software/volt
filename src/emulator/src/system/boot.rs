@@ -38,6 +38,10 @@ pub enum Error {
     NotAnImage,
     BigEndianKernel,
     NoRoom,
+    /// A Mach-O kernel that is truncated or inconsistent.
+    BadMachO(&'static str),
+    /// A boot option the selected kernel format cannot honour.
+    Unsupported(&'static str),
     Memory(MemoryError),
 }
 impl core::fmt::Display for Error {
@@ -82,7 +86,9 @@ pub fn load_address(ram_base: u64, header: Header) -> Result<u64, Error> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
     pub entry: u64,
-    pub device_tree: u64,
+    /// Guest-physical address handed to the kernel in `x0`: the device tree
+    /// blob for a Linux Image, the `boot_args` block for XNU.
+    pub boot_info: u64,
     pub initrd: Option<(u64, u64)>,
 }
 pub fn prepare(
@@ -152,7 +158,7 @@ pub fn prepare_boot(
     memory.write(device_tree, &tree).map_err(Error::Memory)?;
     Ok(Layout {
         entry,
-        device_tree,
+        boot_info: device_tree,
         initrd: initrd_info,
     })
 }
@@ -203,7 +209,7 @@ mod tests {
         let (initrd_start, initrd_end) = layout.initrd.unwrap();
         assert!(initrd_start >= layout.entry + 0x200000);
         assert_eq!(initrd_end, initrd_start + initrd_data.len() as u64);
-        assert!(layout.device_tree >= initrd_end);
+        assert!(layout.boot_info >= initrd_end);
 
         let mut read_back = vec![0u8; initrd_data.len()];
         mem.read(initrd_start, &mut read_back).unwrap();
