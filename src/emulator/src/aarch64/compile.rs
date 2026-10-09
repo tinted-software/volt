@@ -1,6 +1,6 @@
 use super::{
     cpu::{Cpu, DTLB_ENTRIES, Exclusive as CpuExclusive, System as CpuSystem, Trap},
-    decode::*,
+    host::{Dispatch, dispatch},
 };
 use crate::memory::MemoryError;
 use core::{
@@ -12,6 +12,7 @@ use volt_ir::{
     function::{self as ir, BinOp as B, CmpOp as C, Function, Opcode, Value},
     types::{IntDesc, Type, TypeKind},
 };
+use volt_target::aarch64::decode::*;
 use volt_target::native;
 
 #[derive(Debug)]
@@ -80,9 +81,9 @@ struct Lower {
     /// Block currently being emitted into. Memory fast paths switch it.
     block: Cell<ir::Block>,
     cpu: Value,
-    u64: Type,
-    u32: Type,
-    u8: Type,
+    i64: Type,
+    i32: Type,
+    i8: Type,
     boolean: Type,
     ptr: Type,
     /// Guest instructions started but not yet added to `cntvct_el0`. The
@@ -95,18 +96,9 @@ impl Lower {
         let mut f = Function::new();
         // A typical block is a few blocks and about a hundred instructions.
         f.reserve(8, 128, 128);
-        let u64 = f.types.intern(TypeKind::Int(IntDesc {
-            signed: false,
-            bits: 64,
-        }));
-        let u32 = f.types.intern(TypeKind::Int(IntDesc {
-            signed: false,
-            bits: 32,
-        }));
-        let u8 = f.types.intern(TypeKind::Int(IntDesc {
-            signed: false,
-            bits: 8,
-        }));
+        let i64 = f.types.intern(TypeKind::Int(IntDesc { bits: 64 }));
+        let i32 = f.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
+        let i8 = f.types.intern(TypeKind::Int(IntDesc { bits: 8 }));
         let boolean = f.types.intern(TypeKind::Bool);
         let ptr = f.types.ptr_global();
         let block = f.append_block();
@@ -115,9 +107,9 @@ impl Lower {
             f: RefCell::new(f),
             block: Cell::new(block),
             cpu,
-            u64,
-            u32,
-            u8,
+            i64,
+            i32,
+            i8,
             boolean,
             ptr,
             pending: Cell::new(0),
@@ -146,12 +138,23 @@ impl Lower {
         )
     }
     fn cv(&self, t: Type, v: Value) -> Value {
-        let same = { self.f.borrow().value_type(v) == t };
-        if same {
-            v
-        } else {
-            self.emit(t, Opcode::Convert(ir::Convert { value: v }))
+        let from = self.f.borrow().value_type(v);
+        if from == t {
+            return v;
         }
+        let kind = {
+            let f = self.f.borrow();
+            let bits = |ty| match f.types.type_kind(ty) {
+                TypeKind::Int(d) => d.bits,
+                _ => 1,
+            };
+            if bits(t) > bits(from) {
+                ir::ConvertKind::Zext
+            } else {
+                ir::ConvertKind::Trunc
+            }
+        };
+        self.emit(t, Opcode::Convert(ir::Convert { value: v, kind }))
     }
     fn cmp(&self, op: C, a: Value, b: Value) -> Value {
         self.emit(
@@ -177,7 +180,7 @@ impl Lower {
             t,
             Opcode::Load(ir::Load {
                 ptr: p,
-                volatile: false,
+                mem: ir::MemFlags::default(),
             }),
         )
     }
@@ -191,7 +194,7 @@ impl Lower {
         self.store_ptr(self.addr(at), v)
     }
     fn byte(&self, at: usize, v: u64) {
-        self.store(at, self.k(self.u8, v))
+        self.store(at, self.k(self.i8, v))
     }
     fn reg_at(r: u8) -> usize {
         if r == 31 {
@@ -204,7 +207,7 @@ impl Lower {
         if zero && r == 31 {
             self.k(t, 0)
         } else {
-            self.cv(t, self.load(self.u64, Self::reg_at(r)))
+            self.cv(t, self.load(self.i64, Self::reg_at(r)))
         }
     }
     fn put(&self, r: u8, v: Value) {
@@ -213,20 +216,14 @@ impl Lower {
         }
     }
     fn put_sp(&self, r: u8, v: Value) {
-        self.store(Self::reg_at(r), self.cv(self.u64, v))
+        self.store(Self::reg_at(r), self.cv(self.i64, v))
     }
     fn ty(&self, w: Width) -> Type {
-        if w == Width::X64 { self.u64 } else { self.u32 }
-    }
-    fn signed(&self, w: Width) -> Type {
-        self.f.borrow_mut().types.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: w as u16,
-        }))
+        if w == Width::X64 { self.i64 } else { self.i32 }
     }
     fn add_counter(&self, n: u64) {
         let at = offset_of!(Cpu, system) + offset_of!(CpuSystem, cntvct_el0);
-        self.store(at, self.imm(self.u64, B::Add, self.load(self.u64, at), n));
+        self.store(at, self.imm(self.i64, B::Add, self.load(self.i64, at), n));
     }
     /// Make `cntvct_el0` in memory current on the path being emitted.
     fn flush_counter(&self) {
@@ -252,12 +249,12 @@ impl Lower {
     fn flag(&self, flags: Value, bit: u32) -> Value {
         self.cmp(
             C::Ne,
-            self.imm(self.u32, B::BitAnd, flags, 1 << bit),
-            self.k(self.u32, 0),
+            self.imm(self.i32, B::BitAnd, flags, 1 << bit),
+            self.k(self.i32, 0),
         )
     }
     fn condition(&self, c: Condition) -> Value {
-        let f = self.load(self.u32, offset_of!(Cpu, flags));
+        let f = self.load(self.i32, offset_of!(Cpu, flags));
         let n = self.flag(f, 31);
         let z = self.flag(f, 30);
         let carry = self.flag(f, 29);
@@ -284,13 +281,13 @@ impl Lower {
         }
     }
     fn pack(&self, n: Value, z: Value, c: Value, v: Value) -> Value {
-        let mut out = self.k(self.u32, 0);
+        let mut out = self.k(self.i32, 0);
         for (bit, shift) in [(n, 31), (z, 30), (c, 29), (v, 28)] {
             out = self.bin(
-                self.u32,
+                self.i32,
                 B::BitOr,
                 out,
-                self.imm(self.u32, B::Shl, self.cv(self.u32, bit), shift),
+                self.imm(self.i32, B::Shl, self.cv(self.i32, bit), shift),
             );
         }
         out
@@ -314,16 +311,14 @@ impl Lower {
         let z = self.cmp(C::Eq, r, zero);
         let c = carry.unwrap_or_else(|| {
             if op == ArithOp::Sub {
-                self.cmp(C::Ge, a, b)
+                self.cmp(C::Uge, a, b)
             } else {
-                self.cmp(C::Lt, r, a)
+                self.cmp(C::Ult, r, a)
             }
         });
-        let s = self.signed(w);
-        let sz = self.k(s, 0);
-        let an = self.cmp(C::Lt, self.cv(s, a), sz);
-        let bn = self.cmp(C::Lt, self.cv(s, b), sz);
-        let rn = self.cmp(C::Lt, self.cv(s, r), sz);
+        let an = self.cmp(C::Slt, a, zero);
+        let bn = self.cmp(C::Slt, b, zero);
+        let rn = self.cmp(C::Slt, r, zero);
         let diff = self.bin(self.boolean, B::BitXor, an, bn);
         let flip = self.bin(self.boolean, B::BitXor, an, rn);
         let v = self.bin(
@@ -358,10 +353,7 @@ impl Lower {
         match s {
             Shift::Lsl => self.imm(t, B::Shl, v, n),
             Shift::Lsr => self.imm(t, B::Shr, v, n),
-            Shift::Asr => {
-                let signed = self.signed(w);
-                self.cv(t, self.imm(signed, B::Shr, self.cv(signed, v), n))
-            }
+            Shift::Asr => self.imm(t, B::Sar, v, n),
             Shift::Ror => self.bin(
                 t,
                 B::BitOr,
@@ -373,62 +365,62 @@ impl Lower {
     fn extend(&self, v: Value, e: Extend) -> Value {
         match e {
             Extend::Uxtx | Extend::Sxtx => v,
-            Extend::Uxtb => self.imm(self.u64, B::BitAnd, v, 0xff),
-            Extend::Uxth => self.imm(self.u64, B::BitAnd, v, 0xffff),
-            Extend::Uxtw => self.imm(self.u64, B::BitAnd, v, 0xffffffff),
+            Extend::Uxtb => self.imm(self.i64, B::BitAnd, v, 0xff),
+            Extend::Uxth => self.imm(self.i64, B::BitAnd, v, 0xffff),
+            Extend::Uxtw => self.imm(self.i64, B::BitAnd, v, 0xffffffff),
             Extend::Sxtb | Extend::Sxth | Extend::Sxtw => {
                 let n = match e {
                     Extend::Sxtb => 56,
                     Extend::Sxth => 48,
                     _ => 32,
                 };
-                let raised = self.imm(self.u64, B::Shl, v, n);
+                let raised = self.imm(self.i64, B::Shl, v, n);
                 self.shift(Width::X64, raised, Shift::Asr, n)
             }
         }
     }
     fn address(&self, rn: u8, a: Addressing) -> Value {
-        let base = self.reg(self.u64, rn, false);
+        let base = self.reg(self.i64, rn, false);
         match a {
-            Addressing::Offset(n) => self.imm(self.u64, B::Add, base, n as u64),
+            Addressing::Offset(n) => self.imm(self.i64, B::Add, base, n as u64),
             Addressing::PreIndex(n) => {
-                let a = self.imm(self.u64, B::Add, base, n as u64);
+                let a = self.imm(self.i64, B::Add, base, n as u64);
                 self.put_sp(rn, a);
                 a
             }
             Addressing::PostIndex(n) => {
                 self.store(
                     offset_of!(Cpu, writeback_value),
-                    self.imm(self.u64, B::Add, base, n as u64),
+                    self.imm(self.i64, B::Add, base, n as u64),
                 );
                 self.byte(offset_of!(Cpu, writeback_dest), rn as u64);
                 self.byte(offset_of!(Cpu, writeback), 1);
                 base
             }
             Addressing::Register { rm, extend, amount } => {
-                let v = self.extend(self.reg(self.u64, rm, true), extend);
+                let v = self.extend(self.reg(self.i64, rm, true), extend);
                 self.bin(
-                    self.u64,
+                    self.i64,
                     B::Add,
                     base,
-                    self.imm(self.u64, B::Shl, v, amount as u64),
+                    self.imm(self.i64, B::Shl, v, amount as u64),
                 )
             }
         }
     }
     fn branch(&self, pc: u64, offset: i64, c: Value) {
         self.ret(self.sel(
-            self.u64,
+            self.i64,
             c,
-            self.k(self.u64, pc.wrapping_add(offset as u64)),
-            self.k(self.u64, pc.wrapping_add(4)),
+            self.k(self.i64, pc.wrapping_add(offset as u64)),
+            self.k(self.i64, pc.wrapping_add(4)),
         ))
     }
-    fn uint(&self, bits: u16) -> Type {
-        self.f.borrow_mut().types.intern(TypeKind::Int(IntDesc {
-            signed: false,
-            bits,
-        }))
+    fn int(&self, bits: u16) -> Type {
+        self.f
+            .borrow_mut()
+            .types
+            .intern(TypeKind::Int(IntDesc { bits }))
     }
     fn new_block(&self) -> ir::Block {
         self.f.borrow_mut().append_block()
@@ -448,12 +440,12 @@ impl Lower {
     fn address_split(&self, rn: u8, a: Addressing) -> (Value, Option<(u8, Value)>) {
         match a {
             Addressing::PostIndex(n) => {
-                let base = self.reg(self.u64, rn, false);
-                (base, Some((rn, self.imm(self.u64, B::Add, base, n as u64))))
+                let base = self.reg(self.i64, rn, false);
+                (base, Some((rn, self.imm(self.i64, B::Add, base, n as u64))))
             }
             Addressing::PreIndex(n) => {
-                let base = self.reg(self.u64, rn, false);
-                let address = self.imm(self.u64, B::Add, base, n as u64);
+                let base = self.reg(self.i64, rn, false);
+                let address = self.imm(self.i64, B::Add, base, n as u64);
                 (address, Some((rn, address)))
             }
             other => (self.address(rn, other), None),
@@ -468,39 +460,39 @@ impl Lower {
         let n = size as u64;
         // Entry offset = ((address >> 12) & (ENTRIES - 1)) * 32 = (address >> 7) & mask.
         let index = self.imm(
-            self.u64,
+            self.i64,
             B::BitAnd,
-            self.imm(self.u64, B::Shr, address, 7),
+            self.imm(self.i64, B::Shr, address, 7),
             (DTLB_ENTRIES as u64 - 1) << 5,
         );
         let entry = self.bin(self.ptr, B::Add, self.cpu, index);
         // Constant displacements fold into the load addressing.
         let field = |at: usize| {
             self.load_ptr(
-                self.u64,
+                self.i64,
                 self.imm(self.ptr, B::Add, entry, (offset_of!(Cpu, dtlb) + at) as u64),
             )
         };
         let tag = field(if write { 8 } else { 0 });
         let addend = field(16);
         let host = self.bin(self.ptr, B::Add, address, addend);
-        let want = self.imm(self.u64, B::BitAnd, address, !0xfffu64 | (n - 1));
+        let want = self.imm(self.i64, B::BitAnd, address, !0xfffu64 | (n - 1));
         // Last, so the backend can fuse it into the branch that consumes it.
         let hit = self.cmp(C::Eq, tag, want);
         (hit, host)
     }
     fn fast_load(&self, host: Value, size: Size, rt: u8, signed: SignExtend) {
         let bits = size as u16 * 8;
-        let raw = self.load_ptr(self.uint(bits), host);
+        let raw = self.load_ptr(self.int(bits), host);
         if rt == 31 {
             return;
         }
-        let mut v = self.cv(self.u64, raw);
+        let mut v = self.cv(self.i64, raw);
         if signed != SignExtend::None && bits < 64 {
             let n = 64 - bits as u64;
-            let extended = self.shift(Width::X64, self.imm(self.u64, B::Shl, v, n), Shift::Asr, n);
+            let extended = self.shift(Width::X64, self.imm(self.i64, B::Shl, v, n), Shift::Asr, n);
             v = if signed == SignExtend::To32 {
-                self.imm(self.u64, B::BitAnd, extended, 0xffff_ffff)
+                self.imm(self.i64, B::BitAnd, extended, 0xffff_ffff)
             } else {
                 extended
             };
@@ -508,8 +500,8 @@ impl Lower {
         self.put(rt, v);
     }
     fn fast_store(&self, host: Value, size: Size, rt: u8) {
-        let t = self.uint(size as u16 * 8);
-        self.store_ptr(host, self.cv(t, self.reg(self.u64, rt, true)));
+        let t = self.int(size as u16 * 8);
+        self.store_ptr(host, self.cv(t, self.reg(self.i64, rt, true)));
     }
     /// Emit a load or store with an inline fast path. On a data-TLB hit the
     /// access happens in place and emission continues in a fresh block; on a
@@ -561,9 +553,9 @@ impl Lower {
         // `address` is aligned to `n`, so the second access leaves the page
         // exactly when it starts on a page boundary.
         self.block.set(check_block);
-        let second_at = self.imm(self.u64, B::Add, address, n);
-        let offset = self.imm(self.u64, B::BitAnd, second_at, 0xfff);
-        let same_page = self.cmp(C::Ne, offset, self.k(self.u64, 0));
+        let second_at = self.imm(self.i64, B::Add, address, n);
+        let offset = self.imm(self.i64, B::BitAnd, second_at, 0xfff);
+        let same_page = self.cmp(C::Ne, offset, self.k(self.i64, 0));
         self.branch_if(same_page, fast_block, slow_block);
         self.block.set(slow_block);
         slow(self);
@@ -582,7 +574,7 @@ impl Lower {
     }
     fn trap(&self, pc: u64, t: Trap) {
         self.byte(offset_of!(Cpu, trap), t as u64);
-        self.ret(self.k(self.u64, pc))
+        self.ret(self.k(self.i64, pc))
     }
 
     /// Slow path for a whole SIMD vector or vector-pair access: describe the
@@ -604,7 +596,7 @@ impl Lower {
         self.byte(offset_of!(Cpu, dest), rt as u64);
         self.byte(offset_of!(Cpu, vector_dest), 1);
         if let Some(rt2) = rt2 {
-            let second = self.imm(self.u64, B::Add, address, if bytes == 16 { 16 } else { 8 });
+            let second = self.imm(self.i64, B::Add, address, if bytes == 16 { 16 } else { 8 });
             self.store(offset_of!(Cpu, second_address), second);
             self.byte(offset_of!(Cpu, second_width), bytes);
             self.byte(offset_of!(Cpu, second_dest), rt2 as u64);
@@ -653,8 +645,15 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
     for chunk in bytes.chunks_exact(4) {
         l.pending.set(l.pending.get() + 1);
         let word = u32::from_le_bytes(chunk.try_into().unwrap());
-        let instruction = match decode(word) {
-            Ok(insn) => insn,
+        let instruction = match dispatch(word) {
+            Ok(Dispatch::Guest(insn)) => insn,
+            Ok(Dispatch::Host(host_word)) => {
+                // The host runs this word (see `host::run`), and it ends the block.
+                l.store(offset_of!(Cpu, value), l.k(l.i64, host_word as u64));
+                l.trap(pc.wrapping_add(4), Trap::Host);
+                ended = true;
+                break;
+            }
             Err(_) => {
                 eprintln!("compile decode failure at pc {pc:x}: word {word:08x}, full block:");
                 for (i, c) in bytes.chunks_exact(4).enumerate() {
@@ -727,8 +726,8 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
             Instruction::ArithExt(a) => {
                 let t = l.ty(a.width);
                 let lhs = l.reg(t, a.rn, false);
-                let extended = l.extend(l.reg(l.u64, a.rm, true), a.extend);
-                let rhs = l.cv(t, l.imm(l.u64, B::Shl, extended, a.amount as u64));
+                let extended = l.extend(l.reg(l.i64, a.rm, true), a.extend);
+                let rhs = l.cv(t, l.imm(l.i64, B::Shl, extended, a.amount as u64));
                 let r = l.bin(t, arithmetic_op(a.op), lhs, rhs);
                 if a.flags {
                     l.put(a.rd, r);
@@ -777,9 +776,9 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 let carry = l.cv(
                     t,
                     l.imm(
-                        l.u32,
+                        l.i32,
                         B::BitAnd,
-                        l.imm(l.u32, B::Shr, l.load(l.u32, offset_of!(Cpu, flags)), 29),
+                        l.imm(l.i32, B::Shr, l.load(l.i32, offset_of!(Cpu, flags)), 29),
                         1,
                     ),
                 );
@@ -792,8 +791,8 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     let out = l.bin(
                         l.boolean,
                         B::BitOr,
-                        l.cmp(C::Lt, partial, lhs),
-                        l.cmp(C::Lt, r, partial),
+                        l.cmp(C::Ult, partial, lhs),
+                        l.cmp(C::Ult, r, partial),
                     );
                     l.store(
                         offset_of!(Cpu, flags),
@@ -813,10 +812,10 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 l.store(
                     offset_of!(Cpu, flags),
                     l.sel(
-                        l.u32,
+                        l.i32,
                         l.condition(a.cond),
                         flags,
-                        l.k(l.u32, (a.nzcv as u64) << 28),
+                        l.k(l.i32, (a.nzcv as u64) << 28),
                     ),
                 );
             }
@@ -856,12 +855,12 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
             Instruction::MulLong(a) => {
                 let e = if a.signed { Extend::Sxtw } else { Extend::Uxtw };
                 let p = l.bin(
-                    l.u64,
+                    l.i64,
                     B::Mul,
-                    l.extend(l.reg(l.u64, a.rn, true), e),
-                    l.extend(l.reg(l.u64, a.rm, true), e),
+                    l.extend(l.reg(l.i64, a.rn, true), e),
+                    l.extend(l.reg(l.i64, a.rm, true), e),
                 );
-                let r = l.bin(l.u64, arithmetic_op(a.op), l.reg(l.u64, a.ra, true), p);
+                let r = l.bin(l.i64, arithmetic_op(a.op), l.reg(l.i64, a.ra, true), p);
                 if a.rd != 31 {
                     l.put(a.rd, r)
                 }
@@ -869,7 +868,7 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
             Instruction::MulHigh(a) => lower_high(&l, a),
             Instruction::Adr(a) => {
                 let here = if a.page { pc & 0xfffffffffffff000 } else { pc };
-                l.put(a.rd, l.k(l.u64, here.wrapping_add(a.offset as u64)));
+                l.put(a.rd, l.k(l.i64, here.wrapping_add(a.offset as u64)));
             }
             Instruction::Csel(a) => {
                 let t = l.ty(a.width);
@@ -901,17 +900,17 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 );
             }
             Instruction::BCond(a) => l.branch(pc, a.offset, l.condition(a.cond)),
-            Instruction::B(offset) => l.ret(l.k(l.u64, pc.wrapping_add(offset as u64))),
+            Instruction::B(offset) => l.ret(l.k(l.i64, pc.wrapping_add(offset as u64))),
             Instruction::Call(a) => {
                 if a.link {
-                    l.put(30, l.k(l.u64, pc.wrapping_add(4)))
+                    l.put(30, l.k(l.i64, pc.wrapping_add(4)))
                 }
-                l.ret(l.k(l.u64, pc.wrapping_add(a.target as u64)));
+                l.ret(l.k(l.i64, pc.wrapping_add(a.target as u64)));
             }
             Instruction::Indirect(a) => {
-                let target = l.reg(l.u64, a.rn, false);
+                let target = l.reg(l.i64, a.rn, false);
                 if a.link {
-                    l.put(30, l.k(l.u64, pc.wrapping_add(4)))
+                    l.put(30, l.k(l.i64, pc.wrapping_add(4)))
                 }
                 l.ret(target);
             }
@@ -940,7 +939,7 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 }
             }
             Instruction::Literal(a) => {
-                let address = l.k(l.u64, pc.wrapping_add(a.offset as u64));
+                let address = l.k(l.i64, pc.wrapping_add(a.offset as u64));
                 if inline_memory {
                     l.memory_access(
                         address,
@@ -967,13 +966,13 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 }
             }
             Instruction::SimdLiteral(a) => {
-                let address = l.k(l.u64, pc.wrapping_add(a.offset as u64));
+                let address = l.k(l.i64, pc.wrapping_add(a.offset as u64));
                 l.simd_trap_access(address, a.bytes as u64, a.rt, None, None, pc, Trap::Load);
             }
             Instruction::Exclusive(a) => {
                 setup_memory(
                     &l,
-                    l.reg(l.u64, a.rn, false),
+                    l.reg(l.i64, a.rn, false),
                     a.size,
                     a.rt,
                     SignExtend::None,
@@ -1010,7 +1009,7 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     AtomicKind::StorePair => ([31, 31], &[a.rt, a.rt2]),
                     _ => ([a.rt, 31], &[a.rs]),
                 };
-                l.store(offset_of!(Cpu, address), l.reg(l.u64, a.rn, false));
+                l.store(offset_of!(Cpu, address), l.reg(l.i64, a.rn, false));
                 l.byte(offset_of!(Cpu, width), a.size as u64);
                 l.byte(offset_of!(Cpu, dest), dests[0] as u64);
                 l.byte(offset_of!(Cpu, atomic_kind), a.kind as u64);
@@ -1021,7 +1020,7 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     // Register numbers past 30 read as XZR.
                     l.store(
                         offset_of!(Cpu, atomic_operands) + slot * 8,
-                        l.reg(l.u64, reg, true),
+                        l.reg(l.i64, reg, true),
                     );
                 }
                 if a.kind == AtomicKind::StorePair {
@@ -1030,10 +1029,10 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 l.trap(pc.wrapping_add(4), Trap::Atomic);
             }
             Instruction::SimdStruct(a) => {
-                use super::simd_struct::StructDesc;
+                use volt_target::aarch64::simd_struct::StructDesc;
                 // Element-wise accesses with lane merging need the machine slow path.
                 let d = a.desc;
-                let address = l.reg(l.u64, a.rn, false);
+                let address = l.reg(l.i64, a.rn, false);
                 l.store(offset_of!(Cpu, address), address);
                 for (field, value) in [
                     (offset_of!(StructDesc, store), u64::from(d.store)),
@@ -1052,13 +1051,13 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 }
                 let step = match a.post {
                     StructPost::None => None,
-                    StructPost::Immediate => Some(l.k(l.u64, d.bytes())),
-                    StructPost::Register(rm) => Some(l.reg(l.u64, rm, true)),
+                    StructPost::Immediate => Some(l.k(l.i64, d.bytes())),
+                    StructPost::Register(rm) => Some(l.reg(l.i64, rm, true)),
                 };
                 if let Some(step) = step {
                     l.store(
                         offset_of!(Cpu, writeback_value),
-                        l.bin(l.u64, B::Add, address, step),
+                        l.bin(l.i64, B::Add, address, step),
                     );
                     l.byte(offset_of!(Cpu, writeback_dest), a.rn as u64);
                     l.byte(offset_of!(Cpu, writeback), 1);
@@ -1066,17 +1065,12 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 l.trap(pc.wrapping_add(4), Trap::SimdStruct);
             }
             Instruction::AddressTranslate(a) => {
-                l.store(offset_of!(Cpu, address), l.reg(l.u64, a.rt, true));
+                l.store(offset_of!(Cpu, address), l.reg(l.i64, a.rt, true));
                 l.store(
                     offset_of!(Cpu, value),
-                    l.k(l.u64, u64::from(a.write) | u64::from(a.user) << 1),
+                    l.k(l.i64, u64::from(a.write) | u64::from(a.user) << 1),
                 );
                 l.trap(pc.wrapping_add(4), Trap::AddressTranslate);
-            }
-            Instruction::Host(word) => {
-                // The host runs this word: see `host::run`.
-                l.store(offset_of!(Cpu, value), l.k(l.u64, word as u64));
-                l.trap(pc.wrapping_add(4), Trap::Host);
             }
             Instruction::Pair(a) => {
                 let trap = if a.op == MemoryOp::Store {
@@ -1101,14 +1095,14 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     l.trap(pc.wrapping_add(4), trap);
                 }
             }
-            Instruction::Clrex => l.byte(offset_of!(Cpu, monitor_valid), 0),
+            Instruction::Clrex(_) => l.byte(offset_of!(Cpu, monitor_valid), 0),
             Instruction::Sev | Instruction::Sevl => l.byte(offset_of!(Cpu, event_set), 1),
             Instruction::SimdImm(a) => {
                 let at = offset_of!(Cpu, v) + a.rd as usize * 16;
                 match a.combine {
                     ImmCombine::Set => {
-                        l.store(at, l.k(l.u64, a.low));
-                        l.store(at + 8, l.k(l.u64, a.high));
+                        l.store(at, l.k(l.i64, a.low));
+                        l.store(at + 8, l.k(l.i64, a.high));
                     }
                     ImmCombine::Or | ImmCombine::AndNot => {
                         // A 64-bit form (`q == false`) also clears the upper half.
@@ -1116,13 +1110,13 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                             ImmCombine::Or => (B::BitOr, a.low),
                             _ => (B::BitAnd, !a.low),
                         };
-                        l.store(at, l.imm(l.u64, op, l.load(l.u64, at), imm));
+                        l.store(at, l.imm(l.i64, op, l.load(l.i64, at), imm));
                         l.store(
                             at + 8,
                             if a.q {
-                                l.imm(l.u64, op, l.load(l.u64, at + 8), imm)
+                                l.imm(l.i64, op, l.load(l.i64, at + 8), imm)
                             } else {
-                                l.k(l.u64, 0)
+                                l.k(l.i64, 0)
                             },
                         );
                     }
@@ -1131,8 +1125,8 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
             Instruction::SimdMove { rd, rn } => {
                 let at_d = offset_of!(Cpu, v) + rd as usize * 16;
                 let at_n = offset_of!(Cpu, v) + rn as usize * 16;
-                let lo = l.load(l.u64, at_n);
-                let hi = l.load(l.u64, at_n + 8);
+                let lo = l.load(l.i64, at_n);
+                let hi = l.load(l.i64, at_n + 8);
                 l.store(at_d, lo);
                 l.store(at_d + 8, hi);
             }
@@ -1148,17 +1142,17 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 let per_dw = (64 / ebits) as usize;
                 let word = a.index as usize / per_dw;
                 let shift = (a.index as usize % per_dw) as u64 * ebits;
-                let old = l.load(l.u64, at_d + word * 8);
-                let cleared = l.bin(l.u64, B::BitAnd, old, l.k(l.u64, !(emask << shift)));
+                let old = l.load(l.i64, at_d + word * 8);
+                let cleared = l.bin(l.i64, B::BitAnd, old, l.k(l.i64, !(emask << shift)));
                 let value = l.bin(
-                    l.u64,
+                    l.i64,
                     B::BitAnd,
-                    l.reg(l.u64, a.rn, true),
-                    l.k(l.u64, emask),
+                    l.reg(l.i64, a.rn, true),
+                    l.k(l.i64, emask),
                 );
                 l.store(
                     at_d + word * 8,
-                    l.bin(l.u64, B::BitOr, cleared, l.imm(l.u64, B::Shl, value, shift)),
+                    l.bin(l.i64, B::BitOr, cleared, l.imm(l.i64, B::Shl, value, shift)),
                 );
             }
             Instruction::SimdInsertElement(a) => {
@@ -1181,22 +1175,22 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     a.dst as usize / per_dw,
                     (a.dst as usize % per_dw) as u64 * ebits,
                 );
-                let source = l.load(l.u64, at_n + src_word * 8);
+                let source = l.load(l.i64, at_n + src_word * 8);
                 let value = l.imm(
-                    l.u64,
+                    l.i64,
                     B::BitAnd,
-                    l.imm(l.u64, B::Shr, source, src_shift),
+                    l.imm(l.i64, B::Shr, source, src_shift),
                     emask,
                 );
-                let old = l.load(l.u64, at_d + dst_word * 8);
-                let cleared = l.imm(l.u64, B::BitAnd, old, !(emask << dst_shift));
+                let old = l.load(l.i64, at_d + dst_word * 8);
+                let cleared = l.imm(l.i64, B::BitAnd, old, !(emask << dst_shift));
                 l.store(
                     at_d + dst_word * 8,
                     l.bin(
-                        l.u64,
+                        l.i64,
                         B::BitOr,
                         cleared,
-                        l.imm(l.u64, B::Shl, value, dst_shift),
+                        l.imm(l.i64, B::Shl, value, dst_shift),
                     ),
                 );
             }
@@ -1212,8 +1206,8 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 let per_dw = (64 / ebits) as usize;
                 let word = a.index as usize / per_dw;
                 let shift = (a.index as usize % per_dw) as u64 * ebits;
-                let source = l.load(l.u64, at_n + word * 8);
-                let value = l.imm(l.u64, B::BitAnd, l.imm(l.u64, B::Shr, source, shift), emask);
+                let source = l.load(l.i64, at_n + word * 8);
+                let value = l.imm(l.i64, B::BitAnd, l.imm(l.i64, B::Shr, source, shift), emask);
                 l.put(a.rd, value);
             }
             Instruction::SimdDupElement(a) => {
@@ -1224,8 +1218,8 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     (1u64 << ebits) - 1
                 };
                 let at_n = offset_of!(Cpu, v) + a.rn as usize * 16;
-                let vn_lo = l.load(l.u64, at_n);
-                let vn_hi = l.load(l.u64, at_n + 8);
+                let vn_lo = l.load(l.i64, at_n);
+                let vn_hi = l.load(l.i64, at_n + 8);
                 // Locate the requested element across the 128-bit source.
                 let lane = a.index as usize;
                 let lanes_per_dw = (64 / ebits) as usize;
@@ -1235,52 +1229,52 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     vn_hi
                 };
                 let shift = (lane % lanes_per_dw) as u64 * ebits;
-                let element = l.imm(l.u64, B::BitAnd, l.imm(l.u64, B::Shr, src, shift), emask);
+                let element = l.imm(l.i64, B::BitAnd, l.imm(l.i64, B::Shr, src, shift), emask);
                 // Replicate the element across the destination lanes.
-                let mut acc = l.k(l.u64, 0);
+                let mut acc = l.k(l.i64, 0);
                 let lanes = (64 / ebits) as usize;
                 for lane in 0..lanes {
                     acc = l.bin(
-                        l.u64,
+                        l.i64,
                         B::BitOr,
                         acc,
-                        l.imm(l.u64, B::Shl, element, lane as u64 * ebits),
+                        l.imm(l.i64, B::Shl, element, lane as u64 * ebits),
                     );
                 }
                 let at_d = offset_of!(Cpu, v) + a.rd as usize * 16;
                 l.store(at_d, acc);
-                l.store(at_d + 8, if a.q { acc } else { l.k(l.u64, 0) });
+                l.store(at_d + 8, if a.q { acc } else { l.k(l.i64, 0) });
             }
             Instruction::SimdDup { rd, rn, esize, q } => {
-                let r = l.reg(l.u64, rn, true);
+                let r = l.reg(l.i64, rn, true);
                 let val64 = match esize {
                     0 => {
-                        let b = l.imm(l.u64, B::BitAnd, r, 0xff);
-                        l.bin(l.u64, B::Mul, b, l.k(l.u64, 0x0101_0101_0101_0101))
+                        let b = l.imm(l.i64, B::BitAnd, r, 0xff);
+                        l.bin(l.i64, B::Mul, b, l.k(l.i64, 0x0101_0101_0101_0101))
                     }
                     1 => {
-                        let h = l.imm(l.u64, B::BitAnd, r, 0xffff);
-                        l.bin(l.u64, B::Mul, h, l.k(l.u64, 0x0001_0001_0001_0001))
+                        let h = l.imm(l.i64, B::BitAnd, r, 0xffff);
+                        l.bin(l.i64, B::Mul, h, l.k(l.i64, 0x0001_0001_0001_0001))
                     }
                     2 => {
-                        let w = l.imm(l.u64, B::BitAnd, r, 0xffff_ffff);
-                        l.bin(l.u64, B::BitOr, w, l.imm(l.u64, B::Shl, w, 32))
+                        let w = l.imm(l.i64, B::BitAnd, r, 0xffff_ffff);
+                        l.bin(l.i64, B::BitOr, w, l.imm(l.i64, B::Shl, w, 32))
                     }
                     _ => r,
                 };
                 let at = offset_of!(Cpu, v) + rd as usize * 16;
                 l.store(at, val64);
-                let hi = if q { val64 } else { l.k(l.u64, 0) };
+                let hi = if q { val64 } else { l.k(l.i64, 0) };
                 l.store(at + 8, hi);
             }
             Instruction::SimdExt(a) => {
                 let at_d = offset_of!(Cpu, v) + a.rd as usize * 16;
                 let at_n = offset_of!(Cpu, v) + a.rn as usize * 16;
                 let at_m = offset_of!(Cpu, v) + a.rm as usize * 16;
-                let vn_lo = l.load(l.u64, at_n);
-                let vn_hi = l.load(l.u64, at_n + 8);
-                let vm_lo = l.load(l.u64, at_m);
-                let vm_hi = l.load(l.u64, at_m + 8);
+                let vn_lo = l.load(l.i64, at_n);
+                let vn_hi = l.load(l.i64, at_n + 8);
+                let vm_lo = l.load(l.i64, at_m);
+                let vm_hi = l.load(l.i64, at_m + 8);
                 let (lo, hi) = if a.imm == 0 {
                     (vn_lo, vn_hi)
                 } else if a.imm == 8 {
@@ -1289,16 +1283,16 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     let s = a.imm as u64 * 8;
                     let r = (8 - a.imm as u64) * 8;
                     let lo = l.bin(
-                        l.u64,
+                        l.i64,
                         B::BitOr,
-                        l.imm(l.u64, B::Shr, vn_lo, s),
-                        l.imm(l.u64, B::Shl, vn_hi, r),
+                        l.imm(l.i64, B::Shr, vn_lo, s),
+                        l.imm(l.i64, B::Shl, vn_hi, r),
                     );
                     let hi = l.bin(
-                        l.u64,
+                        l.i64,
                         B::BitOr,
-                        l.imm(l.u64, B::Shr, vn_hi, s),
-                        l.imm(l.u64, B::Shl, vm_lo, r),
+                        l.imm(l.i64, B::Shr, vn_hi, s),
+                        l.imm(l.i64, B::Shl, vm_lo, r),
                     );
                     (lo, hi)
                 } else {
@@ -1306,16 +1300,16 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     let s = shift * 8;
                     let r = (8 - shift) * 8;
                     let lo = l.bin(
-                        l.u64,
+                        l.i64,
                         B::BitOr,
-                        l.imm(l.u64, B::Shr, vn_hi, s),
-                        l.imm(l.u64, B::Shl, vm_lo, r),
+                        l.imm(l.i64, B::Shr, vn_hi, s),
+                        l.imm(l.i64, B::Shl, vm_lo, r),
                     );
                     let hi = l.bin(
-                        l.u64,
+                        l.i64,
                         B::BitOr,
-                        l.imm(l.u64, B::Shr, vm_lo, s),
-                        l.imm(l.u64, B::Shl, vm_hi, r),
+                        l.imm(l.i64, B::Shr, vm_lo, s),
+                        l.imm(l.i64, B::Shl, vm_hi, r),
                     );
                     (lo, hi)
                 };
@@ -1325,8 +1319,8 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
             Instruction::SimdCompareZero(a) => {
                 let at_n = offset_of!(Cpu, v) + a.rn as usize * 16;
                 let at_d = offset_of!(Cpu, v) + a.rd as usize * 16;
-                let vn_lo = l.load(l.u64, at_n);
-                let vn_hi = l.load(l.u64, at_n + 8);
+                let vn_lo = l.load(l.i64, at_n);
+                let vn_hi = l.load(l.i64, at_n + 8);
                 let ebits = (1u64 << a.size) * 8;
                 let emask = if ebits == 64 {
                     u64::MAX
@@ -1336,18 +1330,18 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 let halves = if a.q { 2 } else { 1 };
                 for half in 0..2 {
                     if half >= halves {
-                        l.store(at_d + half * 8, l.k(l.u64, 0));
+                        l.store(at_d + half * 8, l.k(l.i64, 0));
                         continue;
                     }
                     let v = if half == 0 { vn_lo } else { vn_hi };
-                    let mut acc = l.k(l.u64, 0);
+                    let mut acc = l.k(l.i64, 0);
                     let lanes = 8 >> a.size;
                     for lane in 0..lanes {
                         let shift = lane as u64 * ebits;
-                        let field = l.imm(l.u64, B::BitAnd, l.imm(l.u64, B::Shr, v, shift), emask);
-                        let is_zero = l.cmp(C::Eq, field, l.k(l.u64, 0));
-                        let bits = l.sel(l.u64, is_zero, l.k(l.u64, emask), l.k(l.u64, 0));
-                        acc = l.bin(l.u64, B::BitOr, acc, l.imm(l.u64, B::Shl, bits, shift));
+                        let field = l.imm(l.i64, B::BitAnd, l.imm(l.i64, B::Shr, v, shift), emask);
+                        let is_zero = l.cmp(C::Eq, field, l.k(l.i64, 0));
+                        let bits = l.sel(l.i64, is_zero, l.k(l.i64, emask), l.k(l.i64, 0));
+                        acc = l.bin(l.i64, B::BitOr, acc, l.imm(l.i64, B::Shl, bits, shift));
                     }
                     l.store(at_d + half * 8, acc);
                 }
@@ -1357,24 +1351,24 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 // byte selects a table byte; out-of-range indices leave zero for
                 // `tbl` and keep the destination byte for `tbx`.
                 let at_m = offset_of!(Cpu, v) + a.rm as usize * 16;
-                let vm_lo = l.load(l.u64, at_m);
-                let vm_hi = l.load(l.u64, at_m + 8);
+                let vm_lo = l.load(l.i64, at_m);
+                let vm_hi = l.load(l.i64, at_m + 8);
                 let regs = a.len as usize + 1;
                 let mut table = Vec::with_capacity(regs * 2);
                 for i in 0..regs {
                     let reg = (a.rn as usize + i) % 32;
                     let at = offset_of!(Cpu, v) + reg * 16;
-                    table.push(l.load(l.u64, at));
-                    table.push(l.load(l.u64, at + 8));
+                    table.push(l.load(l.i64, at));
+                    table.push(l.load(l.i64, at + 8));
                 }
                 let at_d = offset_of!(Cpu, v) + a.rd as usize * 16;
                 let old_lo = if a.extend {
-                    Some(l.load(l.u64, at_d))
+                    Some(l.load(l.i64, at_d))
                 } else {
                     None
                 };
                 let old_hi = if a.extend {
-                    Some(l.load(l.u64, at_d + 8))
+                    Some(l.load(l.i64, at_d + 8))
                 } else {
                     None
                 };
@@ -1382,37 +1376,37 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 let limit = (16 * regs) as u64;
                 for half in 0..2 {
                     if half >= halves {
-                        l.store(at_d + half * 8, l.k(l.u64, 0));
+                        l.store(at_d + half * 8, l.k(l.i64, 0));
                         continue;
                     }
                     let indices = if half == 0 { vm_lo } else { vm_hi };
                     let old = if half == 0 { old_lo } else { old_hi };
-                    let mut acc = l.k(l.u64, 0);
+                    let mut acc = l.k(l.i64, 0);
                     for byte in 0..8u64 {
                         let shift = byte * 8;
                         let index =
-                            l.imm(l.u64, B::BitAnd, l.imm(l.u64, B::Shr, indices, shift), 0xff);
-                        let in_range = l.cmp(C::Lt, index, l.k(l.u64, limit));
-                        let mut value = l.k(l.u64, 0);
-                        let sel = |c: Value, x: Value, y: Value| l.sel(l.u64, c, x, y);
+                            l.imm(l.i64, B::BitAnd, l.imm(l.i64, B::Shr, indices, shift), 0xff);
+                        let in_range = l.cmp(C::Ult, index, l.k(l.i64, limit));
+                        let mut value = l.k(l.i64, 0);
+                        let sel = |c: Value, x: Value, y: Value| l.sel(l.i64, c, x, y);
                         for (b, entry) in table.iter().enumerate() {
                             let here = l.cmp(
                                 C::Eq,
-                                l.bin(l.u64, B::Shr, index, l.k(l.u64, 3)),
-                                l.k(l.u64, b as u64),
+                                l.bin(l.i64, B::Shr, index, l.k(l.i64, 3)),
+                                l.k(l.i64, b as u64),
                             );
                             let byte_at = l.imm(
-                                l.u64,
+                                l.i64,
                                 B::BitAnd,
                                 l.bin(
-                                    l.u64,
+                                    l.i64,
                                     B::Shr,
                                     *entry,
                                     l.bin(
-                                        l.u64,
+                                        l.i64,
                                         B::Shl,
-                                        l.imm(l.u64, B::BitAnd, index, 7),
-                                        l.k(l.u64, 3),
+                                        l.imm(l.i64, B::BitAnd, index, 7),
+                                        l.k(l.i64, 3),
                                     ),
                                 ),
                                 0xff,
@@ -1425,14 +1419,14 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                                 in_range,
                                 value,
                                 l.imm(
-                                    l.u64,
+                                    l.i64,
                                     B::BitAnd,
-                                    l.imm(l.u64, B::Shr, old.unwrap(), shift),
+                                    l.imm(l.i64, B::Shr, old.unwrap(), shift),
                                     0xff,
                                 ),
                             );
                         }
-                        acc = l.bin(l.u64, B::BitOr, acc, l.imm(l.u64, B::Shl, value, shift));
+                        acc = l.bin(l.i64, B::BitOr, acc, l.imm(l.i64, B::Shl, value, shift));
                     }
                     l.store(at_d + half * 8, acc);
                 }
@@ -1440,28 +1434,28 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
             Instruction::SimdFmov(a) => {
                 // Pure bit move; no FP arithmetic involved.
                 if a.to_fp {
-                    let v = l.reg(l.u64, a.rn, true);
+                    let v = l.reg(l.i64, a.rn, true);
                     let bits = if a.double {
                         v
                     } else {
-                        l.imm(l.u64, B::BitAnd, v, 0xffff_ffff)
+                        l.imm(l.i64, B::BitAnd, v, 0xffff_ffff)
                     };
                     let at = offset_of!(Cpu, v) + a.rd as usize * 16;
                     l.store(at, bits);
-                    l.store(at + 8, l.k(l.u64, 0));
+                    l.store(at + 8, l.k(l.i64, 0));
                 } else {
                     let at = offset_of!(Cpu, v) + a.rn as usize * 16;
-                    let v = l.load(l.u64, at);
+                    let v = l.load(l.i64, at);
                     let bits = if a.double {
                         v
                     } else {
-                        l.imm(l.u64, B::BitAnd, v, 0xffff_ffff)
+                        l.imm(l.i64, B::BitAnd, v, 0xffff_ffff)
                     };
                     l.put(a.rd, bits);
                 }
             }
             Instruction::SimdAlu(a) => {
-                use crate::aarch64::decode::SimdAluOp;
+                use volt_target::aarch64::decode::SimdAluOp;
                 // Bitwise logical operations work on whole halves, lane width free.
                 if matches!(
                     a.op,
@@ -1486,36 +1480,36 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     };
                     let at_n = offset_of!(Cpu, v) + a.rn as usize * 16;
                     let at_d = offset_of!(Cpu, v) + a.rd as usize * 16;
-                    let vn_lo = l.load(l.u64, at_n);
-                    let vn_hi = l.load(l.u64, at_n + 8);
+                    let vn_lo = l.load(l.i64, at_n);
+                    let vn_hi = l.load(l.i64, at_n + 8);
                     let halves = if a.q { 2 } else { 1 };
                     let mut total = if a.op == SimdAluOp::UMinV {
-                        l.k(l.u64, emask)
+                        l.k(l.i64, emask)
                     } else {
-                        l.k(l.u64, 0)
+                        l.k(l.i64, 0)
                     };
                     for half in 0..halves {
                         let v = if half == 0 { vn_lo } else { vn_hi };
                         for lane in 0..(8 >> a.size) {
                             let shift = lane as u64 * ebits;
                             let field =
-                                l.imm(l.u64, B::BitAnd, l.imm(l.u64, B::Shr, v, shift), emask);
+                                l.imm(l.i64, B::BitAnd, l.imm(l.i64, B::Shr, v, shift), emask);
                             total = match a.op {
                                 SimdAluOp::UMinV => {
-                                    l.sel(l.u64, l.cmp(C::Lt, field, total), field, total)
+                                    l.sel(l.i64, l.cmp(C::Ult, field, total), field, total)
                                 }
                                 SimdAluOp::UMaxV => {
-                                    l.sel(l.u64, l.cmp(C::Gt, field, total), field, total)
+                                    l.sel(l.i64, l.cmp(C::Ugt, field, total), field, total)
                                 }
-                                _ => l.bin(l.u64, B::Add, total, field),
+                                _ => l.bin(l.i64, B::Add, total, field),
                             };
                         }
                     }
                     l.store(
                         at_d,
-                        l.bin(l.u64, B::BitAnd, total, l.k(l.u64, result_mask)),
+                        l.bin(l.i64, B::BitAnd, total, l.k(l.i64, result_mask)),
                     );
-                    l.store(at_d + 8, l.k(l.u64, 0));
+                    l.store(at_d + 8, l.k(l.i64, 0));
                 } else if matches!(
                     a.op,
                     SimdAluOp::And
@@ -1532,45 +1526,45 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     let at_d = offset_of!(Cpu, v) + a.rd as usize * 16;
                     for half in 0..2 {
                         if half == 1 && !a.q {
-                            l.store(at_d + 8, l.k(l.u64, 0));
+                            l.store(at_d + 8, l.k(l.i64, 0));
                             continue;
                         }
-                        let x = l.load(l.u64, at_n + half * 8);
-                        let y = l.load(l.u64, at_m + half * 8);
-                        let not = |v| l.bin(l.u64, B::BitXor, v, l.k(l.u64, u64::MAX));
+                        let x = l.load(l.i64, at_n + half * 8);
+                        let y = l.load(l.i64, at_m + half * 8);
+                        let not = |v| l.bin(l.i64, B::BitXor, v, l.k(l.i64, u64::MAX));
                         let r = match a.op {
-                            SimdAluOp::And => l.bin(l.u64, B::BitAnd, x, y),
-                            SimdAluOp::Bic => l.bin(l.u64, B::BitAnd, x, not(y)),
-                            SimdAluOp::Orr => l.bin(l.u64, B::BitOr, x, y),
-                            SimdAluOp::Orn => l.bin(l.u64, B::BitOr, x, not(y)),
-                            SimdAluOp::Eor => l.bin(l.u64, B::BitXor, x, y),
+                            SimdAluOp::And => l.bin(l.i64, B::BitAnd, x, y),
+                            SimdAluOp::Bic => l.bin(l.i64, B::BitAnd, x, not(y)),
+                            SimdAluOp::Orr => l.bin(l.i64, B::BitOr, x, y),
+                            SimdAluOp::Orn => l.bin(l.i64, B::BitOr, x, not(y)),
+                            SimdAluOp::Eor => l.bin(l.i64, B::BitXor, x, y),
                             // The destination is both a source mask and the
                             // merge base for BSL/BIT/BIF.
                             _ => {
-                                let d = l.load(l.u64, at_d + half * 8);
+                                let d = l.load(l.i64, at_d + half * 8);
                                 match a.op {
                                     SimdAluOp::Bsl => l.bin(
-                                        l.u64,
+                                        l.i64,
                                         B::BitOr,
-                                        l.bin(l.u64, B::BitAnd, x, d),
-                                        l.bin(l.u64, B::BitAnd, y, not(d)),
+                                        l.bin(l.i64, B::BitAnd, x, d),
+                                        l.bin(l.i64, B::BitAnd, y, not(d)),
                                     ),
                                     _ => {
                                         let selected = match a.op {
                                             SimdAluOp::Bit => l.bin(
-                                                l.u64,
+                                                l.i64,
                                                 B::BitAnd,
-                                                l.bin(l.u64, B::BitXor, d, x),
+                                                l.bin(l.i64, B::BitXor, d, x),
                                                 y,
                                             ),
                                             _ => l.bin(
-                                                l.u64,
+                                                l.i64,
                                                 B::BitAnd,
-                                                l.bin(l.u64, B::BitXor, d, x),
+                                                l.bin(l.i64, B::BitXor, d, x),
                                                 not(y),
                                             ),
                                         };
-                                        l.bin(l.u64, B::BitXor, d, selected)
+                                        l.bin(l.i64, B::BitXor, d, selected)
                                     }
                                 }
                             }
@@ -1581,10 +1575,10 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     let at_n = offset_of!(Cpu, v) + a.rn as usize * 16;
                     let at_m = offset_of!(Cpu, v) + a.rm as usize * 16;
                     let at_d = offset_of!(Cpu, v) + a.rd as usize * 16;
-                    let vn_lo = l.load(l.u64, at_n);
-                    let vn_hi = l.load(l.u64, at_n + 8);
-                    let vm_lo = l.load(l.u64, at_m);
-                    let vm_hi = l.load(l.u64, at_m + 8);
+                    let vn_lo = l.load(l.i64, at_n);
+                    let vn_hi = l.load(l.i64, at_n + 8);
+                    let vm_lo = l.load(l.i64, at_m);
+                    let vm_hi = l.load(l.i64, at_m + 8);
                     let need_d = matches!(a.op, SimdAluOp::Mla | SimdAluOp::Mls);
                     // Pairwise forms consume adjacent lanes of the full source pair:
                     // lane 0/1 of Vn and Vm, then lane 2/3, and so on.
@@ -1605,67 +1599,64 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                         let at_n = offset_of!(Cpu, v) + a.rn as usize * 16;
                         let at_m = offset_of!(Cpu, v) + a.rm as usize * 16;
                         let at_d = offset_of!(Cpu, v) + a.rd as usize * 16;
-                        let s64 = l.signed(Width::X64);
-                        let scmp =
-                            |op: C, x: Value, y: Value| l.cmp(op, l.cv(s64, x), l.cv(s64, y));
-                        let ssel = |c: Value, x: Value, y: Value| l.sel(l.u64, c, x, y);
+                        let ssel = |c: Value, x: Value, y: Value| l.sel(l.i64, c, x, y);
                         let sources = [
-                            l.load(l.u64, at_n),
-                            l.load(l.u64, at_n + 8),
-                            l.load(l.u64, at_m),
-                            l.load(l.u64, at_m + 8),
+                            l.load(l.i64, at_n),
+                            l.load(l.i64, at_n + 8),
+                            l.load(l.i64, at_m),
+                            l.load(l.i64, at_m + 8),
                         ];
                         // Each source is a 128-bit vector. Lane `2k` pairs with lane
                         // `2k + 1` and the result lands in lane `k`; the reduction of Vn
                         // fills the destination's low half and Vm its high half.
                         let per_source = (128 / ebits) as usize;
                         let reduced_lanes = per_source / 2;
-                        let mut out = [l.k(l.u64, 0); 2];
+                        let mut out = [l.k(l.i64, 0); 2];
                         for (which, half) in [(0usize, 0usize), (2usize, 1usize)] {
-                            let mut acc = l.k(l.u64, 0);
+                            let mut acc = l.k(l.i64, 0);
                             for k in 0..reduced_lanes {
                                 let lanes_per_dw = (64 / ebits) as usize;
                                 let read = |lane: usize| {
                                     let double = lane / lanes_per_dw;
                                     let shift = (lane % lanes_per_dw) as u64 * ebits;
                                     l.imm(
-                                        l.u64,
+                                        l.i64,
                                         B::BitAnd,
-                                        l.imm(l.u64, B::Shr, sources[which + double], shift),
+                                        l.imm(l.i64, B::Shr, sources[which + double], shift),
                                         emask,
                                     )
                                 };
                                 let lo = read(2 * k);
                                 let hi = read(2 * k + 1);
                                 let r = match a.op {
-                                    SimdAluOp::AddP => l.bin(l.u64, B::Add, lo, hi),
-                                    SimdAluOp::UMaxP => ssel(l.cmp(C::Gt, lo, hi), lo, hi),
-                                    SimdAluOp::UMinP => ssel(l.cmp(C::Lt, lo, hi), lo, hi),
-                                    SimdAluOp::SMaxP => ssel(scmp(C::Gt, lo, hi), lo, hi),
-                                    _ => ssel(scmp(C::Lt, lo, hi), lo, hi),
+                                    SimdAluOp::AddP => l.bin(l.i64, B::Add, lo, hi),
+                                    SimdAluOp::UMaxP => ssel(l.cmp(C::Ugt, lo, hi), lo, hi),
+                                    SimdAluOp::UMinP => ssel(l.cmp(C::Ult, lo, hi), lo, hi),
+                                    SimdAluOp::SMaxP => ssel(l.cmp(C::Sgt, lo, hi), lo, hi),
+                                    _ => ssel(l.cmp(C::Slt, lo, hi), lo, hi),
                                 };
-                                let masked = l.bin(l.u64, B::BitAnd, r, l.k(l.u64, emask));
+                                let masked = l.bin(l.i64, B::BitAnd, r, l.k(l.i64, emask));
                                 // per_source lanes reduce to exactly 64 bits, so the
                                 // reduced lanes always pack into one doubleword.
                                 acc = l.bin(
-                                    l.u64,
+                                    l.i64,
                                     B::BitOr,
                                     acc,
-                                    l.imm(l.u64, B::Shl, masked, k as u64 * ebits),
+                                    l.imm(l.i64, B::Shl, masked, k as u64 * ebits),
                                 );
                             }
                             out[half] = acc;
                         }
                         l.store(at_d, out[0]);
-                        l.store(at_d + 8, if a.q { out[1] } else { l.k(l.u64, 0) });
+                        l.store(at_d + 8, if a.q { out[1] } else { l.k(l.i64, 0) });
                     } else {
                         let vd_lo = if need_d {
-                            Some(l.load(l.u64, at_d))
+                            Some(l.load(l.i64, at_d))
                         } else {
                             None
                         };
                         let vd_hi = if need_d {
-                            Some(l.load(l.u64, at_d + 8))
+                            Some(l.load(l.i64, at_d + 8))
                         } else {
                             None
                         };
@@ -1675,126 +1666,119 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                         } else {
                             (1u64 << ebits) - 1
                         };
-                        let s64 = l.signed(Width::X64);
                         let smax = u64::MAX >> (65 - ebits);
                         let smin = !smax;
                         let halves = if a.q { 2 } else { 1 };
                         for half in 0..2 {
                             if half >= halves {
-                                l.store(at_d + half * 8, l.k(l.u64, 0));
+                                l.store(at_d + half * 8, l.k(l.i64, 0));
                                 continue;
                             }
                             let vn = if half == 0 { vn_lo } else { vn_hi };
                             let vm = if half == 0 { vm_lo } else { vm_hi };
                             let vd = if half == 0 { vd_lo } else { vd_hi };
-                            let mut acc = l.k(l.u64, 0);
+                            let mut acc = l.k(l.i64, 0);
                             let lanes = 8 >> a.size;
                             for lane in 0..lanes {
                                 let shift = lane as u64 * ebits;
                                 let fld = |v| {
-                                    l.imm(l.u64, B::BitAnd, l.imm(l.u64, B::Shr, v, shift), emask)
+                                    l.imm(l.i64, B::BitAnd, l.imm(l.i64, B::Shr, v, shift), emask)
                                 };
                                 let ext = |v: Value| {
-                                    let up = l.bin(s64, B::Shl, l.cv(s64, v), l.k(s64, 64 - ebits));
-                                    l.imm(s64, B::Shr, up, 64 - ebits)
+                                    let up = l.bin(l.i64, B::Shl, v, l.k(l.i64, 64 - ebits));
+                                    l.imm(l.i64, B::Sar, up, 64 - ebits)
                                 };
                                 let an = fld(vn);
                                 let bn = fld(vm);
                                 let sa = ext(an);
                                 let sb = ext(bn);
                                 let dn = vd.map(|v| fld(v));
-                                let scmp = |op: C, x: Value, y: Value| {
-                                    l.cmp(op, l.cv(s64, x), l.cv(s64, y))
-                                };
-                                let ssel = |c: Value, x: Value, y: Value| l.sel(l.u64, c, x, y);
+                                let ssel = |c: Value, x: Value, y: Value| l.sel(l.i64, c, x, y);
                                 let ssat = |v: Value| {
-                                    let over = scmp(C::Gt, v, l.k(l.u64, smax));
-                                    let under = scmp(C::Lt, v, l.k(l.u64, smin));
-                                    ssel(over, l.k(l.u64, smax), ssel(under, l.k(l.u64, smin), v))
+                                    let over = l.cmp(C::Sgt, v, l.k(l.i64, smax));
+                                    let under = l.cmp(C::Slt, v, l.k(l.i64, smin));
+                                    ssel(over, l.k(l.i64, smax), ssel(under, l.k(l.i64, smin), v))
                                 };
                                 let r = match a.op {
-                                    SimdAluOp::Add => l.bin(l.u64, B::Add, an, bn),
-                                    SimdAluOp::Sub => l.bin(l.u64, B::Sub, an, bn),
-                                    SimdAluOp::Mul => l.bin(l.u64, B::Mul, an, bn),
+                                    SimdAluOp::Add => l.bin(l.i64, B::Add, an, bn),
+                                    SimdAluOp::Sub => l.bin(l.i64, B::Sub, an, bn),
+                                    SimdAluOp::Mul => l.bin(l.i64, B::Mul, an, bn),
                                     SimdAluOp::Mla => l.bin(
-                                        l.u64,
+                                        l.i64,
                                         B::Add,
                                         dn.unwrap(),
-                                        l.bin(l.u64, B::Mul, an, bn),
+                                        l.bin(l.i64, B::Mul, an, bn),
                                     ),
                                     SimdAluOp::Mls => l.bin(
-                                        l.u64,
+                                        l.i64,
                                         B::Sub,
                                         dn.unwrap(),
-                                        l.bin(l.u64, B::Mul, an, bn),
+                                        l.bin(l.i64, B::Mul, an, bn),
                                     ),
                                     SimdAluOp::CmEq => {
-                                        ssel(l.cmp(C::Eq, an, bn), l.k(l.u64, emask), l.k(l.u64, 0))
+                                        ssel(l.cmp(C::Eq, an, bn), l.k(l.i64, emask), l.k(l.i64, 0))
                                     }
-                                    SimdAluOp::CmGt => {
-                                        ssel(scmp(C::Gt, sa, sb), l.k(l.u64, emask), l.k(l.u64, 0))
-                                    }
-                                    SimdAluOp::CmGe => {
-                                        ssel(scmp(C::Ge, sa, sb), l.k(l.u64, emask), l.k(l.u64, 0))
-                                    }
-                                    SimdAluOp::CmHi => {
-                                        ssel(l.cmp(C::Gt, an, bn), l.k(l.u64, emask), l.k(l.u64, 0))
-                                    }
-                                    SimdAluOp::CmHs => {
-                                        ssel(l.cmp(C::Ge, an, bn), l.k(l.u64, emask), l.k(l.u64, 0))
-                                    }
+                                    SimdAluOp::CmGt => ssel(
+                                        l.cmp(C::Sgt, sa, sb),
+                                        l.k(l.i64, emask),
+                                        l.k(l.i64, 0),
+                                    ),
+                                    SimdAluOp::CmGe => ssel(
+                                        l.cmp(C::Sge, sa, sb),
+                                        l.k(l.i64, emask),
+                                        l.k(l.i64, 0),
+                                    ),
+                                    SimdAluOp::CmHi => ssel(
+                                        l.cmp(C::Ugt, an, bn),
+                                        l.k(l.i64, emask),
+                                        l.k(l.i64, 0),
+                                    ),
+                                    SimdAluOp::CmHs => ssel(
+                                        l.cmp(C::Uge, an, bn),
+                                        l.k(l.i64, emask),
+                                        l.k(l.i64, 0),
+                                    ),
                                     SimdAluOp::CmTst => ssel(
                                         l.cmp(
                                             C::Ne,
-                                            l.bin(l.u64, B::BitAnd, an, bn),
-                                            l.k(l.u64, 0),
+                                            l.bin(l.i64, B::BitAnd, an, bn),
+                                            l.k(l.i64, 0),
                                         ),
-                                        l.k(l.u64, emask),
-                                        l.k(l.u64, 0),
+                                        l.k(l.i64, emask),
+                                        l.k(l.i64, 0),
                                     ),
-                                    SimdAluOp::UMin => ssel(l.cmp(C::Lt, an, bn), an, bn),
-                                    SimdAluOp::UMax => ssel(l.cmp(C::Gt, an, bn), an, bn),
-                                    SimdAluOp::SMin => ssel(scmp(C::Lt, sa, sb), an, bn),
-                                    SimdAluOp::SMax => ssel(scmp(C::Gt, sa, sb), an, bn),
+                                    SimdAluOp::UMin => ssel(l.cmp(C::Ult, an, bn), an, bn),
+                                    SimdAluOp::UMax => ssel(l.cmp(C::Ugt, an, bn), an, bn),
+                                    SimdAluOp::SMin => ssel(l.cmp(C::Slt, sa, sb), an, bn),
+                                    SimdAluOp::SMax => ssel(l.cmp(C::Sgt, sa, sb), an, bn),
                                     SimdAluOp::UAbd => {
-                                        let d = l.bin(l.u64, B::Sub, an, bn);
+                                        let d = l.bin(l.i64, B::Sub, an, bn);
                                         ssel(
-                                            l.cmp(C::Ge, an, bn),
+                                            l.cmp(C::Uge, an, bn),
                                             d,
-                                            l.bin(l.u64, B::Sub, l.k(l.u64, 0), d),
+                                            l.bin(l.i64, B::Sub, l.k(l.i64, 0), d),
                                         )
                                     }
                                     SimdAluOp::SAbd => {
-                                        let d = l.bin(s64, B::Sub, sa, sb);
-                                        let neg = l.bin(s64, B::Sub, l.k(s64, 0), d);
-                                        l.cv(
-                                            l.u64,
-                                            ssel(
-                                                scmp(C::Ge, sa, sb),
-                                                l.cv(l.u64, d),
-                                                l.cv(l.u64, neg),
-                                            ),
-                                        )
+                                        let d = l.bin(l.i64, B::Sub, sa, sb);
+                                        let neg = l.bin(l.i64, B::Sub, l.k(l.i64, 0), d);
+                                        ssel(l.cmp(C::Sge, sa, sb), d, neg)
                                     }
-                                    SimdAluOp::SQAdd => {
-                                        ssat(l.cv(l.u64, l.bin(s64, B::Add, sa, sb)))
-                                    }
+                                    SimdAluOp::SQAdd => ssat(l.bin(l.i64, B::Add, sa, sb)),
                                     SimdAluOp::UQAdd => {
-                                        let s = l.bin(l.u64, B::Add, an, bn);
-                                        let carry = l.cmp(C::Lt, s, an);
-                                        let big = l.cmp(C::Gt, s, l.k(l.u64, emask));
+                                        let s = l.bin(l.i64, B::Add, an, bn);
+                                        let carry = l.cmp(C::Ult, s, an);
+                                        let big = l.cmp(C::Ugt, s, l.k(l.i64, emask));
                                         ssel(
-                                            l.bin(l.u64, B::BitOr, carry, big),
-                                            l.k(l.u64, emask),
+                                            l.bin(l.i64, B::BitOr, carry, big),
+                                            l.k(l.i64, emask),
                                             s,
                                         )
                                     }
-                                    SimdAluOp::SQSub => {
-                                        ssat(l.cv(l.u64, l.bin(s64, B::Sub, sa, sb)))
-                                    }
+                                    SimdAluOp::SQSub => ssat(l.bin(l.i64, B::Sub, sa, sb)),
                                     SimdAluOp::UQSub => {
-                                        let borrow = l.cmp(C::Gt, bn, an);
-                                        ssel(borrow, l.k(l.u64, 0), l.bin(l.u64, B::Sub, an, bn))
+                                        let borrow = l.cmp(C::Ugt, bn, an);
+                                        ssel(borrow, l.k(l.i64, 0), l.bin(l.i64, B::Sub, an, bn))
                                     }
                                     SimdAluOp::SHAdd
                                     | SimdAluOp::UHAdd
@@ -1808,19 +1792,16 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                                         );
                                         // Signed forms operate on sign-extended lanes, which
                                         // keeps the halving shift meaningful for negatives.
-                                        let (op_a, op_b) = if signed_op {
-                                            (l.cv(l.u64, sa), l.cv(l.u64, sb))
-                                        } else {
-                                            (an, bn)
-                                        };
+                                        let (op_a, op_b) =
+                                            if signed_op { (sa, sb) } else { (an, bn) };
                                         let shr = |v: Value| {
                                             if signed_op {
-                                                l.cv(l.u64, l.imm(s64, B::Shr, l.cv(s64, v), 1))
+                                                l.imm(l.i64, B::Sar, v, 1)
                                             } else {
-                                                l.imm(l.u64, B::Shr, v, 1)
+                                                l.imm(l.i64, B::Shr, v, 1)
                                             }
                                         };
-                                        let k = l.bin(l.u64, B::Sub, shr(op_a), shr(op_b));
+                                        let k = l.bin(l.i64, B::Sub, shr(op_a), shr(op_b));
                                         let k = if matches!(
                                             a.op,
                                             SimdAluOp::SHAdd
@@ -1828,23 +1809,23 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                                                 | SimdAluOp::SRHAdd
                                                 | SimdAluOp::URHAdd
                                         ) {
-                                            l.bin(l.u64, B::Add, shr(op_a), shr(op_b))
+                                            l.bin(l.i64, B::Add, shr(op_a), shr(op_b))
                                         } else {
                                             k
                                         };
-                                        let a0 = l.bin(l.u64, B::BitAnd, op_a, l.k(l.u64, 1));
-                                        let b0 = l.bin(l.u64, B::BitAnd, op_b, l.k(l.u64, 1));
+                                        let a0 = l.bin(l.i64, B::BitAnd, op_a, l.k(l.i64, 1));
+                                        let b0 = l.bin(l.i64, B::BitAnd, op_b, l.k(l.i64, 1));
                                         let corr = match a.op {
                                             SimdAluOp::SHAdd | SimdAluOp::UHAdd => {
-                                                l.bin(l.u64, B::BitAnd, a0, b0)
+                                                l.bin(l.i64, B::BitAnd, a0, b0)
                                             }
                                             SimdAluOp::SRHAdd | SimdAluOp::URHAdd => {
-                                                l.bin(l.u64, B::BitOr, a0, b0)
+                                                l.bin(l.i64, B::BitOr, a0, b0)
                                             }
                                             _ => l.bin(
-                                                l.u64,
+                                                l.i64,
                                                 B::BitAnd,
-                                                l.bin(l.u64, B::BitXor, a0, l.k(l.u64, 1)),
+                                                l.bin(l.i64, B::BitXor, a0, l.k(l.i64, 1)),
                                                 b0,
                                             ),
                                         };
@@ -1855,9 +1836,9 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                                                 | SimdAluOp::SRHAdd
                                                 | SimdAluOp::URHAdd
                                         ) {
-                                            l.bin(l.u64, B::Add, k, corr)
+                                            l.bin(l.i64, B::Add, k, corr)
                                         } else {
-                                            l.bin(l.u64, B::Sub, k, corr)
+                                            l.bin(l.i64, B::Sub, k, corr)
                                         }
                                     }
                                     SimdAluOp::SSHl
@@ -1881,79 +1862,71 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                                         );
                                         // Shift amount: the lane's low byte, sign-extended to
                                         // 64 bits (negative means a right shift).
-                                        let amt = l.cv(
-                                            s64,
-                                            l.bin(
-                                                s64,
-                                                B::Shl,
-                                                l.cv(
-                                                    s64,
-                                                    l.bin(l.u64, B::BitAnd, bn, l.k(l.u64, 0xff)),
-                                                ),
-                                                l.k(s64, 56),
-                                            ),
+                                        let amt = l.bin(
+                                            l.i64,
+                                            B::Shl,
+                                            l.bin(l.i64, B::BitAnd, bn, l.k(l.i64, 0xff)),
+                                            l.k(l.i64, 56),
                                         );
-                                        let amt = l.cv(s64, l.bin(s64, B::Shr, amt, l.k(s64, 56)));
-                                        let left = scmp(C::Ge, amt, l.k(l.u64, 0));
+                                        let amt = l.bin(l.i64, B::Sar, amt, l.k(l.i64, 56));
+                                        let left = l.cmp(C::Sge, amt, l.k(l.i64, 0));
                                         let n = ssel(
                                             left,
-                                            l.cv(l.u64, amt),
-                                            l.cv(l.u64, l.bin(s64, B::Sub, l.k(s64, 0), amt)),
+                                            amt,
+                                            l.bin(l.i64, B::Sub, l.k(l.i64, 0), amt),
                                         );
-                                        let shl = |v: Value, k: Value| l.bin(l.u64, B::Shl, v, k);
-                                        let sar = |v: Value, k: Value| {
-                                            l.cv(l.u64, l.bin(s64, B::Shr, l.cv(s64, v), k))
-                                        };
-                                        let shr = |v: Value, k: Value| l.bin(l.u64, B::Shr, v, k);
+                                        let shl = |v: Value, k: Value| l.bin(l.i64, B::Shl, v, k);
+                                        let sar = |v: Value, k: Value| l.bin(l.i64, B::Sar, v, k);
+                                        let shr = |v: Value, k: Value| l.bin(l.i64, B::Shr, v, k);
                                         // Beyond the lane width: a plain right shift keeps the
                                         // sign fill (or zero), a rounding shift collapses to zero,
                                         // and a saturating left shift pins to the lane bound.
                                         let sign_fill = if signed_op {
                                             ssel(
-                                                scmp(C::Lt, sa, l.k(l.u64, 0)),
-                                                l.k(l.u64, emask),
-                                                l.k(l.u64, 0),
+                                                l.cmp(C::Slt, sa, l.k(l.i64, 0)),
+                                                l.k(l.i64, emask),
+                                                l.k(l.i64, 0),
                                             )
                                         } else {
-                                            l.k(l.u64, 0)
+                                            l.k(l.i64, 0)
                                         };
                                         let sat_fill = if signed_op {
                                             ssel(
-                                                scmp(C::Lt, sa, l.k(l.u64, 0)),
-                                                l.k(l.u64, smin),
-                                                l.k(l.u64, smax),
+                                                l.cmp(C::Slt, sa, l.k(l.i64, 0)),
+                                                l.k(l.i64, smin),
+                                                l.k(l.i64, smax),
                                             )
                                         } else {
-                                            l.k(l.u64, emask)
+                                            l.k(l.i64, emask)
                                         };
                                         let far = ssel(
                                             left,
-                                            if saturating { sat_fill } else { l.k(l.u64, 0) },
-                                            if rounding { l.k(l.u64, 0) } else { sign_fill },
+                                            if saturating { sat_fill } else { l.k(l.i64, 0) },
+                                            if rounding { l.k(l.i64, 0) } else { sign_fill },
                                         );
                                         // Shift when the amount stays inside the lane width.
                                         // Clamping to `ebits - 1` keeps the host shift defined.
                                         let kc = ssel(
-                                            l.cmp(C::Ge, n, l.k(l.u64, ebits)),
-                                            l.k(l.u64, ebits - 1),
+                                            l.cmp(C::Uge, n, l.k(l.i64, ebits)),
+                                            l.k(l.i64, ebits - 1),
                                             n,
                                         );
                                         let rnd = if rounding {
                                             shl(
-                                                l.k(l.u64, 1),
-                                                l.bin(l.u64, B::Sub, kc, l.k(l.u64, 1)),
+                                                l.k(l.i64, 1),
+                                                l.bin(l.i64, B::Sub, kc, l.k(l.i64, 1)),
                                             )
                                         } else {
-                                            l.k(l.u64, 0)
+                                            l.k(l.i64, 0)
                                         };
-                                        let opnd = if signed_op { l.cv(l.u64, sa) } else { an };
+                                        let opnd = if signed_op { sa } else { an };
                                         let t = if rounding {
                                             // The rounding constant must not leak out of the lane.
                                             l.bin(
-                                                l.u64,
+                                                l.i64,
                                                 B::BitAnd,
-                                                l.bin(l.u64, B::Add, opnd, rnd),
-                                                l.k(l.u64, emask),
+                                                l.bin(l.i64, B::Add, opnd, rnd),
+                                                l.k(l.i64, emask),
                                             )
                                         } else {
                                             opnd
@@ -1968,7 +1941,7 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                                         let shifted = shl(opnd, kc);
                                         let moved = ssel(left, shifted, right);
                                         let moved =
-                                            ssel(l.cmp(C::Ge, n, l.k(l.u64, ebits)), far, moved);
+                                            ssel(l.cmp(C::Uge, n, l.k(l.i64, ebits)), far, moved);
                                         if !saturating {
                                             moved
                                         } else if signed_op {
@@ -1983,33 +1956,33 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                                                 l.bin(
                                                     l.boolean,
                                                     B::BitOr,
-                                                    scmp(C::Gt, shifted, l.k(l.u64, smax)),
-                                                    scmp(C::Lt, shifted, l.k(l.u64, smin)),
+                                                    l.cmp(C::Sgt, shifted, l.k(l.i64, smax)),
+                                                    l.cmp(C::Slt, shifted, l.k(l.i64, smin)),
                                                 )
                                             };
                                             let sat = ssel(
-                                                scmp(C::Lt, sa, l.k(l.u64, 0)),
-                                                l.k(l.u64, smin),
-                                                l.k(l.u64, smax),
+                                                l.cmp(C::Slt, sa, l.k(l.i64, 0)),
+                                                l.k(l.i64, smin),
+                                                l.k(l.i64, smax),
                                             );
                                             ssel(left, ssel(ov, sat, moved), moved)
                                         } else {
                                             let ov = if ebits == 64 {
                                                 l.cmp(C::Ne, shr(shifted, kc), an)
                                             } else {
-                                                l.cmp(C::Gt, shifted, l.k(l.u64, emask))
+                                                l.cmp(C::Ugt, shifted, l.k(l.i64, emask))
                                             };
-                                            ssel(left, ssel(ov, l.k(l.u64, emask), moved), moved)
+                                            ssel(left, ssel(ov, l.k(l.i64, emask), moved), moved)
                                         }
                                     }
-                                    _ => l.k(l.u64, 0),
+                                    _ => l.k(l.i64, 0),
                                 };
-                                let masked = l.bin(l.u64, B::BitAnd, r, l.k(l.u64, emask));
+                                let masked = l.bin(l.i64, B::BitAnd, r, l.k(l.i64, emask));
                                 acc = l.bin(
-                                    l.u64,
+                                    l.i64,
                                     B::BitOr,
                                     acc,
-                                    l.imm(l.u64, B::Shl, masked, shift),
+                                    l.imm(l.i64, B::Shl, masked, shift),
                                 );
                             }
                             l.store(at_d + half * 8, acc);
@@ -2034,9 +2007,9 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     let (bytes, chunk_count) = if a.bytes == 16 { (16, 4) } else { (8, 2) };
                     let starts: [Value; 4] = [
                         address,
-                        l.imm(l.u64, B::Add, address, 8),
-                        l.imm(l.u64, B::Add, address, 16),
-                        l.imm(l.u64, B::Add, address, 24),
+                        l.imm(l.i64, B::Add, address, 8),
+                        l.imm(l.i64, B::Add, address, 16),
+                        l.imm(l.i64, B::Add, address, 24),
                     ];
                     // stores: (reg_offset_base, half) per chunk
                     let src: [(usize, u64); 4] = if bytes == 16 {
@@ -2055,17 +2028,17 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     if store {
                         for i in 0..chunk_count {
                             let host = hosts[i].unwrap();
-                            l.store_ptr(host, l.load(l.u64, src[i].0));
+                            l.store_ptr(host, l.load(l.i64, src[i].0));
                         }
                     } else {
                         for i in 0..chunk_count {
                             let host = hosts[i].unwrap();
-                            l.store(src[i].0, l.load_ptr(l.u64, host));
+                            l.store(src[i].0, l.load_ptr(l.i64, host));
                         }
                         // zero the untransferred half of each 128-bit register
                         if bytes == 8 {
-                            l.store(at_rt + 8, l.k(l.u64, 0));
-                            l.store(at_rt2 + 8, l.k(l.u64, 0));
+                            l.store(at_rt + 8, l.k(l.i64, 0));
+                            l.store(at_rt2 + 8, l.k(l.i64, 0));
                         }
                     }
                     if let Some((rn, value)) = post {
@@ -2100,8 +2073,8 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                         _ => Size::Double,
                     };
                     let chunk_count = if wide { 2 } else { 1 };
-                    let starts: [Value; 2] = [address, l.imm(l.u64, B::Add, address, 8)];
-                    let chunk_ty = l.uint((a.bytes.min(8) as u16) * 8);
+                    let starts: [Value; 2] = [address, l.imm(l.i64, B::Add, address, 8)];
+                    let chunk_ty = l.int((a.bytes.min(8) as u16) * 8);
                     let src: [usize; 2] = [at_rt, at_rt + 8];
                     let mut hosts: [Option<Value>; 2] = [None; 2];
                     for i in 0..chunk_count {
@@ -2114,20 +2087,20 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                     if store {
                         for i in 0..chunk_count {
                             let host = hosts[i].unwrap();
-                            l.store_ptr(host, l.cv(chunk_ty, l.load(l.u64, src[i])));
+                            l.store_ptr(host, l.cv(chunk_ty, l.load(l.i64, src[i])));
                         }
                     } else {
                         for i in 0..chunk_count {
                             let host = hosts[i].unwrap();
-                            l.store(src[i], l.cv(l.u64, l.load_ptr(chunk_ty, host)));
+                            l.store(src[i], l.cv(l.i64, l.load_ptr(chunk_ty, host)));
                         }
                         // Scalar loads zero the whole upper register, not just the
                         // untransferred half.
                         if a.bytes <= 8 {
-                            l.store(at_rt + 8, l.k(l.u64, 0));
+                            l.store(at_rt + 8, l.k(l.i64, 0));
                             if a.bytes < 8 {
                                 let kept = (1u64 << (a.bytes * 8)) - 1;
-                                let lo = l.imm(l.u64, B::BitAnd, l.load(l.u64, at_rt), kept);
+                                let lo = l.imm(l.i64, B::BitAnd, l.load(l.i64, at_rt), kept);
                                 l.store(at_rt, lo);
                             }
                         }
@@ -2142,23 +2115,29 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
                 }
             }
             Instruction::Nop
-            | Instruction::CacheOp
-            | Instruction::Dsb
-            | Instruction::Dmb
+            | Instruction::Hint(_)
+            | Instruction::Prefetch(_)
+            | Instruction::PrefetchLiteral(_)
+            | Instruction::CacheOp(_)
+            | Instruction::Dsb(_)
+            | Instruction::Dmb(_)
             | Instruction::Yield => {}
             Instruction::Wfe => l.trap(pc.wrapping_add(4), Trap::Wfe),
             Instruction::Brk(imm) => {
-                l.store(offset_of!(Cpu, address), l.k(l.u64, u64::from(imm)));
+                l.store(offset_of!(Cpu, address), l.k(l.i64, u64::from(imm)));
                 l.trap(pc, Trap::Brk)
             }
-            Instruction::Isb => l.trap(pc.wrapping_add(4), Trap::Isb),
-            Instruction::Tlbi => l.trap(pc.wrapping_add(4), Trap::Tlbi),
+            Instruction::Isb(_) => l.trap(pc.wrapping_add(4), Trap::Isb),
+            Instruction::Tlbi(_) => l.trap(pc.wrapping_add(4), Trap::Tlbi),
             Instruction::DcZva(rt) => {
-                l.store(offset_of!(Cpu, address), l.reg(l.u64, rt, true));
+                l.store(offset_of!(Cpu, address), l.reg(l.i64, rt, true));
                 l.trap(pc.wrapping_add(4), Trap::DcZva)
             }
             Instruction::Eret => l.trap(pc.wrapping_add(4), Trap::Eret),
-            Instruction::Svc => l.trap(pc.wrapping_add(4), Trap::Svc),
+            Instruction::Svc(imm) => {
+                l.store(offset_of!(Cpu, address), l.k(l.i64, u64::from(imm)));
+                l.trap(pc.wrapping_add(4), Trap::Svc)
+            }
             Instruction::Psci => l.trap(pc.wrapping_add(4), Trap::Psci),
             Instruction::Wfi => l.trap(pc.wrapping_add(4), Trap::Wfi),
         }
@@ -2168,7 +2147,7 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
         }
     }
     if !ended {
-        l.ret(l.k(l.u64, pc))
+        l.ret(l.k(l.i64, pc))
     }
     Ok(Block::new(native::compile_owned(l.f.into_inner())?))
 }
@@ -2178,7 +2157,7 @@ fn setup_pair(l: &Lower, address: Value, a: Pair) {
     setup_memory(l, address, a.size, a.rt, a.signed, a.op);
     l.store(
         offset_of!(Cpu, second_address),
-        l.imm(l.u64, B::Add, address, a.size as u64),
+        l.imm(l.i64, B::Add, address, a.size as u64),
     );
     l.byte(offset_of!(Cpu, second_width), a.size as u64);
     l.byte(offset_of!(Cpu, second_dest), a.rt2 as u64);
@@ -2186,7 +2165,7 @@ fn setup_pair(l: &Lower, address: Value, a: Pair) {
         l.byte(offset_of!(Cpu, second_signed), a.signed as u64)
     }
     if a.op == MemoryOp::Store {
-        l.store(offset_of!(Cpu, second_value), l.reg(l.u64, a.rt2, true))
+        l.store(offset_of!(Cpu, second_value), l.reg(l.i64, a.rt2, true))
     }
     l.byte(offset_of!(Cpu, second_pending), 1);
 }
@@ -2198,7 +2177,7 @@ fn setup_memory(l: &Lower, address: Value, size: Size, rt: u8, signed: SignExten
         l.byte(offset_of!(Cpu, load_signed), signed as u64)
     }
     if op == MemoryOp::Store {
-        l.store(offset_of!(Cpu, value), l.reg(l.u64, rt, true))
+        l.store(offset_of!(Cpu, value), l.reg(l.i64, rt, true))
     }
 }
 
@@ -2213,10 +2192,7 @@ fn lower_variable(l: &Lower, a: Variable) {
             match a.op {
                 VariableOp::Lsl => l.bin(t, B::Shl, lhs, distance),
                 VariableOp::Lsr => l.bin(t, B::Shr, lhs, distance),
-                VariableOp::Asr => {
-                    let s = l.signed(a.width);
-                    l.cv(t, l.bin(s, B::Shr, l.cv(s, lhs), l.cv(s, distance)))
-                }
+                VariableOp::Asr => l.bin(t, B::Sar, lhs, distance),
                 VariableOp::Ror => {
                     let back = l.imm(
                         t,
@@ -2240,12 +2216,11 @@ fn lower_variable(l: &Lower, a: Variable) {
             let by_zero = l.cmp(C::Eq, rhs, zero);
             if a.op == VariableOp::Udiv {
                 let safe = l.sel(t, by_zero, one, rhs);
-                l.sel(t, by_zero, zero, l.bin(t, B::Div, lhs, safe))
+                l.sel(t, by_zero, zero, l.bin(t, B::UDiv, lhs, safe))
             } else {
                 let minus_one = l.cmp(C::Eq, rhs, l.k(t, u64::MAX));
                 let safe = l.sel(t, minus_one, one, l.sel(t, by_zero, one, rhs));
-                let s = l.signed(a.width);
-                let quotient = l.cv(t, l.bin(s, B::Div, l.cv(s, lhs), l.cv(s, safe)));
+                let quotient = l.bin(t, B::SDiv, lhs, safe);
                 let negated = l.bin(t, B::Sub, zero, lhs);
                 l.sel(t, by_zero, zero, l.sel(t, minus_one, negated, quotient))
             }
@@ -2384,7 +2359,7 @@ fn lower_unary(l: &Lower, a: Unary) {
     }
 }
 fn lower_high(l: &Lower, a: MultiplyHigh) {
-    let t = l.u64;
+    let t = l.i64;
     let x = l.reg(t, a.rn, true);
     let y = l.reg(t, a.rm, true);
     let xl = l.imm(t, B::BitAnd, x, 0xffffffff);
@@ -2556,14 +2531,14 @@ fn lower_system(l: &Lower, a: System) {
         _ => None,
     };
     if let Some(level) = level {
-        let current = l.cv(l.u64, l.load(l.u8, at + offset_of!(CpuSystem, el)));
-        let at_level = l.cmp(C::Eq, current, l.k(l.u64, level));
+        let current = l.cv(l.i64, l.load(l.i8, at + offset_of!(CpuSystem, el)));
+        let at_level = l.cmp(C::Eq, current, l.k(l.i64, level));
         let live = if level <= 1 {
-            let el1 = l.cmp(C::Eq, current, l.k(l.u64, 1));
+            let el1 = l.cmp(C::Eq, current, l.k(l.i64, 1));
             let selected = l.cmp(
                 if level == 0 { C::Eq } else { C::Ne },
-                l.load(l.u8, at + offset_of!(CpuSystem, spsel)),
-                l.k(l.u8, 0),
+                l.load(l.i8, at + offset_of!(CpuSystem, spsel)),
+                l.k(l.i8, 0),
             );
             let el1_selected = l.bin(l.boolean, B::BitAnd, el1, selected);
             if level == 0 {
@@ -2581,32 +2556,32 @@ fn lower_system(l: &Lower, a: System) {
             l.addr(at + offset_of!(CpuSystem, sp_el) + level as usize * 8),
         );
         if a.read {
-            l.put(a.rt, l.load_ptr(l.u64, p))
+            l.put(a.rt, l.load_ptr(l.i64, p))
         } else {
-            l.store_ptr(p, l.reg(l.u64, a.rt, true))
+            l.store_ptr(p, l.reg(l.i64, a.rt, true))
         }
         return;
     }
     if let Some((el1, el2)) = vhe_banks(a.register) {
         // HCR_EL2.E2H: EL1 register names accessed from EL2 reach the EL2 banks.
-        let current = l.cv(l.u64, l.load(l.u8, at + offset_of!(CpuSystem, el)));
-        let el2_mode = l.cmp(C::Eq, current, l.k(l.u64, 2));
+        let current = l.cv(l.i64, l.load(l.i8, at + offset_of!(CpuSystem, el)));
+        let el2_mode = l.cmp(C::Eq, current, l.k(l.i64, 2));
         let e2h = l.cmp(
             C::Ne,
             l.imm(
-                l.u64,
+                l.i64,
                 B::BitAnd,
-                l.load(l.u64, at + offset_of!(CpuSystem, hcr_el2)),
+                l.load(l.i64, at + offset_of!(CpuSystem, hcr_el2)),
                 super::cpu::HCR_E2H,
             ),
-            l.k(l.u64, 0),
+            l.k(l.i64, 0),
         );
         let redirect = l.bin(l.boolean, B::BitAnd, el2_mode, e2h);
         let p = l.sel(l.ptr, redirect, l.addr(at + el2), l.addr(at + el1));
         if a.read {
-            l.put(a.rt, l.load_ptr(l.u64, p));
+            l.put(a.rt, l.load_ptr(l.i64, p));
         } else {
-            l.store_ptr(p, l.reg(l.u64, a.rt, true));
+            l.store_ptr(p, l.reg(l.i64, a.rt, true));
         }
         return;
     }
@@ -2614,9 +2589,9 @@ fn lower_system(l: &Lower, a: System) {
         CurrentEl => l.put(
             a.rt,
             l.imm(
-                l.u64,
+                l.i64,
                 B::Shl,
-                l.cv(l.u64, l.load(l.u8, at + offset_of!(CpuSystem, el))),
+                l.cv(l.i64, l.load(l.i8, at + offset_of!(CpuSystem, el))),
                 2,
             ),
         ),
@@ -2624,29 +2599,29 @@ fn lower_system(l: &Lower, a: System) {
             // PSTATE.PAN lives in bit 22 of the register form.
             let pan = at + offset_of!(CpuSystem, pan);
             if a.read {
-                l.put(a.rt, l.imm(l.u64, B::Shl, l.load(l.u64, pan), 22));
+                l.put(a.rt, l.imm(l.i64, B::Shl, l.load(l.i64, pan), 22));
             } else if a.register == PanSet {
-                l.store(pan, l.k(l.u64, u64::from(a.immediate & 1)));
+                l.store(pan, l.k(l.i64, u64::from(a.immediate & 1)));
             } else {
-                let bit = l.imm(l.u64, B::Shr, l.reg(l.u64, a.rt, true), 22);
-                l.store(pan, l.imm(l.u64, B::BitAnd, bit, 1));
+                let bit = l.imm(l.i64, B::Shr, l.reg(l.i64, a.rt, true), 22);
+                l.store(pan, l.imm(l.i64, B::BitAnd, bit, 1));
             }
         }
         RazWi | AppleZero => {
             if a.read {
-                l.put(a.rt, l.k(l.u64, 0));
+                l.put(a.rt, l.k(l.i64, 0));
             }
         }
         SpSel | SpSelSet => {
-            let selected = l.load(l.u8, at + offset_of!(CpuSystem, spsel));
+            let selected = l.load(l.i8, at + offset_of!(CpuSystem, spsel));
             if a.read {
-                l.put(a.rt, l.cv(l.u64, selected));
+                l.put(a.rt, l.cv(l.i64, selected));
                 return;
             }
             let new = if a.register == SpSelSet {
-                l.k(l.u8, u64::from(a.immediate & 1))
+                l.k(l.i8, u64::from(a.immediate & 1))
             } else {
-                l.cv(l.u8, l.imm(l.u64, B::BitAnd, l.reg(l.u64, a.rt, true), 1))
+                l.cv(l.i8, l.imm(l.i64, B::BitAnd, l.reg(l.i64, a.rt, true), 1))
             };
             // The live stack pointer belongs to bank `SP_EL1` when SPSel is 1
             // and `SP_EL0` when it is 0. Park it in its bank, then load the
@@ -2656,22 +2631,22 @@ fn lower_system(l: &Lower, a: System) {
             let bank = |select: Value| {
                 l.sel(
                     l.ptr,
-                    l.cmp(C::Ne, select, l.k(l.u8, 0)),
+                    l.cmp(C::Ne, select, l.k(l.i8, 0)),
                     l.addr(banks + 8),
                     l.addr(banks),
                 )
             };
-            let live = l.load(l.u64, Lower::reg_at(31));
+            let live = l.load(l.i64, Lower::reg_at(31));
             l.store_ptr(bank(selected), live);
-            let incoming = l.load_ptr(l.u64, bank(new));
+            let incoming = l.load_ptr(l.i64, bank(new));
             l.store(Lower::reg_at(31), incoming);
             l.store(at + offset_of!(CpuSystem, spsel), new);
         }
         DaifSet | DaifClear => {
             let p = at + offset_of!(CpuSystem, daif);
-            let before = l.load(l.u64, p);
+            let before = l.load(l.i64, p);
             let updated = l.imm(
-                l.u64,
+                l.i64,
                 if a.register == DaifSet {
                     B::BitOr
                 } else {
@@ -2688,14 +2663,14 @@ fn lower_system(l: &Lower, a: System) {
         }
         Nzcv => {
             if a.read {
-                l.put(a.rt, l.cv(l.u64, l.load(l.u32, offset_of!(Cpu, flags))))
+                l.put(a.rt, l.cv(l.i64, l.load(l.i32, offset_of!(Cpu, flags))))
             } else {
                 l.store(
                     offset_of!(Cpu, flags),
                     l.imm(
-                        l.u32,
+                        l.i32,
                         B::BitAnd,
-                        l.cv(l.u32, l.reg(l.u64, a.rt, true)),
+                        l.cv(l.i32, l.reg(l.i64, a.rt, true)),
                         0xf0000000,
                     ),
                 )
@@ -2703,35 +2678,35 @@ fn lower_system(l: &Lower, a: System) {
         }
         OslsrEl1 => {
             let either = l.bin(
-                l.u64,
+                l.i64,
                 B::BitOr,
-                l.load(l.u64, at + offset_of!(CpuSystem, oslar_el1)),
-                l.load(l.u64, at + offset_of!(CpuSystem, osdlr_el1)),
+                l.load(l.i64, at + offset_of!(CpuSystem, oslar_el1)),
+                l.load(l.i64, at + offset_of!(CpuSystem, osdlr_el1)),
             );
-            let locked = l.cmp(C::Ne, either, l.k(l.u64, 0));
-            l.put(a.rt, l.sel(l.u64, locked, l.k(l.u64, 2), l.k(l.u64, 0)));
+            let locked = l.cmp(C::Ne, either, l.k(l.i64, 0));
+            l.put(a.rt, l.sel(l.i64, locked, l.k(l.i64, 2), l.k(l.i64, 0)));
         }
         CcsidrEl1 => {
             // CSSELR bit 0 is InD, bits 3:1 the level - 1; L2 has no separate I-side.
             use super::identification::{CCSIDR_L1D, CCSIDR_L1I, CCSIDR_L2};
             let select = l.imm(
-                l.u64,
+                l.i64,
                 B::BitAnd,
-                l.load(l.u64, at + offset_of!(CpuSystem, csselr_el1)),
+                l.load(l.i64, at + offset_of!(CpuSystem, csselr_el1)),
                 0xf,
             );
-            let is = |n: u64| l.cmp(C::Eq, select, l.k(l.u64, n));
-            let l1_instruction = l.sel(l.u64, is(1), l.k(l.u64, CCSIDR_L1I), l.k(l.u64, CCSIDR_L2));
+            let is = |n: u64| l.cmp(C::Eq, select, l.k(l.i64, n));
+            let l1_instruction = l.sel(l.i64, is(1), l.k(l.i64, CCSIDR_L1I), l.k(l.i64, CCSIDR_L2));
             l.put(
                 a.rt,
-                l.sel(l.u64, is(0), l.k(l.u64, CCSIDR_L1D), l1_instruction),
+                l.sel(l.i64, is(0), l.k(l.i64, CCSIDR_L1D), l1_instruction),
             );
         }
         CntvTvalEl0 | CntpTvalEl0 => {
             // The timer value is the signed 32-bit distance to the compare value:
             // reads give the low 32 bits of `CVAL - count`, writes `CVAL = count + sext(value)`.
             // The physical timer shares the virtual count, as CNTVOFF_EL2 is zero without EL2.
-            let counter = l.load(l.u64, at + offset_of!(CpuSystem, cntvct_el0));
+            let counter = l.load(l.i64, at + offset_of!(CpuSystem, cntvct_el0));
             let compare = at
                 + if a.register == CntpTvalEl0 {
                     offset_of!(CpuSystem, cntp_cval_el0)
@@ -2739,37 +2714,37 @@ fn lower_system(l: &Lower, a: System) {
                     offset_of!(CpuSystem, cntv_cval_el0)
                 };
             if a.read {
-                let distance = l.bin(l.u64, B::Sub, l.load(l.u64, compare), counter);
-                l.put(a.rt, l.imm(l.u64, B::BitAnd, distance, 0xffff_ffff));
+                let distance = l.bin(l.i64, B::Sub, l.load(l.i64, compare), counter);
+                l.put(a.rt, l.imm(l.i64, B::BitAnd, distance, 0xffff_ffff));
             } else {
-                let delta = l.extend(l.reg(l.u64, a.rt, true), Extend::Sxtw);
-                l.store(compare, l.bin(l.u64, B::Add, counter, delta));
+                let delta = l.extend(l.reg(l.i64, a.rt, true), Extend::Sxtw);
+                l.store(compare, l.bin(l.i64, B::Add, counter, delta));
             }
         }
         CntpctEl0 => {
             // Writes are ignored: the counter is not writable from software.
             if a.read {
-                l.put(a.rt, l.load(l.u64, at + offset_of!(CpuSystem, cntvct_el0)));
+                l.put(a.rt, l.load(l.i64, at + offset_of!(CpuSystem, cntvct_el0)));
             }
         }
         IccIar1El1 => {
             // No group 1 interrupt is delivered by this model, so acknowledge reads spurious.
             if a.read {
-                l.put(a.rt, l.k(l.u64, 1023));
+                l.put(a.rt, l.k(l.i64, 1023));
             }
         }
         IccEoir1El1 => {}
         Daif => {
             let p = at + offset_of!(CpuSystem, daif);
             if a.read {
-                l.put(a.rt, l.imm(l.u64, B::Shl, l.load(l.u64, p), 6))
+                l.put(a.rt, l.imm(l.i64, B::Shl, l.load(l.i64, p), 6))
             } else {
                 l.store(
                     p,
                     l.imm(
-                        l.u64,
+                        l.i64,
                         B::BitAnd,
-                        l.imm(l.u64, B::Shr, l.reg(l.u64, a.rt, true), 6),
+                        l.imm(l.i64, B::Shr, l.reg(l.i64, a.rt, true), 6),
                         0xf,
                     ),
                 );
@@ -2777,32 +2752,32 @@ fn lower_system(l: &Lower, a: System) {
         }
         _ => {
             if let Some(constant) = super::identification::value(a.register) {
-                l.put(a.rt, l.k(l.u64, constant));
+                l.put(a.rt, l.k(l.i64, constant));
                 return;
             }
             let offset = system_offset(a.register).expect("decoded system register has storage");
             let p = at + offset;
             if a.read {
                 let v = if a.register == CntvCtlEl0 {
-                    let counter = l.load(l.u64, at + offset_of!(CpuSystem, cntvct_el0));
-                    let compare = l.load(l.u64, at + offset_of!(CpuSystem, cntv_cval_el0));
-                    let reached = l.cmp(C::Ge, counter, compare);
+                    let counter = l.load(l.i64, at + offset_of!(CpuSystem, cntvct_el0));
+                    let compare = l.load(l.i64, at + offset_of!(CpuSystem, cntv_cval_el0));
+                    let reached = l.cmp(C::Uge, counter, compare);
                     l.bin(
-                        l.u64,
+                        l.i64,
                         B::BitOr,
-                        l.load(l.u64, p),
-                        l.sel(l.u64, reached, l.k(l.u64, 4), l.k(l.u64, 0)),
+                        l.load(l.i64, p),
+                        l.sel(l.i64, reached, l.k(l.i64, 4), l.k(l.i64, 0)),
                     )
                 } else {
-                    l.load(l.u64, p)
+                    l.load(l.i64, p)
                 };
                 l.put(a.rt, v);
             } else {
-                let from = l.reg(l.u64, a.rt, true);
+                let from = l.reg(l.i64, a.rt, true);
                 l.store(
                     p,
                     if a.register == CntvCtlEl0 {
-                        l.imm(l.u64, B::BitAnd, from, 3)
+                        l.imm(l.i64, B::BitAnd, from, 3)
                     } else {
                         from
                     },
@@ -2845,6 +2820,169 @@ mod tests {
         cpu.x[1] = u64::MAX;
         block.run(&mut cpu);
         assert_eq!(cpu.x[3], 1 << 63);
+    }
+    #[test]
+    fn signed_and_unsigned_integer_ops_select_distinct_semantics() {
+        // sdiv/udiv/asrv (w and x), smulh/umulh, sxtw, sbfx, asr #imm, then
+        // `cmp` + `cset` for each signed/unsigned condition on w and x.
+        let words = [
+            0x1ac10c02, 0x1ac10803, 0x1ac12804, 0x9ac12805, 0x9b417c06, 0x9bc17c07, 0x93407c08,
+            0x93442c09, 0x13037c0a, 0x6b01001f, 0x1a9fa7eb, 0x1a9fb7ec, 0x1a9f27ed, 0x1a9f97ee,
+            0x1a9fd7ef, 0x1a9fc7f0, 0x1a9f87f1, 0xeb01001f, 0x9a9fa7f2, 0x9a9f27f3, 0x9a9fd7f4,
+        ];
+        let block = compile(0, &bytes(&words)).unwrap();
+        let pairs: [(u64, u64); 9] = [
+            (0xffff_ffff_8000_0005, 3),
+            (0x8000_0000, 0xffff_ffff),
+            (0x7fff_ffff_ffff_ffff, 0x8000_0000_0000_0000),
+            (0x8000_0000_0000_0000, u64::MAX),
+            (3, 0),
+            (7, 7),
+            (0xffff_ffff_0000_0007, 0x0000_0001_0000_0009),
+            (0x8000_0001, 2),
+            (2, 0x8000_0001),
+        ];
+        for (a, b) in pairs {
+            let mut cpu = Cpu::default();
+            cpu.x[0] = a;
+            cpu.x[1] = b;
+            block.run(&mut cpu);
+            let (w, wb) = (a as u32, b as u32);
+            let (sw, swb) = (w as i32, wb as i32);
+            let sdiv = if wb == 0 {
+                0
+            } else {
+                sw.wrapping_div(swb) as u32
+            };
+            let udiv = if wb == 0 { 0 } else { w / wb };
+            assert_eq!(cpu.x[2], sdiv as u64, "sdiv w {a:#x} {b:#x}");
+            assert_eq!(cpu.x[3], udiv as u64, "udiv w {a:#x} {b:#x}");
+            assert_eq!(cpu.x[4], (sw >> (wb & 31)) as u32 as u64, "asr w");
+            assert_eq!(cpu.x[5], ((a as i64) >> (b & 63)) as u64, "asr x");
+            assert_eq!(
+                cpu.x[6],
+                ((a as i64 as i128 * b as i64 as i128) >> 64) as u64,
+                "smulh"
+            );
+            assert_eq!(cpu.x[7], ((a as u128 * b as u128) >> 64) as u64, "umulh");
+            assert_eq!(cpu.x[8], w as i32 as i64 as u64, "sxtw");
+            assert_eq!(cpu.x[9], ((a >> 4) as u8) as i8 as i64 as u64, "sbfx");
+            assert_eq!(cpu.x[10], (sw >> 3) as u32 as u64, "asr w imm");
+            // Registers 11-17 come from the 32-bit compare, 18-20 from the 64-bit one.
+            let w_flags = [
+                sw < swb,
+                sw >= swb,
+                w < wb,
+                w > wb,
+                sw > swb,
+                sw <= swb,
+                w <= wb,
+            ];
+            for (i, want) in w_flags.into_iter().enumerate() {
+                assert_eq!(cpu.x[11 + i], want as u64, "w cond {i} {a:#x} {b:#x}");
+            }
+            let (sa, sb) = (a as i64, b as i64);
+            assert_eq!(cpu.x[18], (sa < sb) as u64, "x lt");
+            assert_eq!(cpu.x[19], (a < b) as u64, "x lo");
+            assert_eq!(cpu.x[20], (sa > sb) as u64, "x gt");
+        }
+    }
+    #[test]
+    fn signed_and_unsigned_vector_lanes_select_distinct_semantics() {
+        // smax.16b, sabd.8h, shadd.4s, sshl.4s, sqadd.16b, cmgt.2d, cmhi.2d.
+        let words = [
+            0x4e216403, 0x4e617404, 0x4ea10405, 0x4ea14406, 0x4e210c07, 0x4ee13409, 0x6ee1340a,
+        ];
+        let block = compile(0, &bytes(&words)).unwrap();
+        let a: [u8; 16] = [
+            0x80, 0x7f, 0x01, 0xff, 0x10, 0x90, 0x00, 0x7e, 0x85, 0x05, 0xfe, 0x40, 0x7f, 0x80,
+            0xc0, 0x20,
+        ];
+        let b: [u8; 16] = [
+            0x01, 0x80, 0xff, 0x01, 0x90, 0x10, 0x00, 0x7f, 0x05, 0x85, 0x02, 0xc0, 0x7f, 0x7f,
+            0x40, 0xe0,
+        ];
+        let pack = |x: [u8; 16]| {
+            let v = u128::from_le_bytes(x);
+            [v as u64, (v >> 64) as u64]
+        };
+        let mut cpu = Cpu::default();
+        cpu.v[0] = pack(a);
+        cpu.v[1] = pack(b);
+        block.run(&mut cpu);
+        let out =
+            |r: usize| (u128::from(cpu.v[r][1]) << 64 | u128::from(cpu.v[r][0])).to_le_bytes();
+        let lanes16 = |x: [u8; 16]| -> Vec<i16> {
+            x.chunks(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        };
+        let lanes32 = |x: [u8; 16]| -> Vec<i32> {
+            x.chunks(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        // smax.16b
+        let want: Vec<u8> = (0..16)
+            .map(|i| (a[i] as i8).max(b[i] as i8) as u8)
+            .collect();
+        assert_eq!(out(3).to_vec(), want, "smax");
+        // sabd.8h
+        let want: Vec<u8> = lanes16(a)
+            .iter()
+            .zip(lanes16(b))
+            .flat_map(|(x, y)| ((*x as i32 - y as i32).unsigned_abs() as u16).to_le_bytes())
+            .collect();
+        assert_eq!(out(4).to_vec(), want, "sabd");
+        // shadd.4s
+        let want: Vec<u8> = lanes32(a)
+            .iter()
+            .zip(lanes32(b))
+            .flat_map(|(x, y)| (((*x as i64 + y as i64) >> 1) as i32).to_le_bytes())
+            .collect();
+        assert_eq!(out(5).to_vec(), want, "shadd");
+        // sshl.4s: the shift amount is the signed low byte of each lane of b.
+        let want: Vec<u8> = lanes32(a)
+            .iter()
+            .zip(lanes32(b))
+            .flat_map(|(x, y)| {
+                let n = y as i8 as i32;
+                let r = if n >= 32 {
+                    0
+                } else if n >= 0 {
+                    x << n
+                } else if n > -32 {
+                    x >> -n
+                } else if *x < 0 {
+                    -1
+                } else {
+                    0
+                };
+                r.to_le_bytes()
+            })
+            .collect();
+        assert_eq!(out(6).to_vec(), want, "sshl");
+        // sqadd.16b
+        let want: Vec<u8> = (0..16)
+            .map(|i| (a[i] as i8).saturating_add(b[i] as i8) as u8)
+            .collect();
+        assert_eq!(out(7).to_vec(), want, "sqadd");
+        // cmgt.2d / cmhi.2d
+        for (r, signed) in [(9, true), (10, false)] {
+            for lane in 0..2 {
+                let (x, y) = (cpu.v[0][lane], cpu.v[1][lane]);
+                let gt = if signed {
+                    (x as i64) > (y as i64)
+                } else {
+                    x > y
+                };
+                assert_eq!(
+                    cpu.v[r][lane],
+                    if gt { u64::MAX } else { 0 },
+                    "cmp {r} {lane}"
+                );
+            }
+        }
     }
     #[test]
     fn pair_post_index_records_deferred_access_and_writeback() {

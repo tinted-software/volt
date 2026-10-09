@@ -2,6 +2,75 @@
 //! of the function printer. Values and blocks are named positionally (`v{n}`,
 //! `block{n}`); the parser creates them in textual order and resolves
 //! references by number. Ported from `vulcan/libs/vulcan-ir/parser.zig`.
+//!
+//! # Memory accesses
+//!
+//! `load` and `store` take optional modifier words (the `MemFlags`) between the mnemonic
+//! and the operands. Each may appear at most once, in any order; the canonical order
+//! (the one a printer writes) is:
+//!
+//! ```text
+//! let v1 = load [volatile] [atomic <ordering>] [align <n>] [be|le] <ty>, <ptr>
+//! store [volatile] [atomic <ordering>] [align <n>] [be|le] <value>, <ptr>
+//! ```
+//!
+//! - `volatile`: the access may not be removed, merged or reordered.
+//! - `atomic <ordering>`: `relaxed`, `acquire`, `release`, `seq_cst` (loads take
+//!   relaxed/acquire/seq_cst, stores relaxed/release/seq_cst; `acq_rel` parses but does not
+//!   verify on a load or store).
+//! - `align <n>`: the address is aligned to `n` bytes (a power of two).
+//! - `be` / `le`: big / little endian memory image; omitted means native.
+//!
+//! # Signedness lives on the operation
+//!
+//! Integer types are plain `iN` (there is no `uN`); an operation decides whether it reads its
+//! operands as signed or unsigned. Binary operators are infix (`let v2 = v0 <op> v1`, or
+//! `v0 <op> <integer literal>` for the immediate form); the signed / unsigned variant of an
+//! operator is the same spelling with an `s` / `u` suffix:
+//!
+//! ```text
+//! + - * & | ^ << >>     add sub mul and or xor shl, logical shift right (integer)
+//! / %                   FLOAT division / remainder only
+//! /u /s  %u %s          unsigned / signed integer division / remainder
+//! >>s                   arithmetic shift right (integer)
+//! *hu *hs               high half of the unsigned / signed double-width product
+//! == !=                 equality of any scalar
+//! < <= > >=             FLOAT ordered comparison only
+//! <s <=s >s >=s         signed integer comparison
+//! <u <=u >u >=u         unsigned integer / pointer comparison
+//! ```
+//!
+//! Conversions name the kind first, then the result type:
+//!
+//! ```text
+//! let v1 = convert <kind> <ty>, v0
+//! ```
+//!
+//! with `kind` one of `trunc zext sext sitofp uitofp fptosi fptoui fpresize` (the legal type
+//! pairs of each are listed on `ConvertKind`). A same-width integer cast does not exist.
+//!
+//! `dot` and the atomic min/max spell the signedness as a word:
+//!
+//! ```text
+//! let v3 = dot signed|unsigned v0, v1, v2
+//! let v2 = atomic_rmw add|smin|smax|umin|umax|bit_and|bit_or|bit_xor|exchange <scope> <order> v0, v1
+//! ```
+//!
+//! Words naming a `BinOp` (`reduce add, v0`) are `add sub mul div rem udiv sdiv urem srem
+//! bit_and bit_or bit_xor shl shr sar umulh smulh`.
+//!
+//! # Intrinsics
+//!
+//! An intrinsic is a target-defined operation named by a dotted identifier:
+//!
+//! ```text
+//! let v2 = intrinsic <ty> @aarch64.aese(v0, v1) [imm <n>] [pure]
+//! intrinsic @aarch64.dmb() [imm <n>] [pure]
+//! ```
+//!
+//! `imm` is the one signed immediate operand (omitted means 0, and the printer omits it
+//! then). `pure` marks the intrinsic free of side effects (`Intrinsic::side_effects ==
+//! false`); without it the intrinsic is assumed to have side effects.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -9,10 +78,10 @@ use alloc::vec::Vec;
 use super::attribute::{AttrValue, Attribute, Custom, Endianness};
 use super::function::{
     Alloca, Arith, AtomicOp, AtomicOrdering, AtomicRmw, AtomicScope, AttrTarget, BarrierScope,
-    BinOp, Block, Call, CallIndirect, CmpOp, Compare, Convert, EdgeDesc, Extract, Function,
-    GlobalAddr, InputSigns, Load, LowFloatConvert, MatMul, MatMulQuant, MatMulQuantOut,
-    MatMulScale, MatMulType, NvFp4Convert, Opcode, Reduce, Ret, RetPiece, Select, Terminator,
-    Unary, UnaryOp, Value,
+    BinOp, Block, Call, CallIndirect, CmpOp, Compare, ConvertKind, EdgeDesc, Extract, Function,
+    GlobalAddr, InputSigns, LowFloatConvert, MatMul, MatMulQuant, MatMulQuantOut, MatMulScale,
+    MatMulType, MemFlags, NvFp4Convert, Opcode, Reduce, Ret, RetPiece, Select, Terminator, Unary,
+    UnaryOp, Value,
 };
 use super::low_float::Format as LowFloatFormat;
 use super::nvfp4::ScaleApplication;
@@ -42,20 +111,45 @@ impl From<types::ParseError> for ParseError {
     }
 }
 
-/// Map a leading character to a binary arithmetic operator, if it is one.
-fn arith_op_of(c: u8) -> Option<BinOp> {
-    match c {
-        b'+' => Some(BinOp::Add),
-        b'-' => Some(BinOp::Sub),
-        b'*' => Some(BinOp::Mul),
-        b'/' => Some(BinOp::Div),
-        b'%' => Some(BinOp::Rem),
-        b'&' => Some(BinOp::BitAnd),
-        b'|' => Some(BinOp::BitOr),
-        b'^' => Some(BinOp::BitXor),
-        _ => None,
-    }
-}
+/// The infix spellings of the binary operators. A spelling that is a prefix of another
+/// (`>>` of `>>s`, `*` of `*hu`) comes after it, so the first match wins.
+const ARITH_OPS: [(&str, BinOp); 17] = [
+    ("<<", BinOp::Shl),
+    (">>s", BinOp::Sar),
+    (">>", BinOp::Shr),
+    ("*hu", BinOp::UMulh),
+    ("*hs", BinOp::SMulh),
+    ("/u", BinOp::UDiv),
+    ("/s", BinOp::SDiv),
+    ("%u", BinOp::URem),
+    ("%s", BinOp::SRem),
+    ("+", BinOp::Add),
+    ("-", BinOp::Sub),
+    ("*", BinOp::Mul),
+    ("/", BinOp::Div),
+    ("%", BinOp::Rem),
+    ("&", BinOp::BitAnd),
+    ("|", BinOp::BitOr),
+    ("^", BinOp::BitXor),
+];
+
+/// The infix spellings of the comparisons, ordered like [`ARITH_OPS`].
+const CMP_OPS: [(&str, CmpOp); 14] = [
+    ("==", CmpOp::Eq),
+    ("!=", CmpOp::Ne),
+    ("<=s", CmpOp::Sle),
+    ("<=u", CmpOp::Ule),
+    ("<=", CmpOp::Le),
+    ("<s", CmpOp::Slt),
+    ("<u", CmpOp::Ult),
+    ("<", CmpOp::Lt),
+    (">=s", CmpOp::Sge),
+    (">=u", CmpOp::Uge),
+    (">=", CmpOp::Ge),
+    (">s", CmpOp::Sgt),
+    (">u", CmpOp::Ugt),
+    (">", CmpOp::Gt),
+];
 
 /// Parse a function from its text form. The returned function owns its memory.
 pub fn parse(text: &str) -> Result<Function, ParseError> {
@@ -132,7 +226,7 @@ fn all_digits(s: &[u8]) -> bool {
     !s.is_empty() && s.iter().all(|&c| is_digit(c))
 }
 
-/// BinOp from its printer word (`add`, `sub`, `bit_and`, ...). The text is untrusted,
+/// BinOp from its word (`add`, `sub`, `bit_and`, `udiv`, ...). The text is untrusted,
 /// so an unknown op word is a parse error, never an invalid enum.
 fn bin_op_of(word: &str) -> Option<BinOp> {
     match word {
@@ -141,12 +235,32 @@ fn bin_op_of(word: &str) -> Option<BinOp> {
         "mul" => Some(BinOp::Mul),
         "div" => Some(BinOp::Div),
         "rem" => Some(BinOp::Rem),
+        "udiv" => Some(BinOp::UDiv),
+        "sdiv" => Some(BinOp::SDiv),
+        "urem" => Some(BinOp::URem),
+        "srem" => Some(BinOp::SRem),
         "bit_and" => Some(BinOp::BitAnd),
         "bit_or" => Some(BinOp::BitOr),
         "bit_xor" => Some(BinOp::BitXor),
         "shl" => Some(BinOp::Shl),
         "shr" => Some(BinOp::Shr),
-        "mulh" => Some(BinOp::Mulh),
+        "sar" => Some(BinOp::Sar),
+        "umulh" => Some(BinOp::UMulh),
+        "smulh" => Some(BinOp::SMulh),
+        _ => None,
+    }
+}
+
+fn convert_kind_of(word: &str) -> Option<ConvertKind> {
+    match word {
+        "trunc" => Some(ConvertKind::Trunc),
+        "zext" => Some(ConvertKind::Zext),
+        "sext" => Some(ConvertKind::Sext),
+        "sitofp" => Some(ConvertKind::SiToFp),
+        "uitofp" => Some(ConvertKind::UiToFp),
+        "fptosi" => Some(ConvertKind::FpToSi),
+        "fptoui" => Some(ConvertKind::FpToUi),
+        "fpresize" => Some(ConvertKind::FpResize),
         _ => None,
     }
 }
@@ -209,8 +323,10 @@ fn barrier_scope_of(word: &str) -> Option<BarrierScope> {
 fn atomic_op_of(word: &str) -> Option<AtomicOp> {
     match word {
         "add" => Some(AtomicOp::Add),
-        "min" => Some(AtomicOp::Min),
-        "max" => Some(AtomicOp::Max),
+        "smin" => Some(AtomicOp::SMin),
+        "smax" => Some(AtomicOp::SMax),
+        "umin" => Some(AtomicOp::UMin),
+        "umax" => Some(AtomicOp::UMax),
         "bit_and" => Some(AtomicOp::BitAnd),
         "bit_or" => Some(AtomicOp::BitOr),
         "bit_xor" => Some(AtomicOp::BitXor),
@@ -542,20 +658,6 @@ impl<'a> FunctionParser<'a> {
             let align = u32::try_from(n).map_err(|_| ParseError::InvalidSyntax)?;
             return Ok(Attribute::Align(align));
         }
-        if word == "endian" {
-            self.eat(b'(')?;
-            let e = self.read_word().to_string();
-            self.eat(b')')?;
-            // The text is UNTRUSTED, so an unknown order is a parse error and never an
-            // invalid enum.
-            let order = match e.as_str() {
-                "little" => Endianness::Little,
-                "big" => Endianness::Big,
-                "native" => Endianness::Native,
-                _ => return Err(ParseError::InvalidSyntax),
-            };
-            return Ok(Attribute::Endian(order));
-        }
         // Namespaced: `namespace.key` with an optional `= value`. A namespace may itself
         // hold dots (`vulcan.gpu` is the one the whole GPU path uses), so read the full
         // dotted path and split it at the LAST dot: everything before it is the
@@ -715,6 +817,13 @@ impl<'a> FunctionParser<'a> {
                     return Err(ParseError::InvalidSyntax);
                 }
                 self.parse_void_call(block)?;
+            } else if word == "intrinsic" {
+                if !pending.is_empty() {
+                    return Err(ParseError::InvalidSyntax);
+                }
+                let (name, args, imm, side_effects) = self.parse_intrinsic_body()?;
+                self.func
+                    .append_intrinsic_void(block, &name, &args, imm, side_effects);
             } else if word == "call_indirect" {
                 if !pending.is_empty() {
                     return Err(ParseError::InvalidSyntax);
@@ -889,36 +998,24 @@ impl<'a> FunctionParser<'a> {
             .map_err(|_| ParseError::InvalidSyntax)
     }
 
+    /// Consume the binary arithmetic operator at the cursor, if there is one.
+    fn read_arith_op(&mut self) -> Option<BinOp> {
+        let rest = &self.src[self.pos..];
+        let (text, op) = ARITH_OPS
+            .iter()
+            .find(|(text, _)| rest.starts_with(text.as_bytes()))?;
+        self.pos += text.len();
+        Some(*op)
+    }
+
     fn read_cmp_op(&mut self) -> Result<CmpOp, ParseError> {
-        match self.peek().ok_or(ParseError::InvalidSyntax)? {
-            b'=' => {
-                self.eat(b'=')?;
-                self.eat(b'=')?;
-                Ok(CmpOp::Eq)
-            }
-            b'!' => {
-                self.eat(b'!')?;
-                self.eat(b'=')?;
-                Ok(CmpOp::Ne)
-            }
-            b'<' => {
-                self.pos += 1;
-                Ok(if self.try_char(b'=') {
-                    CmpOp::Le
-                } else {
-                    CmpOp::Lt
-                })
-            }
-            b'>' => {
-                self.pos += 1;
-                Ok(if self.try_char(b'=') {
-                    CmpOp::Ge
-                } else {
-                    CmpOp::Gt
-                })
-            }
-            _ => Err(ParseError::InvalidSyntax),
-        }
+        let rest = &self.src[self.pos..];
+        let (text, op) = CMP_OPS
+            .iter()
+            .find(|(text, _)| rest.starts_with(text.as_bytes()))
+            .ok_or(ParseError::InvalidSyntax)?;
+        self.pos += text.len();
+        Ok(*op)
     }
 
     fn parse_let(&mut self, block: Block) -> Result<Value, ParseError> {
@@ -953,17 +1050,7 @@ impl<'a> FunctionParser<'a> {
                 return Ok(result);
             }
             self.skip_ws();
-            let rest = &self.src[self.pos..];
-            if rest.starts_with(b"<<") {
-                self.pos += 2;
-                return self.finish_arith(block, lhs, BinOp::Shl);
-            }
-            if rest.starts_with(b">>") {
-                self.pos += 2;
-                return self.finish_arith(block, lhs, BinOp::Shr);
-            }
-            if let Some(bop) = arith_op_of(self.peek().unwrap_or(0)) {
-                self.pos += 1;
+            if let Some(bop) = self.read_arith_op() {
                 return self.finish_arith(block, lhs, bop);
             }
             let op = self.read_cmp_op()?;
@@ -978,21 +1065,24 @@ impl<'a> FunctionParser<'a> {
         }
         let op = self.read_word().to_string();
         if op == "load" {
-            let is_volatile = self.try_word("volatile");
+            let mem = self.parse_mem_flags()?;
             self.skip_ws();
             let ty = self.parse_type()?;
             self.skip_ws();
             self.eat(b',')?;
             self.skip_ws();
             let ptr = self.parse_value_ref()?;
-            let result = self.func.append_inst(
-                block,
-                ty,
-                Opcode::Load(Load {
-                    ptr,
-                    volatile: is_volatile,
-                }),
-            );
+            let result = self.func.append_load(block, ty, ptr, mem);
+            self.record_value(result);
+            return Ok(result);
+        }
+        if op == "intrinsic" {
+            self.skip_ws();
+            let ty = self.parse_type()?;
+            let (name, args, imm, side_effects) = self.parse_intrinsic_body()?;
+            let result = self
+                .func
+                .append_intrinsic(block, ty, &name, &args, imm, side_effects);
             self.record_value(result);
             return Ok(result);
         }
@@ -1019,6 +1109,12 @@ impl<'a> FunctionParser<'a> {
         }
         if op == "dot" {
             self.skip_ws();
+            let signed = match self.read_word() {
+                "signed" => true,
+                "unsigned" => false,
+                _ => return Err(ParseError::InvalidSyntax),
+            };
+            self.skip_ws();
             let acc = self.parse_value_ref()?;
             self.skip_ws();
             self.eat(b',')?;
@@ -1028,7 +1124,7 @@ impl<'a> FunctionParser<'a> {
             self.eat(b',')?;
             self.skip_ws();
             let b = self.parse_value_ref()?;
-            let result = self.func.append_dot(block, acc, a, b);
+            let result = self.func.append_dot(block, acc, a, b, signed);
             self.record_value(result);
             return Ok(result);
         }
@@ -1150,14 +1246,14 @@ impl<'a> FunctionParser<'a> {
         }
         if op == "convert" {
             self.skip_ws();
+            let kind = convert_kind_of(self.read_word()).ok_or(ParseError::InvalidSyntax)?;
+            self.skip_ws();
             let ty = self.parse_type()?;
             self.skip_ws();
             self.eat(b',')?;
             self.skip_ws();
             let value = self.parse_value_ref()?;
-            let result = self
-                .func
-                .append_inst(block, ty, Opcode::Convert(Convert { value }));
+            let result = self.func.append_convert(block, ty, kind, value);
             self.record_value(result);
             return Ok(result);
         }
@@ -1173,7 +1269,6 @@ impl<'a> FunctionParser<'a> {
                 self.func.types.intern(TypeKind::Float(FloatKind::F32))
             } else {
                 self.func.types.intern(TypeKind::Int(IntDesc {
-                    signed: false,
                     bits: format.payload_bits(),
                 }))
             };
@@ -1208,10 +1303,7 @@ impl<'a> FunctionParser<'a> {
             let ty = if dequantize {
                 self.func.types.intern(TypeKind::Float(FloatKind::F32))
             } else {
-                self.func.types.intern(TypeKind::Int(IntDesc {
-                    signed: false,
-                    bits: 8,
-                }))
+                self.func.types.intern(TypeKind::Int(IntDesc { bits: 8 }))
             };
             let conversion = NvFp4Convert {
                 value: operands[0],
@@ -1290,16 +1382,105 @@ impl<'a> FunctionParser<'a> {
         })
     }
 
+    /// Read `be` or `le` at the cursor; any other word leaves the cursor where it was.
+    fn try_endian_word(&mut self) -> Option<Endianness> {
+        let save = self.pos;
+        self.skip_ws();
+        match self.read_word() {
+            "be" => Some(Endianness::Big),
+            "le" => Some(Endianness::Little),
+            _ => {
+                self.pos = save;
+                None
+            }
+        }
+    }
+
+    /// Parse the optional modifier words after `load`/`store`: `volatile`, `atomic <ordering>`,
+    /// `align <n>`, `be`, `le`, in any order, each at most once. Absent modifiers keep the
+    /// `MemFlags::new()` default (native byte order, not atomic, no alignment promise).
+    fn parse_mem_flags(&mut self) -> Result<MemFlags, ParseError> {
+        let mut mem = MemFlags::new();
+        let (mut volatile, mut atomic, mut align, mut endian) = (false, false, false, false);
+        loop {
+            if self.try_word("volatile") {
+                if core::mem::replace(&mut volatile, true) {
+                    return Err(ParseError::InvalidSyntax);
+                }
+                mem.volatile = true;
+            } else if self.try_word("atomic") {
+                if core::mem::replace(&mut atomic, true) {
+                    return Err(ParseError::InvalidSyntax);
+                }
+                self.skip_ws();
+                mem.ordering =
+                    Some(atomic_ordering_of(self.read_word()).ok_or(ParseError::InvalidSyntax)?);
+            } else if self.try_word("align") {
+                if core::mem::replace(&mut align, true) {
+                    return Err(ParseError::InvalidSyntax);
+                }
+                self.skip_ws();
+                mem.align =
+                    u32::try_from(self.read_unsigned()?).map_err(|_| ParseError::InvalidSyntax)?;
+            } else if let Some(order) = self.try_endian_word() {
+                if core::mem::replace(&mut endian, true) {
+                    return Err(ParseError::InvalidSyntax);
+                }
+                mem.endian = order;
+            } else {
+                return Ok(mem);
+            }
+        }
+    }
+
     fn parse_store(&mut self, block: Block) -> Result<(), ParseError> {
-        let is_volatile = self.try_word("volatile");
+        let mem = self.parse_mem_flags()?;
         self.skip_ws();
         let value = self.parse_value_ref()?;
         self.skip_ws();
         self.eat(b',')?;
         self.skip_ws();
         let ptr = self.parse_value_ref()?;
-        self.func.append_store_vol(block, value, ptr, is_volatile);
+        self.func.append_store_mem(block, value, ptr, mem);
         Ok(())
+    }
+
+    /// The part of an intrinsic after its optional result type:
+    /// `@name(args) [imm N] [pure]`. The name is a dotted identifier (`aarch64.aese`);
+    /// `pure` clears `side_effects`, which is otherwise set.
+    fn parse_intrinsic_body(&mut self) -> Result<(String, Vec<Value>, i64, bool), ParseError> {
+        self.skip_ws();
+        self.eat(b'@')?;
+        let start = self.pos;
+        while matches!(self.src.get(self.pos), Some(&c) if is_word_char(c) || c == b'.') {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return Err(ParseError::InvalidSyntax);
+        }
+        let name = core::str::from_utf8(&self.src[start..self.pos])
+            .map_err(|_| ParseError::InvalidSyntax)?
+            .to_string();
+        let mut args: Vec<Value> = Vec::new();
+        self.parse_call_args(&mut args)?;
+        let (mut imm, mut side_effects) = (0, true);
+        let (mut saw_imm, mut saw_pure) = (false, false);
+        loop {
+            if self.try_word("imm") {
+                if core::mem::replace(&mut saw_imm, true) {
+                    return Err(ParseError::InvalidSyntax);
+                }
+                self.skip_ws();
+                imm = self.read_signed()?;
+            } else if self.try_word("pure") {
+                if core::mem::replace(&mut saw_pure, true) {
+                    return Err(ParseError::InvalidSyntax);
+                }
+                side_effects = false;
+            } else {
+                return Ok((name, args, imm, side_effects));
+            }
+        }
     }
 
     fn parse_barrier(&mut self, block: Block) -> Result<(), ParseError> {
@@ -1839,11 +2020,472 @@ mod tests {
     #[test]
     fn round_trips_the_canonical_max_function() {
         let func = parse_ok(
-            "fn {\n  block0(v0: i32, v1: i32):\n    let v2 = v0 > v1\n    if v2 { block1(v0) } else { block1(v1) }\n    ret void\n\n  block1(v3: i32):\n    ret v3\n}",
+            "fn {\n  block0(v0: i32, v1: i32):\n    let v2 = v0 >s v1\n    if v2 { block1(v0) } else { block1(v1) }\n    ret void\n\n  block1(v3: i32):\n    ret v3\n}",
         );
         let diags = verify::verify(&func, verify::Profile::High);
         assert!(diags.ok());
         let diags = verify::verify(&func, verify::Profile::Low);
         assert!(diags.ok());
+    }
+
+    fn only_mem(func: &Function, which: usize) -> MemFlags {
+        let mut seen = 0;
+        for bi in 0..func.block_count() {
+            for &inst in func.block_insts(Block::from_u32(bi as u32)) {
+                let mem = match func.opcode(inst) {
+                    Opcode::Load(l) => l.mem,
+                    Opcode::Store(st) => st.mem,
+                    _ => continue,
+                };
+                if seen == which {
+                    return mem;
+                }
+                seen += 1;
+            }
+        }
+        panic!("no memory access #{which}");
+    }
+
+    /// The canonical spelling of `mem` as documented in the module comment.
+    fn mem_words(mem: &MemFlags) -> String {
+        let mut out = String::new();
+        if mem.volatile {
+            out.push_str("volatile ");
+        }
+        if let Some(o) = mem.ordering {
+            out.push_str(match o {
+                AtomicOrdering::Relaxed => "atomic relaxed ",
+                AtomicOrdering::Acquire => "atomic acquire ",
+                AtomicOrdering::Release => "atomic release ",
+                AtomicOrdering::AcqRel => "atomic acq_rel ",
+                AtomicOrdering::SeqCst => "atomic seq_cst ",
+            });
+        }
+        if mem.align != 0 {
+            out.push_str(&alloc::format!("align {} ", mem.align));
+        }
+        match mem.endian {
+            Endianness::Native => {}
+            Endianness::Big => out.push_str("be "),
+            Endianness::Little => out.push_str("le "),
+        }
+        out
+    }
+
+    #[test]
+    fn parses_load_and_store_without_modifiers_as_plain() {
+        let func = parse_ok(
+            "fn {\n  block0(v0: ptr, v1: i32):\n    let v2 = load i32, v0\n    store v1, v0\n    ret v2\n}",
+        );
+        assert_eq!(only_mem(&func, 0), MemFlags::new());
+        assert_eq!(only_mem(&func, 1), MemFlags::new());
+        assert!(only_mem(&func, 0).is_plain());
+    }
+
+    #[test]
+    fn mem_flags_text_round_trips_every_modifier() {
+        let orderings = [
+            None,
+            Some(AtomicOrdering::Relaxed),
+            Some(AtomicOrdering::Acquire),
+            Some(AtomicOrdering::Release),
+            Some(AtomicOrdering::AcqRel),
+            Some(AtomicOrdering::SeqCst),
+        ];
+        let endians = [Endianness::Native, Endianness::Little, Endianness::Big];
+        for volatile in [false, true] {
+            for align in [0u32, 1, 8, 4096] {
+                for ordering in orderings {
+                    for endian in endians {
+                        let mem = MemFlags {
+                            volatile,
+                            align,
+                            ordering,
+                            endian,
+                        };
+                        let words = mem_words(&mem);
+                        let text = alloc::format!(
+                            "fn {{\n  block0(v0: ptr, v1: i32):\n    let v2 = load {words}i32, v0\n    store {words}v1, v0\n    ret v2\n}}"
+                        );
+                        let func = parse_ok(&text);
+                        assert_eq!(only_mem(&func, 0), mem, "{text}");
+                        assert_eq!(only_mem(&func, 1), mem, "{text}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mem_flag_modifiers_parse_in_any_order() {
+        let func = parse_ok(
+            "fn {\n  block0(v0: ptr):\n    let v1 = load be align 8 atomic seq_cst volatile i64, v0\n    ret v1\n}",
+        );
+        assert_eq!(
+            only_mem(&func, 0),
+            MemFlags {
+                volatile: true,
+                align: 8,
+                ordering: Some(AtomicOrdering::SeqCst),
+                endian: Endianness::Big,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_mem_flags() {
+        for words in [
+            "volatile volatile ",
+            "align ",
+            "align x ",
+            "atomic ",
+            "atomic strong ",
+            "atomic acquire atomic acquire ",
+            "be le ",
+            "align 4 align 4 ",
+        ] {
+            let text = alloc::format!(
+                "fn {{\n  block0(v0: ptr):\n    let v1 = load {words}i32, v0\n    ret v1\n}}"
+            );
+            assert!(parse(&text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn round_trips_a_valued_intrinsic() {
+        let func = parse_ok(
+            "fn {\n  block0(v0: i32, v1: i32):\n    let v2 = intrinsic i32 @aarch64.aese(v0, v1) imm -3\n    ret v2\n}",
+        );
+        let inst = func.defining_inst(Value::from_u32(2)).unwrap();
+        let Opcode::Intrinsic(i) = func.opcode(inst) else {
+            panic!("expected intrinsic");
+        };
+        assert_eq!(func.symbol_name(i.symbol), "aarch64.aese");
+        assert_eq!(
+            func.value_list(i.args),
+            &[Value::from_u32(0), Value::from_u32(1)]
+        );
+        assert_eq!(i.imm, -3);
+        assert!(i.side_effects);
+    }
+
+    #[test]
+    fn round_trips_a_pure_and_a_void_intrinsic() {
+        let func = parse_ok(
+            "fn {\n  block0(v0: i32):\n    let v1 = intrinsic i32 @x86.bswap(v0) pure\n    intrinsic @arm.dmb() imm 15\n    intrinsic @nop.pure() pure imm 1\n    ret v1\n}",
+        );
+        let insts = func.block_insts(Block::from_u32(0));
+        let get = |n: usize| match func.opcode(insts[n]) {
+            Opcode::Intrinsic(i) => i,
+            _ => panic!("expected intrinsic"),
+        };
+        let (a, b, c) = (get(0), get(1), get(2));
+        assert!(!a.side_effects && a.imm == 0);
+        assert!(func.inst_result(insts[1]).is_none());
+        assert!(b.side_effects && b.imm == 15 && b.args.len == 0);
+        assert!(!c.side_effects && c.imm == 1);
+        assert_eq!(func.symbol_name(b.symbol), "arm.dmb");
+    }
+
+    // --- Signedness on the operation ---------------------------------------------
+
+    const ALL_BIN_OPS: [BinOp; 17] = [
+        BinOp::Add,
+        BinOp::Sub,
+        BinOp::Mul,
+        BinOp::Div,
+        BinOp::Rem,
+        BinOp::BitAnd,
+        BinOp::BitOr,
+        BinOp::BitXor,
+        BinOp::Shl,
+        BinOp::Shr,
+        BinOp::Sar,
+        BinOp::UDiv,
+        BinOp::SDiv,
+        BinOp::URem,
+        BinOp::SRem,
+        BinOp::UMulh,
+        BinOp::SMulh,
+    ];
+
+    const ALL_CMP_OPS: [CmpOp; 14] = [
+        CmpOp::Eq,
+        CmpOp::Ne,
+        CmpOp::Lt,
+        CmpOp::Le,
+        CmpOp::Gt,
+        CmpOp::Ge,
+        CmpOp::Slt,
+        CmpOp::Sle,
+        CmpOp::Sgt,
+        CmpOp::Sge,
+        CmpOp::Ult,
+        CmpOp::Ule,
+        CmpOp::Ugt,
+        CmpOp::Uge,
+    ];
+
+    fn assert_verifies(func: &Function, what: &str) {
+        let diags = verify::verify(func, verify::Profile::High);
+        assert!(diags.ok(), "{what}: {:?}", diags.items());
+    }
+
+    fn type_text(func: &Function, v: u32) -> String {
+        func.types
+            .display(func.value_type(Value::from_u32(v)))
+            .to_string()
+    }
+
+    #[test]
+    fn every_binary_operator_parses_from_its_own_symbol() {
+        for op in ALL_BIN_OPS {
+            let ty = if matches!(op, BinOp::Div | BinOp::Rem) {
+                "f32"
+            } else {
+                "i32"
+            };
+            let text = alloc::format!(
+                "fn {{\n  block0(v0: {ty}, v1: {ty}):\n    let v2 = v0 {} v1\n    ret v2\n}}",
+                op.symbol()
+            );
+            let func = parse_ok(&text);
+            let inst = func.defining_inst(Value::from_u32(2)).unwrap();
+            assert!(
+                matches!(func.opcode(inst), Opcode::Arith(a)
+                    if a.op == op && a.lhs == Value::from_u32(0) && a.rhs == Value::from_u32(1)),
+                "{op:?}: {text}"
+            );
+            assert_verifies(&func, &text);
+        }
+    }
+
+    #[test]
+    fn every_binary_operator_has_an_immediate_form() {
+        for op in ALL_BIN_OPS {
+            let ty = if matches!(op, BinOp::Div | BinOp::Rem) {
+                "f32"
+            } else {
+                "i32"
+            };
+            let text = alloc::format!(
+                "fn {{\n  block0(v0: {ty}):\n    let v1 = v0 {} 3\n    ret v1\n}}",
+                op.symbol()
+            );
+            let func = parse_ok(&text);
+            let inst = func.defining_inst(Value::from_u32(1)).unwrap();
+            assert!(
+                matches!(func.opcode(inst), Opcode::ArithImm(a) if a.op == op && a.imm == 3),
+                "{op:?}: {text}"
+            );
+            assert_verifies(&func, &text);
+        }
+    }
+
+    #[test]
+    fn operator_suffixes_pick_the_signed_or_unsigned_variant() {
+        let op_of = |sym: &str| {
+            let func = parse_ok(&alloc::format!(
+                "fn {{\n  block0(v0: i64, v1: i64):\n    let v2 = v0 {sym} v1\n    ret v2\n}}"
+            ));
+            let inst = func.defining_inst(Value::from_u32(2)).unwrap();
+            match func.opcode(inst) {
+                Opcode::Arith(a) => a.op,
+                other => panic!("expected arith, got {other:?}"),
+            }
+        };
+        assert_eq!(op_of(">>"), BinOp::Shr);
+        assert_eq!(op_of(">>s"), BinOp::Sar);
+        assert_eq!(op_of("/u"), BinOp::UDiv);
+        assert_eq!(op_of("/s"), BinOp::SDiv);
+        assert_eq!(op_of("%u"), BinOp::URem);
+        assert_eq!(op_of("%s"), BinOp::SRem);
+        assert_eq!(op_of("*"), BinOp::Mul);
+        assert_eq!(op_of("*hu"), BinOp::UMulh);
+        assert_eq!(op_of("*hs"), BinOp::SMulh);
+    }
+
+    #[test]
+    fn every_comparison_parses_from_its_own_symbol() {
+        for op in ALL_CMP_OPS {
+            let ty = if matches!(op, CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge) {
+                "f32"
+            } else {
+                "i32"
+            };
+            let text = alloc::format!(
+                "fn {{\n  block0(v0: {ty}, v1: {ty}):\n    let v2 = v0 {} v1\n    ret v2\n}}",
+                op.symbol()
+            );
+            let func = parse_ok(&text);
+            let inst = func.defining_inst(Value::from_u32(2)).unwrap();
+            assert!(
+                matches!(func.opcode(inst), Opcode::Icmp(c) if c.op == op),
+                "{op:?}: {text}"
+            );
+            assert_eq!(type_text(&func, 2), "bool");
+            assert_verifies(&func, &text);
+        }
+        let ptrs =
+            parse_ok("fn {\n  block0(v0: ptr, v1: ptr):\n    let v2 = v0 <u v1\n    ret v2\n}");
+        assert_verifies(&ptrs, "ptr <u ptr");
+    }
+
+    #[test]
+    fn the_verifier_rejects_an_operator_applied_to_the_wrong_domain() {
+        for (ty, sym) in [
+            ("i32", "/"),
+            ("i32", "%"),
+            ("f32", "/u"),
+            ("f32", "/s"),
+            ("f32", "%u"),
+            ("f32", ">>"),
+            ("f32", ">>s"),
+            ("f32", "*hu"),
+            ("i32", "<"),
+            ("i32", ">="),
+            ("f32", "<s"),
+            ("f32", ">u"),
+            ("ptr", "<s"),
+        ] {
+            let text = alloc::format!(
+                "fn {{\n  block0(v0: {ty}, v1: {ty}):\n    let v2 = v0 {sym} v1\n    ret v2\n}}"
+            );
+            let func = parse_ok(&text);
+            let diags = verify::verify(&func, verify::Profile::High);
+            assert!(
+                matches!(diags.items(), [verify::Diagnostic::InvalidOperation(_)]),
+                "{text}: {:?}",
+                diags.items()
+            );
+        }
+    }
+
+    #[test]
+    fn every_conversion_kind_parses_with_its_result_type() {
+        use ConvertKind::*;
+        for (kind, src, dst) in [
+            (Trunc, "i64", "i8"),
+            (Zext, "bool", "i32"),
+            (Zext, "i8", "i64"),
+            (Sext, "i8", "i64"),
+            (SiToFp, "i32", "f32"),
+            (UiToFp, "i64", "f64"),
+            (FpToSi, "f32", "i32"),
+            (FpToUi, "f64", "i64"),
+            (FpResize, "f32", "f64"),
+            (FpResize, "f128", "f16"),
+            (Zext, "<4 x i8>", "<4 x i32>"),
+        ] {
+            let text = alloc::format!(
+                "fn {{\n  block0(v0: {src}):\n    let v1 = convert {} {dst}, v0\n    ret v1\n}}",
+                kind.name()
+            );
+            let func = parse_ok(&text);
+            let inst = func.defining_inst(Value::from_u32(1)).unwrap();
+            assert!(
+                matches!(func.opcode(inst), Opcode::Convert(c)
+                    if c.kind == kind && c.value == Value::from_u32(0)),
+                "{text}"
+            );
+            assert_eq!(type_text(&func, 1), dst, "{text}");
+            assert_verifies(&func, &text);
+        }
+    }
+
+    #[test]
+    fn a_conversion_needs_a_known_kind() {
+        for text in [
+            "fn {\n  block0(v0: i8):\n    let v1 = convert i32, v0\n    ret v1\n}",
+            "fn {\n  block0(v0: i8):\n    let v1 = convert widen i32, v0\n    ret v1\n}",
+            "fn {\n  block0(v0: i8):\n    let v1 = convert sext, v0\n    ret v1\n}",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn dot_spells_its_signedness() {
+        for (word, signed) in [("signed", true), ("unsigned", false)] {
+            let func = parse_ok(&alloc::format!(
+                "fn {{\n  block0(v0: <4 x i32>, v1: <16 x i8>, v2: <16 x i8>):\n    let v3 = dot {word} v0, v1, v2\n    ret v3\n}}"
+            ));
+            let inst = func.defining_inst(Value::from_u32(3)).unwrap();
+            assert!(
+                matches!(func.opcode(inst), Opcode::Dot(d)
+                    if d.signed == signed && d.acc == Value::from_u32(0)
+                        && d.a == Value::from_u32(1) && d.b == Value::from_u32(2)),
+                "{word}"
+            );
+            assert_eq!(type_text(&func, 3), "<4 x i32>");
+        }
+        for text in [
+            "fn {\n  block0(v0: <4 x i32>, v1: <16 x i8>, v2: <16 x i8>):\n    let v3 = dot v0, v1, v2\n    ret v3\n}",
+            "fn {\n  block0(v0: <4 x i32>, v1: <16 x i8>, v2: <16 x i8>):\n    let v3 = dot sgn v0, v1, v2\n    ret v3\n}",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn atomic_min_and_max_are_signed_or_unsigned() {
+        for (word, op) in [
+            ("add", AtomicOp::Add),
+            ("smin", AtomicOp::SMin),
+            ("smax", AtomicOp::SMax),
+            ("umin", AtomicOp::UMin),
+            ("umax", AtomicOp::UMax),
+            ("bit_and", AtomicOp::BitAnd),
+            ("bit_or", AtomicOp::BitOr),
+            ("bit_xor", AtomicOp::BitXor),
+            ("exchange", AtomicOp::Exchange),
+        ] {
+            let func = parse_ok(&alloc::format!(
+                "fn {{\n  block0(v0: ptr, v1: i32):\n    let v2 = atomic_rmw {word} device seq_cst v0, v1\n    ret v2\n}}"
+            ));
+            let inst = func.defining_inst(Value::from_u32(2)).unwrap();
+            assert!(
+                matches!(func.opcode(inst), Opcode::AtomicRmw(a) if a.op == op),
+                "{word}"
+            );
+            assert_verifies(&func, word);
+        }
+        for word in ["min", "max"] {
+            let text = alloc::format!(
+                "fn {{\n  block0(v0: ptr, v1: i32):\n    let v2 = atomic_rmw {word} device seq_cst v0, v1\n    ret v2\n}}"
+            );
+            assert!(parse(&text).is_err(), "{word}");
+        }
+    }
+
+    #[test]
+    fn integer_types_have_no_unsigned_spelling_and_mulh_has_no_bare_word() {
+        assert!(parse("fn {\n  block0(v0: u32):\n    ret v0\n}").is_err());
+        assert!(parse("fn {\n  block0():\n    const v0: u8 = 1\n    ret v0\n}").is_err());
+        assert!(parse("fn {\n  block0():\n    const v0: i8 = 1\n    ret v0\n}").is_ok());
+        for word in ["mulh", "min", "max"] {
+            let text = alloc::format!(
+                "fn {{\n  block0(v0: <4 x i32>):\n    let v1 = reduce {word}, v0\n    ret v1\n}}"
+            );
+            assert!(parse(&text).is_err(), "{word}");
+        }
+        for word in ["umulh", "sdiv", "sar"] {
+            let text = alloc::format!(
+                "fn {{\n  block0(v0: <4 x i32>):\n    let v1 = reduce {word}, v0\n    ret v1\n}}"
+            );
+            // The word parses; the verifier is what limits reductions to the lane-wise ops.
+            let func = parse_ok(&text);
+            assert!(!verify::verify(&func, verify::Profile::High).ok(), "{word}");
+        }
+    }
+
+    #[test]
+    fn low_float_and_nvfp4_results_are_plain_integers() {
+        let func = parse_ok(
+            "fn {\n  block0(v0: f32, v1: i8, v2: f32):\n    let v3 = encode_low_float bf16, v0\n    let v4 = encode_low_float f8_e4m3, v0\n    let v5 = quantize_nvfp4 multiply, divide, v0, v1, v2\n    ret v3\n}",
+        );
+        assert_eq!(type_text(&func, 3), "i16");
+        assert_eq!(type_text(&func, 4), "i8");
+        assert_eq!(type_text(&func, 5), "i8");
     }
 }

@@ -29,6 +29,5 @@ pub enum Attribute {
     Noreturn,
     Cold,
     Align(u32),
-    Endian(Endianness),
     Custom(Custom),
 }

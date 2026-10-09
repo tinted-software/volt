@@ -36,5 +36,9 @@ pub fn compile(function: &volt_ir::function::Function) -> Result<alloc::vec::Vec
     Ok(result.code)
 }
 
+#[cfg(test)]
+mod cases;
+#[cfg(test)]
+mod codegen_tests;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod tests;

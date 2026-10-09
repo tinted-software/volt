@@ -1,4 +1,5 @@
 //! AArch64 encoding, Function-based native selection, object linking and JIT.
+pub mod decode;
 pub mod disasm;
 pub mod encode;
 pub mod isel;
@@ -13,3 +14,4 @@ pub mod jit;
 pub mod link;
 pub mod object;
 pub mod peephole;
+pub mod simd_struct;

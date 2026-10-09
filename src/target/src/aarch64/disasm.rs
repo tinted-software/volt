@@ -809,6 +809,9 @@ fn decode(out: &mut String, w: u32, ctx: Option<Context<'_>>) {
         return;
     }
 
+    if ordered_mem(out, w) {
+        return;
+    }
     if mem_imm(out, w) {
         return;
     }
@@ -874,6 +877,24 @@ fn ror_in_esize(v: u64, r: u32, esize: u32) -> u64 {
         return v & mask;
     }
     ((v >> rr) | (v << (esize - rr))) & mask
+}
+
+/// Load-acquire / store-release register (`ldar{,b,h}`, `stlr{,b,h}`): `[xn]` addressing only.
+fn ordered_mem(out: &mut String, w: u32) -> bool {
+    let mnem = match w & 0x3FFF_FC00 {
+        0x08DF_FC00 => "ldar",
+        0x089F_FC00 => "stlr",
+        _ => return false,
+    };
+    let size = w >> 30;
+    out.push_str(mnem);
+    out.push_str(["b", "h", "", ""][size as usize]);
+    out.push(' ');
+    gp(out, size == 3, rd(w));
+    out.push_str(", [");
+    sp(out, true, rn(w));
+    out.push(']');
+    true
 }
 
 /// Scaled-unsigned-offset loads/stores (integer and FP). Returns whether it
@@ -1499,6 +1520,15 @@ mod tests {
         // nop is outside the emitted-subset decode coverage: it must surface
         // as a raw word, never a mis-decode.
         assert_eq!(one(0xD503_201F), ".word 0xd503201f");
+        // ldar/stlr in every width (GNU as output).
+        assert_eq!(one(0x88df_fc20), "ldar w0, [x1]");
+        assert_eq!(one(0xc8df_fc62), "ldar x2, [x3]");
+        assert_eq!(one(0x08df_fca4), "ldarb w4, [x5]");
+        assert_eq!(one(0x48df_fce6), "ldarh w6, [x7]");
+        assert_eq!(one(0x889f_fc20), "stlr w0, [x1]");
+        assert_eq!(one(0xc89f_fc62), "stlr x2, [x3]");
+        assert_eq!(one(0x089f_fca4), "stlrb w4, [x5]");
+        assert_eq!(one(0x489f_fce6), "stlrh w6, [x7]");
     }
 
     #[test]

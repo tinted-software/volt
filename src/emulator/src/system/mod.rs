@@ -14,7 +14,7 @@ pub mod psci;
 pub mod smp;
 pub mod xnu;
 
-use crate::aarch64::{Cpu, decode, translate};
+use crate::aarch64::{Cpu, host, translate};
 use crate::devices::bus::Device;
 use crate::devices::pci::PciHost;
 use crate::devices::virtio_pci::VirtioBlockPci;
@@ -767,7 +767,7 @@ fn instruction_diagnostic<M: GuestMemory>(
         let mut bytes = [0; 4];
         machine.memory.read(physical, &mut bytes).ok()?;
         let word = u32::from_le_bytes(bytes);
-        let decoded = decode::decode(word);
+        let decoded = host::dispatch(word);
         last = Some(InstructionDiagnostic {
             virtual_address: address,
             physical_address: physical,
@@ -880,6 +880,38 @@ mod tests {
         assert_eq!(report.console, b"A");
         assert_eq!(report.unmapped_accesses, 0);
         assert!(report.compiled_blocks >= 3);
+    }
+
+    /// A single-precision `fnmadd` is a fused operation, not an `fmov`. Its `Rm` has
+    /// bits 18:17 set, which the old FMOV pattern accepted because it left bit 24 unchecked.
+    #[test]
+    fn fused_fp_operations_are_not_misread_as_fmov() {
+        let code = [
+            0x1e2e_1000u32, // fmov s0, #1.0
+            0x1e20_1006,    // fmov s6, #2.0
+            0x1f26_0002,    // fnmadd s2, s0, s6, s0  => -(1) - (1*2) = -3.0 = 0xc0400000
+            0x1e26_0040,    // fmov w0, s2
+            0x5318_7c00,    // lsr w0, w0, #24
+            0xd2a1_2001,    // movz x1, #0x900, lsl #16 (PL011)
+            0x3900_0020,    // strb w0, [x1]
+            0xd2b0_8000,    // movz x0, #0x8400, lsl #16
+            0xf280_0100,    // movk x0, #8 (PSCI_SYSTEM_OFF)
+            0xd400_0002,    // hvc #0
+        ];
+        let mut image = vec![0; 64];
+        image[..4].copy_from_slice(&0x14000010u32.to_le_bytes());
+        image[4..8].copy_from_slice(&0xd503201fu32.to_le_bytes());
+        image[24..32].copy_from_slice(&2u64.to_le_bytes());
+        image[56..60].copy_from_slice(&boot::MAGIC.to_le_bytes());
+        for w in code {
+            image.extend_from_slice(&w.to_le_bytes());
+        }
+        let length = image.len() as u64;
+        image[16..24].copy_from_slice(&length.to_le_bytes());
+        let report =
+            boot_with_serial(&image, Duration::from_secs(10), DEFAULT_CMDLINE, |_| {}).unwrap();
+        assert_eq!(report.reason, StopReason::Shutdown, "{report}");
+        assert_eq!(report.console, b"\xc0", "high byte of fnmadd s2 result");
     }
 
     fn create_test_image(instructions: &[u32]) -> Vec<u8> {

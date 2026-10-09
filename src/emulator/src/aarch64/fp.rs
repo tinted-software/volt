@@ -11,6 +11,7 @@
 //! rounding is always to nearest, ties to even), and the `FPSR` exception flags.
 
 use super::Cpu;
+use volt_target::aarch64::decode::expand_immediate;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Precision {
@@ -143,19 +144,6 @@ fn precision(ty: u32) -> Option<Precision> {
         1 => Some(Precision::Double),
         // 3 is half precision, which is not modelled; 2 is reserved.
         _ => None,
-    }
-}
-
-/// The 32- or 64-bit pattern of the 8-bit floating-point immediate `imm8`
-/// (`VFPExpandImm`), as `fmov` and the vector `fmov` take it.
-pub fn expand_immediate(imm8: u64, double: bool) -> u64 {
-    let sign = imm8 >> 7;
-    let b = (imm8 >> 6) & 1;
-    let fraction = imm8 & 0x3f;
-    if double {
-        (sign << 63) | ((b ^ 1) << 62) | (b * 0xff << 54) | (fraction << 48)
-    } else {
-        (sign << 31) | ((b ^ 1) << 30) | (b * 0x1f << 25) | (fraction << 19)
     }
 }
 

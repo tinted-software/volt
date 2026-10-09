@@ -8,12 +8,6 @@ use core::fmt;
 pub struct Type(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum Signedness {
-    Signed,
-    Unsigned,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum FloatKind {
     F32,
     F64,
@@ -23,7 +17,6 @@ pub enum FloatKind {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct IntDesc {
-    pub signed: bool,
     pub bits: u16,
 }
 
@@ -100,6 +93,20 @@ impl TypeTable {
 
     pub fn type_kind(&self, h: Type) -> &TypeKind {
         &self.kinds[h.0 as usize]
+    }
+
+    /// Size in bytes of an int/float/ptr scalar as it sits in memory (pointers are 8 bytes);
+    /// None for bool, vectors, aggregates and integers whose width is not a whole byte count.
+    pub fn scalar_mem_bytes(&self, h: Type) -> Option<u32> {
+        match self.type_kind(h) {
+            TypeKind::Int(d) if d.bits % 8 == 0 && d.bits != 0 => Some(u32::from(d.bits) / 8),
+            TypeKind::Float(FloatKind::F16) => Some(2),
+            TypeKind::Float(FloatKind::F32) => Some(4),
+            TypeKind::Float(FloatKind::F64) => Some(8),
+            TypeKind::Float(FloatKind::F128) => Some(16),
+            TypeKind::Ptr(_) => Some(8),
+            _ => None,
+        }
     }
 
     pub fn count(&self) -> usize {
@@ -230,12 +237,9 @@ impl TypeTable {
                     "f128" => Ok(self.intern(TypeKind::Float(FloatKind::F128))),
                     _ => {
                         let b = w.as_bytes();
-                        if b.len() >= 2 && (b[0] == b'i' || b[0] == b'u') {
+                        if b.len() >= 2 && b[0] == b'i' {
                             let bits: u16 = w[1..].parse().map_err(|_| ParseError)?;
-                            Ok(self.intern(TypeKind::Int(IntDesc {
-                                signed: b[0] == b'i',
-                                bits,
-                            })))
+                            Ok(self.intern(TypeKind::Int(IntDesc { bits })))
                         } else {
                             Err(ParseError)
                         }
@@ -249,7 +253,7 @@ impl TypeTable {
         match &self.kinds[ty.0 as usize] {
             TypeKind::Bool => out.push_str("bool"),
             TypeKind::Int(i) => {
-                out.push(if i.signed { 'i' } else { 'u' });
+                out.push('i');
                 out.push_str(&alloc::format!("{}", i.bits));
             }
             TypeKind::Float(f) => out.push_str(match f {
@@ -354,14 +358,22 @@ mod tests {
     #[test]
     fn scalars_round_trip() {
         let mut t = TypeTable::new();
-        let i32a = t.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }));
+        let i32a = t.intern(TypeKind::Int(IntDesc { bits: 32 }));
         assert_eq!(i32a, t.parse_type("i32").unwrap());
         assert_eq!(t.parse_type("bool").unwrap(), t.intern(TypeKind::Bool));
         assert_eq!(t.ptr_global(), t.parse_type("ptr").unwrap());
         assert_eq!("i32", alloc::format!("{}", t.display(i32a)));
+    }
+
+    #[test]
+    fn integer_types_are_signless_and_the_u_spelling_is_gone() {
+        let mut t = TypeTable::new();
+        let i8t = t.parse_type("i8").unwrap();
+        assert_eq!(i8t, t.intern(TypeKind::Int(IntDesc { bits: 8 })));
+        assert_eq!(i8t, t.parse_type(" i8 ").unwrap());
+        for text in ["u8", "u32", "u64", "i", "i-1", "i8x", "i99999"] {
+            assert!(t.parse_type(text).is_err(), "{text}");
+        }
     }
 
     #[test]
@@ -378,10 +390,7 @@ mod tests {
     #[test]
     fn composites() {
         let mut t = TypeTable::new();
-        let i32t = t.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }));
+        let i32t = t.intern(TypeKind::Int(IntDesc { bits: 32 }));
         let f32t = t.intern(TypeKind::Float(FloatKind::F32));
         let v4 = t.intern(TypeKind::Vector(VectorDesc { len: 4, elem: i32t }));
         assert_eq!(v4, t.parse_type("<4 x i32>").unwrap());

@@ -10,11 +10,12 @@ pub mod syscalls;
 pub use memory::Space;
 
 use crate::aarch64::cpu::{Exclusive, Trap};
-use crate::aarch64::decode::{Instruction, SignExtend, SystemRegister, decode};
+use crate::aarch64::host::{Dispatch, dispatch};
 use crate::aarch64::{Cache, Cpu};
 use crate::memory::{GuestMemory, MemoryError};
 use std::ffi::OsString;
 use std::path::Path;
+use volt_target::aarch64::decode::{Instruction, SignExtend, SystemRegister};
 
 #[derive(Debug)]
 pub enum Error {
@@ -150,19 +151,18 @@ fn fetch(
         }
     }
     let word = u32::from_le_bytes(bytes);
-    let instruction =
-        decode(word).map_err(|_| crate::aarch64::compile::Error::Decode { word, pc: address })?;
-    if !user_instruction(&instruction) {
-        return Err(crate::aarch64::compile::Error::InvalidUserInstruction);
-    }
-    if matches!(instruction, Instruction::CacheOp) {
-        // The decoder groups EL0 and privileged cache operations together.
-        // Only IC IVAU and DC CVAC/CVAU/CIVAC are permitted in userspace.
-        let op1 = (word >> 16) & 7;
-        let crm = (word >> 8) & 15;
-        let op2 = (word >> 5) & 7;
-        if op1 != 3 || op2 != 1 || !matches!(crm, 5 | 10 | 11 | 14) {
+    let dispatched =
+        dispatch(word).map_err(|_| crate::aarch64::compile::Error::Decode { word, pc: address })?;
+    if let Dispatch::Guest(instruction) = &dispatched {
+        if !user_instruction(instruction) {
             return Err(crate::aarch64::compile::Error::InvalidUserInstruction);
+        }
+        if let Instruction::CacheOp(sys) = instruction {
+            // The decoder groups EL0 and privileged cache operations together.
+            // Only IC IVAU and DC CVAC/CVAU/CIVAC are permitted in userspace.
+            if sys.op1 != 3 || sys.op2 != 1 || !matches!(sys.crm, 5 | 10 | 11 | 14) {
+                return Err(crate::aarch64::compile::Error::InvalidUserInstruction);
+            }
         }
     }
     if into.len() < 4 {
@@ -187,7 +187,7 @@ fn user_instruction(instruction: &Instruction) -> bool {
         },
         Instruction::Eret
         | Instruction::Psci
-        | Instruction::Tlbi
+        | Instruction::Tlbi(_)
         | Instruction::Wfi
         | Instruction::AddressTranslate(_) => false,
         _ => true,

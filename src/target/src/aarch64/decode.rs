@@ -307,6 +307,28 @@ pub struct Address {
     pub rd: u8,
     pub offset: i64,
 }
+/// The operands of a `SYS`-space system instruction (`DC`, `IC`, `TLBI`, `AT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SysOp {
+    pub op1: u8,
+    pub crn: u8,
+    pub crm: u8,
+    pub op2: u8,
+    pub rt: u8,
+}
+/// `PRFM`/`PRFUM` with a register-based address. `op` is the prefetch operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prefetch {
+    pub op: u8,
+    pub rn: u8,
+    pub addressing: Addressing,
+}
+/// `PRFM` (literal): a prefetch from a PC-relative address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefetchLiteral {
+    pub op: u8,
+    pub offset: i64,
+}
 /// How a modified-immediate instruction combines its immediate with `rd`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImmCombine {
@@ -834,18 +856,23 @@ pub enum Instruction {
     SimdLiteral(SimdLiteral),
     Exclusive(Exclusive),
     Atomic(Atomic),
-    Clrex,
+    Clrex(u8),
     Adr(Address),
     System(System),
     DcZva(u8),
     AddressTranslate(AddressTranslate),
     Eret,
-    CacheOp,
-    Tlbi,
+    CacheOp(SysOp),
+    Tlbi(SysOp),
     Nop,
-    Dsb,
-    Dmb,
-    Isb,
+    /// A hint-space `HINT #n` other than `nop` and the named hints (`bti`, `esb`,
+    /// `csdb`, ...). Executes as `nop`.
+    Hint(u8),
+    Prefetch(Prefetch),
+    PrefetchLiteral(PrefetchLiteral),
+    Dsb(u8),
+    Dmb(u8),
+    Isb(u8),
     Sev,
     Sevl,
     Wfe,
@@ -877,15 +904,13 @@ pub enum Instruction {
         q: bool,
     },
     SimdDupElement(SimdDupElement),
-    /// An instruction the host executes from its raw word (see `host`).
-    Host(u32),
     SimdInsert(SimdInsert),
     SimdInsertElement(SimdInsertElement),
     SimdExtract(SimdExtract),
     SimdExt(SimdExt),
     SimdAlu(SimdAlu),
     SimdTable(SimdTable),
-    Svc,
+    Svc(u16),
     Psci,
     Wfi,
 }
@@ -926,17 +951,16 @@ impl Instruction {
                 | TestBranch(_)
                 | Call(_)
                 | Indirect(_)
-                | Svc
+                | Svc(_)
                 | Psci
                 | Wfi
                 | Wfe
                 | Brk(_)
-                | Isb
+                | Isb(_)
                 | DcZva(_)
                 | AddressTranslate(_)
-                | Host(_)
                 | Eret
-                | Tlbi
+                | Tlbi(_)
         )
     }
 }
@@ -1357,13 +1381,22 @@ fn system_register(
     })
 }
 
+/// The 32- or 64-bit pattern of the 8-bit floating-point immediate `imm8`
+/// (`VFPExpandImm`), as `fmov` and the vector `fmov` take it.
+pub fn expand_immediate(imm8: u64, double: bool) -> u64 {
+    let sign = imm8 >> 7;
+    let b = (imm8 >> 6) & 1;
+    let fraction = imm8 & 0x3f;
+    if double {
+        (sign << 63) | ((b ^ 1) << 62) | (b * 0xff << 54) | (fraction << 48)
+    } else {
+        (sign << 31) | ((b ^ 1) << 30) | (b * 0x1f << 25) | (fraction << 19)
+    }
+}
+
 pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
     use DecodeError::UnsupportedInstruction;
     use Instruction::*;
-    // PAuth and guarded-execution instructions, hint-space forms included, run on the host.
-    if super::pauth::is_supported(word) || super::gxf::is_supported(word) {
-        return Ok(Host(word));
-    }
     let width = width(word);
     let rn = reg(word, 5);
     let rm = reg(word, 16);
@@ -1546,12 +1579,39 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             immediate: ((word >> 10) & 0xfff) << if word & 0x0040_0000 != 0 { 12 } else { 0 },
         }));
     }
-    if word & 0xffc0_0000 == 0xf980_0000
-        || word & 0xffe0_0c00 == 0xf8a0_0800
-        || word & 0xffe0_0c00 == 0xf880_0000
-        || word & 0xff00_0000 == 0xd800_0000
-    {
-        return Ok(Nop);
+    // PRFM (unsigned offset), PRFUM (unscaled offset) and PRFM (register). They
+    // keep their operand and execute as `nop`.
+    if word & 0xffc0_0000 == 0xf980_0000 {
+        return Ok(Prefetch(self::Prefetch {
+            op: rd,
+            rn,
+            addressing: Addressing::Offset((((word >> 10) & 0xfff) << 3) as i64),
+        }));
+    }
+    if word & 0xffe0_0c00 == 0xf880_0000 {
+        return Ok(Prefetch(self::Prefetch {
+            op: rd,
+            rn,
+            addressing: Addressing::Offset(sign_extend(word >> 12, 9)),
+        }));
+    }
+    if word & 0xffe0_0c00 == 0xf8a0_0800 {
+        return Ok(Prefetch(self::Prefetch {
+            op: rd,
+            rn,
+            addressing: Addressing::Register {
+                rm,
+                extend: extension(word >> 13),
+                amount: if word & 0x1000 != 0 { 3 } else { 0 },
+            },
+        }));
+    }
+    // PRFM (literal).
+    if word & 0xff00_0000 == 0xd800_0000 {
+        return Ok(PrefetchLiteral(self::PrefetchLiteral {
+            op: rd,
+            offset: sign_extend(word >> 5, 19) << 2,
+        }));
     }
     if word & 0x3f00_0000 == 0x1800_0000 {
         let size = match word >> 30 {
@@ -1858,21 +1918,24 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
         }));
     }
     if word & 0xffff_f01f == 0xd503_201f {
-        return Ok(match (word >> 5) & 127 {
+        let hint = ((word >> 5) & 127) as u8;
+        return Ok(match hint {
+            0 => Nop,
             1 => Yield,
             2 => Wfe,
             3 => Wfi,
             4 => Sev,
             5 => Sevl,
-            _ => Nop,
+            _ => Hint(hint),
         });
     }
     if word & 0xffff_f01f == 0xd503_301f {
+        let option = ((word >> 8) & 15) as u8;
         return match (word >> 5) & 7 {
-            2 => Ok(Clrex),
-            4 => Ok(Dsb),
-            5 => Ok(Dmb),
-            6 => Ok(Isb),
+            2 => Ok(Clrex(option)),
+            4 => Ok(Dsb(option)),
+            5 => Ok(Dmb(option)),
+            6 => Ok(Isb(option)),
             _ => Err(UnsupportedInstruction),
         };
     }
@@ -1891,11 +1954,18 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
     if word & 0xfff8_0000 == 0xd508_0000 {
         let crn = (word >> 12) & 15;
         let crm = (word >> 8) & 15;
+        let sys = SysOp {
+            op1: ((word >> 16) & 7) as u8,
+            crn: crn as u8,
+            crm: crm as u8,
+            op2: ((word >> 5) & 7) as u8,
+            rt: rd,
+        };
         if crn == 8 {
-            return Ok(Tlbi);
+            return Ok(Tlbi(sys));
         }
         if crn == 7 && matches!(crm, 1 | 5 | 6 | 10 | 11 | 14) {
-            return Ok(CacheOp);
+            return Ok(CacheOp(sys));
         }
         return Err(UnsupportedInstruction);
     }
@@ -2086,8 +2156,8 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
                 acc | (if (imm8 >> bit) & 1 != 0 { 0xff } else { 0 }) << (8 * bit)
             }),
             // FMOV: the 8-bit float immediate widened to f32 (twice) or f64.
-            _ if !op => twice(super::fp::expand_immediate(imm8, false)),
-            _ if q => super::fp::expand_immediate(imm8, true),
+            _ if !op => twice(expand_immediate(imm8, false)),
+            _ if q => expand_immediate(imm8, true),
             _ => return Err(UnsupportedInstruction),
         };
         // Odd cmode below 12 is ORR/BIC; MOVI becomes MVNI (inverted) with op set.
@@ -2121,8 +2191,9 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
         }
         return Ok(SimdCompareZero(self::SimdCompareZero { rd, rn, size, q }));
     }
-    // FMOV between a general register and an S/D register: a pure bit move.
-    if word & 0x7ebe_fc00 == 0x1e26_0000 {
+    // FMOV between a general register and an S/D register: a pure bit move. Bit 24
+    // must be clear; the floating-point 3-source group (FMADD and friends) has it set.
+    if word & 0x7fbe_fc00 == 0x1e26_0000 {
         let double64 = word & 0x8000_0000 != 0;
         let double_type = word & 0x0040_0000 != 0;
         if double64 != double_type {
@@ -2134,11 +2205,6 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             to_fp: word & 0x0001_0000 != 0,
             double: double64,
         }));
-    }
-    // Scalar floating point and integer SIMD the JIT does not compile: `host::run`
-    // executes the word.
-    if super::host::is_supported(word) {
-        return Ok(Host(word));
     }
     // Across-lanes reductions: bits 21:17 = 11000, bits 11:10 = 10. They share
     // the three-same class bits, so they are matched first. ADDV (U=0, opcode
@@ -2425,8 +2491,11 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             rd,
         }));
     }
+    // SVC #imm16: the immediate is the whole field.
+    if word & 0xffe0_001f == 0xd400_0001 {
+        return Ok(Svc((word >> 5) as u16));
+    }
     match word {
-        0xd400_0001 => Ok(Svc),
         0xd400_0002 => Ok(Psci),
         0xd503_207f => Ok(Wfi),
         _ => Err(UnsupportedInstruction),
@@ -2655,21 +2724,23 @@ mod tests {
     fn assembler_hints_barriers_and_traps() {
         use Instruction::*;
         for (word, expected) in [
-            (0xd5033f9f, Dsb),
-            (0xd5033fbf, Dmb),
-            (0xd5033fdf, Isb),
+            (0xd5033f9f, Dsb(0xf)),
+            (0xd5033fbf, Dmb(0xf)),
+            (0xd5033fdf, Isb(0xf)),
             (0xd503201f, Nop),
+            (0xd503305f, Clrex(0)),
             (0xd503203f, Yield),
             (0xd503205f, Wfe),
             (0xd503207f, Wfi),
             (0xd503209f, Sev),
             (0xd50320bf, Sevl),
-            (0xd503241f, Nop),
-            (0xd503245f, Nop),
-            (0xd503249f, Nop),
-            (0xd50324df, Nop),
+            (0xd503241f, Hint(32)),
+            (0xd503245f, Hint(34)),
+            (0xd503249f, Hint(36)),
+            (0xd50324df, Hint(38)),
             (0xd69f03e0, Eret),
-            (0xd4000001, Svc),
+            (0xd4000001, Svc(0)),
+            (0xd4001001, Svc(0x80)),
             (0xd4000002, Psci),
             (0xd4200020, Brk(1)),
             (0xd4210000, Brk(0x800)),
@@ -2677,10 +2748,66 @@ mod tests {
             assert_eq!(decode(word), Ok(expected));
         }
         assert_eq!(decode(0xd50b7423), Ok(DcZva(3)));
-        assert_eq!(decode(0xd503309f), Ok(Dsb));
-        assert!(!Dsb.terminates());
-        assert!(Isb.terminates());
+        assert_eq!(decode(0xd503309f), Ok(Dsb(0)));
+        assert!(!Dsb(0).terminates());
+        assert!(Isb(0).terminates());
         assert!(Eret.terminates());
+    }
+    #[test]
+    fn prefetch_and_system_operations_keep_their_operands() {
+        use Instruction::*;
+        assert_eq!(
+            decode(0xf9800420),
+            Ok(Prefetch(super::Prefetch {
+                op: 0,
+                rn: 1,
+                addressing: Addressing::Offset(8),
+            }))
+        );
+        assert_eq!(
+            decode(0xf89f8040),
+            Ok(Prefetch(super::Prefetch {
+                op: 0,
+                rn: 2,
+                addressing: Addressing::Offset(-8),
+            }))
+        );
+        assert_eq!(
+            decode(0xf8a47860),
+            Ok(Prefetch(super::Prefetch {
+                op: 0,
+                rn: 3,
+                addressing: Addressing::Register {
+                    rm: 4,
+                    extend: Extend::Uxtx,
+                    amount: 3,
+                },
+            }))
+        );
+        assert_eq!(
+            decode(0xd8000040),
+            Ok(PrefetchLiteral(super::PrefetchLiteral { op: 0, offset: 8 }))
+        );
+        assert_eq!(
+            decode(0xd50b7e20),
+            Ok(CacheOp(super::SysOp {
+                op1: 3,
+                crn: 7,
+                crm: 14,
+                op2: 1,
+                rt: 0,
+            }))
+        );
+        assert_eq!(
+            decode(0xd508871f),
+            Ok(Tlbi(super::SysOp {
+                op1: 0,
+                crn: 8,
+                crm: 7,
+                op2: 0,
+                rt: 31,
+            }))
+        );
     }
     #[test]
     fn logical_immediates_wrap_and_replicate_without_crossing_elements() {
@@ -2821,7 +2948,7 @@ mod tests {
         // modified immediate but have a non-zero `immh`; they are not `movi`.
         for word in [0x2f08a401, 0x4f255420, 0x4f090420, 0x0f0c8420] {
             assert!(
-                matches!(decode(word), Ok(Instruction::Host(_))),
+                !matches!(decode(word), Ok(Instruction::SimdImm(_))),
                 "{word:08x}"
             );
         }

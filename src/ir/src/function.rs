@@ -3,7 +3,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::attribute::Attribute;
+use super::attribute::{Attribute, Endianness};
 use super::low_float::Format as LowFloatFormat;
 use super::nvfp4::ScaleApplication;
 use super::types::{Type, TypeKind, TypeTable};
@@ -44,22 +44,47 @@ impl Inst {
     }
 }
 
+/// Binary operators.
+///
+/// Integer types (`iN`) carry no signedness: a value is a bare bit pattern, and the
+/// OPERATION decides how it is read. Operations whose result differs between a signed and
+/// an unsigned reading therefore come in pairs (`UDiv`/`SDiv`, `Shr`/`Sar`, ...).
+///
+/// Operand rules (enforced by `verify`; "int" and "float" include vectors of that lane type):
+/// - `Add`, `Sub`, `Mul`: int or float (`Add`/`Sub` also pointer +/- int).
+/// - `Div`, `Rem`: FLOAT ONLY (the IEEE division and remainder).
+/// - `UDiv`, `SDiv`, `URem`, `SRem`: INT ONLY. Dividing by zero and `MIN / -1` behave exactly
+///   as the backends and the emulator implement them.
+/// - `BitAnd`, `BitOr`, `BitXor`: int or bool.
+/// - `Shl`, `Shr` (logical right shift), `Sar` (arithmetic right shift): INT ONLY.
+/// - `UMulh`, `SMulh`: INT ONLY; the high half of the double-width unsigned / signed product.
+///
+/// Bitcode-relevant: `as u8` is the wire tag and the values are pinned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[repr(u8)]
 pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
-    BitAnd,
-    BitOr,
-    BitXor,
-    Shl,
-    Shr,
-    Mulh,
+    Add = 0,
+    Sub = 1,
+    Mul = 2,
+    Div = 3,
+    Rem = 4,
+    BitAnd = 5,
+    BitOr = 6,
+    BitXor = 7,
+    Shl = 8,
+    Shr = 9,
+    Sar = 10,
+    UDiv = 11,
+    SDiv = 12,
+    URem = 13,
+    SRem = 14,
+    UMulh = 15,
+    SMulh = 16,
 }
 
 impl BinOp {
+    /// The operator spelling of the text syntax (see the `parser` module comment). The
+    /// signedness suffix is `u` / `s`.
     pub fn symbol(self) -> &'static str {
         match self {
             BinOp::Add => "+",
@@ -67,12 +92,18 @@ impl BinOp {
             BinOp::Mul => "*",
             BinOp::Div => "/",
             BinOp::Rem => "%",
+            BinOp::UDiv => "/u",
+            BinOp::SDiv => "/s",
+            BinOp::URem => "%u",
+            BinOp::SRem => "%s",
             BinOp::BitAnd => "&",
             BinOp::BitOr => "|",
             BinOp::BitXor => "^",
             BinOp::Shl => "<<",
             BinOp::Shr => ">>",
-            BinOp::Mulh => "*h",
+            BinOp::Sar => ">>s",
+            BinOp::UMulh => "*hu",
+            BinOp::SMulh => "*hs",
         }
     }
 }
@@ -84,6 +115,9 @@ pub struct Arith {
     pub rhs: Value,
 }
 
+/// `op lhs, imm` with the constant `imm` standing in for the right operand. The constant is
+/// the one an `Iconst(imm)` of `lhs`'s type would be, so only its low `bits` matter; for a
+/// shift it is the shift amount. `op` obeys the same rules as in [`Arith`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ArithImm {
     pub op: BinOp,
@@ -91,17 +125,37 @@ pub struct ArithImm {
     pub imm: i64,
 }
 
+/// Comparison operators; the result is `bool` (for vector operands, a vector of `bool`).
+///
+/// Operand rules (enforced by `verify`): both operands have the same type.
+/// - `Eq`, `Ne`: any scalar (`bool`, int, float, ptr) or a vector of one.
+/// - `Lt`, `Le`, `Gt`, `Ge`: FLOAT ONLY (ordered; false when either operand is NaN).
+/// - `Slt`, `Sle`, `Sgt`, `Sge`: INT ONLY, the operands read as two's complement signed.
+/// - `Ult`, `Ule`, `Ugt`, `Uge`: int or ptr, the operands read as unsigned.
+///
+/// Bitcode-relevant: `as u8` is the wire tag and the values are pinned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[repr(u8)]
 pub enum CmpOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
+    Eq = 0,
+    Ne = 1,
+    Lt = 2,
+    Le = 3,
+    Gt = 4,
+    Ge = 5,
+    Slt = 6,
+    Sle = 7,
+    Sgt = 8,
+    Sge = 9,
+    Ult = 10,
+    Ule = 11,
+    Ugt = 12,
+    Uge = 13,
 }
 
 impl CmpOp {
+    /// The operator spelling of the text syntax (see the `parser` module comment). The
+    /// signedness suffix is `u` / `s`.
     pub fn symbol(self) -> &'static str {
         match self {
             CmpOp::Eq => "==",
@@ -110,6 +164,14 @@ impl CmpOp {
             CmpOp::Le => "<=",
             CmpOp::Gt => ">",
             CmpOp::Ge => ">=",
+            CmpOp::Slt => "<s",
+            CmpOp::Sle => "<=s",
+            CmpOp::Sgt => ">s",
+            CmpOp::Sge => ">=s",
+            CmpOp::Ult => "<u",
+            CmpOp::Ule => "<=u",
+            CmpOp::Ugt => ">u",
+            CmpOp::Uge => ">=u",
         }
     }
 }
@@ -139,9 +201,56 @@ pub struct Extract {
     pub index: u32,
 }
 
+/// The conversion a [`Convert`] performs. `SiToFp` etc. name the source/destination class and
+/// the SIGN of the integer side; widths come from the operand and result types.
+///
+/// Type rules (enforced by `verify`; lane counts must match for vectors):
+/// - `Trunc`: int -> strictly narrower int. Keeps the low bits.
+/// - `Zext`: int or `bool` -> strictly wider int, filling with zeros.
+/// - `Sext`: int -> strictly wider int, filling with the sign bit.
+/// - `SiToFp` / `UiToFp`: int (read signed / unsigned) -> float.
+/// - `FpToSi` / `FpToUi`: float -> int. In-range values truncate toward zero. The result of
+///   an out-of-range or NaN input is UNSPECIFIED and differs between backends (aarch64
+///   saturates, x86-64 returns its "integer indefinite" value); frontends that need a
+///   specific behavior must range-check or clamp the input first.
+/// - `FpResize`: float -> float of a DIFFERENT width (extend or truncate).
+///
+/// Same-width int <-> int casts have no kind: the value is simply reused.
+///
+/// Bitcode-relevant: encoded as one byte, tag values pinned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[repr(u8)]
+pub enum ConvertKind {
+    Trunc = 0,
+    Zext = 1,
+    Sext = 2,
+    SiToFp = 3,
+    UiToFp = 4,
+    FpToSi = 5,
+    FpToUi = 6,
+    FpResize = 7,
+}
+
+impl ConvertKind {
+    /// The mnemonic word of the text syntax: `convert <name> <ty>, <value>`.
+    pub fn name(self) -> &'static str {
+        match self {
+            ConvertKind::Trunc => "trunc",
+            ConvertKind::Zext => "zext",
+            ConvertKind::Sext => "sext",
+            ConvertKind::SiToFp => "sitofp",
+            ConvertKind::UiToFp => "uitofp",
+            ConvertKind::FpToSi => "fptosi",
+            ConvertKind::FpToUi => "fptoui",
+            ConvertKind::FpResize => "fpresize",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Convert {
     pub value: Value,
+    pub kind: ConvertKind,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -257,17 +366,69 @@ pub struct GlobalAddr {
     pub via_got: bool,
 }
 
+/// Memory-access flags shared by [`Load`] and [`Store`].
+///
+/// Bitcode-relevant: see the `MemFlags` encoding in `bitcode.rs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct MemFlags {
+    /// The access must not be removed, merged or reordered by optimizers.
+    pub volatile: bool,
+    /// Guaranteed alignment of the address in bytes (power of two); 0 = no promise.
+    pub align: u32,
+    /// None = ordinary access. Some(o) = atomic load/store with ordering o.
+    /// Loads allow Relaxed|Acquire|SeqCst; stores allow Relaxed|Release|SeqCst.
+    pub ordering: Option<AtomicOrdering>,
+    /// Byte order of the memory image. `Native` and `Little` are identical on all current hosts
+    /// (both backends are little-endian); `Big` requires a byte swap.
+    pub endian: Endianness,
+}
+
+impl Default for MemFlags {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemFlags {
+    pub const fn new() -> Self {
+        Self {
+            volatile: false,
+            align: 0,
+            ordering: None,
+            endian: Endianness::Native,
+        }
+    }
+
+    /// True when the access needs nothing beyond a plain native load/store:
+    /// not volatile, not atomic, not big-endian. `align` is ignored.
+    pub fn is_plain(&self) -> bool {
+        !self.volatile && self.ordering.is_none() && self.endian != Endianness::Big
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Load {
     pub ptr: Value,
-    pub volatile: bool,
+    pub mem: MemFlags,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Store {
     pub value: Value,
     pub ptr: Value,
-    pub volatile: bool,
+    pub mem: MemFlags,
+}
+
+/// Open, target-defined operation identified by an interned name
+/// (e.g. `aarch64.aese`). The result, if any, is typed by the instruction.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Intrinsic {
+    pub symbol: u32,
+    pub args: ValueList,
+    /// One immediate operand (lane index, rounding mode, ...).
+    pub imm: i64,
+    /// false = pure (may be removed if the result is unused, or duplicated).
+    pub side_effects: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -291,11 +452,15 @@ pub struct VaEnd {
     pub list: Value,
 }
 
+/// Dot-product accumulate: `acc + sum(a[i] * b[i])` over the lanes. For integer lanes
+/// `signed` picks signed (`sdot`) or unsigned (`udot`) multiplication of the lanes; it has no
+/// effect on float lanes (the text syntax always spells it, so a parser needs one form).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Dot {
     pub acc: Value,
     pub a: Value,
     pub b: Value,
+    pub signed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -375,18 +540,21 @@ pub struct Barrier {
     pub scope: BarrierScope,
 }
 
-/// Bitcode-relevant: names map 1:1 onto NVIDIA encode ops, order pinned.
+/// Bitcode-relevant: names map 1:1 onto NVIDIA encode ops, tag values pinned. `SMin`/`SMax`
+/// read the operands as signed integers, `UMin`/`UMax` as unsigned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum AtomicOp {
     Add = 0,
-    Min = 1,
-    Max = 2,
+    SMin = 1,
+    SMax = 2,
     BitAnd = 3,
     BitOr = 4,
     BitXor = 5,
     Exchange = 6,
     CompareExchange = 7,
+    UMin = 8,
+    UMax = 9,
 }
 
 /// Bitcode-relevant: encoded as one byte, tag values pinned.
@@ -542,6 +710,9 @@ impl<'a> AttrIterator<'a> {
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Opcode {
+    /// An integer constant. Integers are signless, so only the low `bits` of the payload
+    /// matter; `legalize` rewrites the payload of every sub-64-bit constant to the
+    /// zero-extended form the backends hold values in.
     Iconst(i64),
     Fconst(f64),
     Fconst128(u128),
@@ -573,6 +744,7 @@ pub enum Opcode {
     Matmul(MatMul),
     Barrier(Barrier),
     AtomicRmw(AtomicRmw),
+    Intrinsic(Intrinsic),
     If(If),
 }
 
@@ -706,24 +878,6 @@ impl Function {
                 entry.target = to;
             }
         }
-    }
-
-    pub fn is_byte_order_tagged(&self, inst: Inst) -> bool {
-        let mut on_inst = self.attributes_of(AttrTarget::Inst(inst));
-        while let Some(attr) = on_inst.next_attr() {
-            if matches!(attr, Attribute::Endian(_)) {
-                return true;
-            }
-        }
-        if let Some(result) = self.inst_result(inst) {
-            let mut on_result = self.attributes_of(AttrTarget::Value(result));
-            while let Some(attr) = on_result.next_attr() {
-                if matches!(attr, Attribute::Endian(_)) {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     pub fn clone_attrs(&mut self, values: &[ValuePair], insts: &[InstPair]) {
@@ -868,18 +1022,55 @@ impl Function {
     }
 
     pub fn append_store(&mut self, block: Block, value: Value, ptr: Value) {
-        self.append_store_vol(block, value, ptr, false);
+        self.append_store_mem(block, value, ptr, MemFlags::new());
     }
 
-    pub fn append_store_vol(&mut self, block: Block, value: Value, ptr: Value, volatile: bool) {
-        self.append_stmt(
-            block,
-            Opcode::Store(Store {
-                value,
-                ptr,
-                volatile,
-            }),
-        );
+    pub fn append_store_mem(&mut self, block: Block, value: Value, ptr: Value, mem: MemFlags) {
+        self.append_stmt(block, Opcode::Store(Store { value, ptr, mem }));
+    }
+
+    pub fn append_load(&mut self, block: Block, ty: Type, ptr: Value, mem: MemFlags) -> Value {
+        self.append_inst(block, ty, Opcode::Load(Load { ptr, mem }))
+    }
+
+    pub fn append_intrinsic(
+        &mut self,
+        block: Block,
+        ty: Type,
+        name: &str,
+        args: &[Value],
+        imm: i64,
+        side_effects: bool,
+    ) -> Value {
+        let intrinsic = self.make_intrinsic(name, args, imm, side_effects);
+        self.append_inst(block, ty, Opcode::Intrinsic(intrinsic))
+    }
+
+    pub fn append_intrinsic_void(
+        &mut self,
+        block: Block,
+        name: &str,
+        args: &[Value],
+        imm: i64,
+        side_effects: bool,
+    ) {
+        let intrinsic = self.make_intrinsic(name, args, imm, side_effects);
+        self.append_stmt(block, Opcode::Intrinsic(intrinsic));
+    }
+
+    fn make_intrinsic(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        imm: i64,
+        side_effects: bool,
+    ) -> Intrinsic {
+        Intrinsic {
+            symbol: self.intern_symbol(name),
+            args: self.intern_values(args),
+            imm,
+            side_effects,
+        }
     }
 
     pub fn append_prefetch(&mut self, block: Block, ptr: Value) {
@@ -911,9 +1102,26 @@ impl Function {
         self.append_stmt(block, Opcode::AtomicRmw(rmw));
     }
 
-    pub fn append_dot(&mut self, block: Block, acc: Value, a: Value, b: Value) -> Value {
+    pub fn append_dot(
+        &mut self,
+        block: Block,
+        acc: Value,
+        a: Value,
+        b: Value,
+        signed: bool,
+    ) -> Value {
         let ty = self.value_type(acc);
-        self.append_inst(block, ty, Opcode::Dot(Dot { acc, a, b }))
+        self.append_inst(block, ty, Opcode::Dot(Dot { acc, a, b, signed }))
+    }
+
+    pub fn append_convert(
+        &mut self,
+        block: Block,
+        ty: Type,
+        kind: ConvertKind,
+        value: Value,
+    ) -> Value {
+        self.append_inst(block, ty, Opcode::Convert(Convert { value, kind }))
     }
 
     pub fn append_reduce(&mut self, block: Block, op: BinOp, vector: Value) -> Value {
@@ -1346,6 +1554,7 @@ impl Function {
             match &inst.op {
                 Opcode::StructNew(sn) => lists.push((sn.fields.start, sn.fields.len)),
                 Opcode::Call(c) => lists.push((c.args.start, c.args.len)),
+                Opcode::Intrinsic(i) => lists.push((i.args.start, i.args.len)),
                 Opcode::CallIndirect(c) => lists.push((c.args.start, c.args.len)),
                 Opcode::If(cf) => {
                     lists.push((cf.then.args.start, cf.then.args.len));
@@ -1416,6 +1625,7 @@ impl Function {
                     }
                 }
                 Opcode::StructNew(_)
+                | Opcode::Intrinsic(_)
                 | Opcode::Call(_)
                 | Opcode::CallIndirect(_)
                 | Opcode::If(_) => {}
@@ -1632,6 +1842,7 @@ impl Function {
             }),
             Opcode::Convert(cv) => Opcode::Convert(Convert {
                 value: remap(map, cv.value),
+                kind: cv.kind,
             }),
             Opcode::DecodeLowFloat(cv) => Opcode::DecodeLowFloat(LowFloatConvert {
                 value: remap(map, cv.value),
@@ -1676,12 +1887,12 @@ impl Function {
             }
             Opcode::Load(ld) => Opcode::Load(Load {
                 ptr: remap(map, ld.ptr),
-                volatile: ld.volatile,
+                mem: ld.mem,
             }),
             Opcode::Store(st) => Opcode::Store(Store {
                 value: remap(map, st.value),
                 ptr: remap(map, st.ptr),
-                volatile: st.volatile,
+                mem: st.mem,
             }),
             Opcode::Prefetch(pf) => Opcode::Prefetch(Prefetch {
                 ptr: remap(map, pf.ptr),
@@ -1700,6 +1911,7 @@ impl Function {
                 acc: remap(map, d.acc),
                 a: remap(map, d.a),
                 b: remap(map, d.b),
+                signed: d.signed,
             }),
             Opcode::Reduce(red) => Opcode::Reduce(Reduce {
                 vector: remap(map, red.vector),
@@ -1721,6 +1933,10 @@ impl Function {
                     a.compare = Some(remap(map, c));
                 }
                 Opcode::AtomicRmw(a)
+            }
+            Opcode::Intrinsic(mut i) => {
+                i.args = self.remap_value_list(i.args, map);
+                Opcode::Intrinsic(i)
             }
             Opcode::If(cond) => Opcode::If(If {
                 cond: remap(map, cond.cond),

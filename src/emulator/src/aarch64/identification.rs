@@ -1,4 +1,4 @@
-use super::decode::SystemRegister;
+use volt_target::aarch64::decode::SystemRegister;
 #[allow(non_upper_case_globals)]
 pub const counter_hz: u64 = 62_500_000;
 /// Cache hierarchy `CLIDR_EL1` reports: split L1, unified L2, 64-byte lines.

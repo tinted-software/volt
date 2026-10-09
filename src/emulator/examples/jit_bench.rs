@@ -20,12 +20,12 @@ fn block(n: usize, seed: u32) -> Vec<u8> {
 fn main() {
     dispatch();
     {
-        use volt_emulator::aarch64::decode::decode;
+        use volt_emulator::aarch64::host::dispatch;
         let b = block(63, 1);
         let n = b
             .chunks_exact(4)
             .take_while(|c| {
-                !decode(u32::from_le_bytes((*c).try_into().unwrap()))
+                !dispatch(u32::from_le_bytes((*c).try_into().unwrap()))
                     .unwrap()
                     .terminates()
             })

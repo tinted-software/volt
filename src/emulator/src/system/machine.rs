@@ -2,12 +2,12 @@
 use super::afdt;
 use super::fdt;
 use crate::aarch64::cpu::{Exclusive, Trap};
-use crate::aarch64::decode::SignExtend;
 use crate::aarch64::simd_struct;
 use crate::aarch64::{Cache, Cpu};
 use crate::aarch64::{exception, translate};
 use crate::devices::{bus::Device, gicv2::Gicv2, pl011::Pl011};
 use crate::memory::{GuestMemory, MemoryError};
+use volt_target::aarch64::decode::SignExtend;
 
 #[derive(Debug)]
 pub enum Error {
@@ -487,7 +487,7 @@ impl<M: GuestMemory> Machine<M> {
                     continue;
                 }
                 if let crate::aarch64::compile::Error::Decode { word, pc } = &error
-                    && crate::aarch64::decode::is_undefined(*word)
+                    && volt_target::aarch64::decode::is_undefined(*word)
                 {
                     // An Undefined Instruction exception (EC 0, 32-bit instruction).
                     self.cpu.pc = *pc;
@@ -562,12 +562,15 @@ impl<M: GuestMemory> Machine<M> {
                 Trap::Svc => {
                     self.cpu.trap = Trap::None;
                     let pc = self.cpu.pc;
+                    // The SVC immediate goes in ISS, as a BRK's does.
+                    let immediate = self.cpu.address as u32;
                     exception::take(
                         &mut self.cpu,
                         exception::Reason {
                             ec: 0x15,
                             status: 0,
                             instruction: true,
+                            iss: immediate,
                             ..Default::default()
                         },
                         pc,

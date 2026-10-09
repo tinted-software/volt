@@ -1,5 +1,5 @@
-use super::decode::{AtomicKind, SignExtend};
-use super::simd_struct::StructDesc;
+use volt_target::aarch64::decode::{AtomicKind, SignExtend};
+use volt_target::aarch64::simd_struct::StructDesc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -159,13 +159,13 @@ pub struct Cpu {
     pub apple_bank: ImpDefBank,
 }
 
-/// `S3_<op1>_c15` registers, indexed by `decode::apple_bank_slot`.
+/// `S3_<op1>_c15` registers, indexed by `volt_target::aarch64::decode::apple_bank_slot`.
 #[derive(Clone, Debug)]
-pub struct ImpDefBank(pub [u64; crate::aarch64::decode::APPLE_BANK_SLOTS]);
+pub struct ImpDefBank(pub [u64; volt_target::aarch64::decode::APPLE_BANK_SLOTS]);
 
 impl Default for ImpDefBank {
     fn default() -> Self {
-        Self([0; crate::aarch64::decode::APPLE_BANK_SLOTS])
+        Self([0; volt_target::aarch64::decode::APPLE_BANK_SLOTS])
     }
 }
 
@@ -235,8 +235,8 @@ pub struct System {
     pub hcr_el2: u64,
     pub tpidr_el2: u64,
     pub cntvoff_el2: u64,
-    /// Apple IMP-DEF configuration registers, indexed by `decode::SystemRegister::Apple`.
-    pub apple: [u64; crate::aarch64::decode::APPLE_SLOTS],
+    /// Apple IMP-DEF configuration registers, indexed by `SystemRegister::Apple`.
+    pub apple: [u64; volt_target::aarch64::decode::APPLE_SLOTS],
     /// `MIDR_EL1`, `ID_AA64PFR0_EL1` and `ID_AA64MMFR0_EL1`: the identity this CPU
     /// advertises, set by the board.
     pub midr_el1: u64,
@@ -306,7 +306,7 @@ impl Default for System {
             cntp_ctl_el0: 0,
             cntp_cval_el0: 0,
             actlr_el1: 0,
-            apple: [0; crate::aarch64::decode::APPLE_SLOTS],
+            apple: [0; volt_target::aarch64::decode::APPLE_SLOTS],
             midr_el1: crate::aarch64::identification::DEFAULT_MIDR_EL1,
             id_aa64pfr0_el1: crate::aarch64::identification::DEFAULT_ID_AA64PFR0_EL1,
             id_aa64mmfr0_el1: crate::aarch64::identification::DEFAULT_ID_AA64MMFR0_EL1,
