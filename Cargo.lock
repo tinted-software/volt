@@ -179,6 +179,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "volt-ir",
+ "volt-lift-aarch64",
  "volt-target",
 ]
 
@@ -194,6 +195,14 @@ dependencies = [
 [[package]]
 name = "volt-ir"
 version = "0.1.0"
+
+[[package]]
+name = "volt-lift-aarch64"
+version = "0.1.0"
+dependencies = [
+ "volt-ir",
+ "volt-target",
+]
 
 [[package]]
 name = "volt-target"

@@ -2,6 +2,7 @@ pub mod ahead;
 pub mod cache;
 pub mod compile;
 pub mod cpu;
+mod environment;
 pub mod exception;
 pub mod fp;
 pub mod gxf;

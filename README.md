@@ -2,6 +2,16 @@
 
 Independent Rust workspace for modular dynamic binary translation.
 
+## AArch64 lifter
+
+`volt-lift-aarch64` (`src/lift/aarch64`) is a `no_std` crate that lifts decoded AArch64
+instructions to `volt-ir` over guest state held in memory: each lifted function is
+`fn(state: *mut u8) -> u64` and returns the next guest pc. It implements the architecture
+(integer ALU, flags, branches, register-only SIMD) and leaves the machine to an
+`Environment` trait: the state layout, how memory is reached, and system instructions.
+`volt-emulator` is one environment (`Cpu` state, an inline data TLB, trap-and-resume slow
+paths); a user-mode emulator or a static translator supplies its own.
+
 ## AArch64 Linux boot
 
 `volt-boot` launches a raw arm64 Linux `Image` with a PL011 console, GICv2,
