@@ -140,9 +140,12 @@ impl CodeTracker {
     }
 }
 
-/// Host-visible RAM or a physical region without a host mapping.
+/// Host-visible RAM, read-only storage such as flash, or a physical region without
+/// a host mapping. Read-only storage serves reads and refuses writes; it has no
+/// host pointer, so generated code's stores cannot bypass the refusal.
 pub enum Backing {
     Shared(Vec<u8>),
+    ReadOnly(Vec<u8>),
     Private,
 }
 
@@ -165,6 +168,20 @@ impl Region {
             backing: Backing::Shared(bytes),
         })
     }
+
+    /// Read-only storage at `gpa`, such as a firmware image in flash.
+    pub fn rom(gpa: u64, bytes: Vec<u8>) -> Result<Self, MemoryError> {
+        let len = bytes.len() as u64;
+        gpa.checked_add(len).ok_or(MemoryError::AccessFault {
+            address: gpa,
+            length: bytes.len(),
+        })?;
+        Ok(Self {
+            gpa,
+            len,
+            backing: Backing::ReadOnly(bytes),
+        })
+    }
 }
 
 /// Owns RAM storage. Every access must fit one physical region, as in Mirage.
@@ -184,7 +201,7 @@ impl PhysicalMemory {
                     address: region.gpa,
                     length: usize::MAX,
                 })?;
-            if let Backing::Shared(bytes) = &region.backing {
+            if let Backing::Shared(bytes) | Backing::ReadOnly(bytes) = &region.backing {
                 if bytes.len() as u64 != region.len {
                     return Err(MemoryError::AccessFault {
                         address: region.gpa,
@@ -228,7 +245,7 @@ impl PhysicalMemory {
     pub fn slice(&self, address: u64, length: usize) -> Result<&[u8], MemoryError> {
         let (index, offset) = self.find(address, length)?;
         match &self.regions[index].backing {
-            Backing::Shared(bytes) => bytes
+            Backing::Shared(bytes) | Backing::ReadOnly(bytes) => bytes
                 .get(offset..offset + length)
                 .ok_or(MemoryError::AccessFault { address, length }),
             Backing::Private => Err(MemoryError::PrivateMemory),
@@ -237,14 +254,17 @@ impl PhysicalMemory {
 
     pub fn slice_mut(&mut self, address: u64, length: usize) -> Result<&mut [u8], MemoryError> {
         let (index, offset) = self.find(address, length)?;
-        // The caller writes through the returned slice, so it counts as a write
-        // already. The borrow (plus the RwLock for shared memory) keeps readers
-        // from observing the bumped version with the old bytes.
-        self.tracker.note_write(address, length);
         match &mut self.regions[index].backing {
-            Backing::Shared(bytes) => bytes
-                .get_mut(offset..offset + length)
-                .ok_or(MemoryError::AccessFault { address, length }),
+            Backing::Shared(bytes) => {
+                // The caller writes through the returned slice, so it counts as a write
+                // already. The borrow (plus the RwLock for shared memory) keeps readers
+                // from observing the bumped version with the old bytes.
+                self.tracker.note_write(address, length);
+                bytes
+                    .get_mut(offset..offset + length)
+                    .ok_or(MemoryError::AccessFault { address, length })
+            }
+            Backing::ReadOnly(_) => Err(MemoryError::AccessFault { address, length }),
             Backing::Private => Err(MemoryError::PrivateMemory),
         }
     }
@@ -302,7 +322,7 @@ impl SharedMemory {
             .iter()
             .filter_map(|region| match &region.backing {
                 Backing::Shared(bytes) => Some((region.gpa, region.len, bytes.as_ptr().cast_mut())),
-                Backing::Private => None,
+                Backing::ReadOnly(_) | Backing::Private => None,
             })
             .collect();
         Self {
@@ -422,6 +442,39 @@ mod tests {
         .unwrap();
         assert_eq!(memory.slice(0x8000, 1), Err(MemoryError::PrivateMemory));
         assert_eq!(memory.write(0x8000, b"x"), Err(MemoryError::PrivateMemory));
+    }
+
+    #[test]
+    fn read_only_regions_serve_reads_and_refuse_writes() {
+        let mut memory =
+            PhysicalMemory::new(vec![Region::rom(0, b"flash!".to_vec()).unwrap()]).unwrap();
+        let mut out = [0u8; 5];
+        memory.read(1, &mut out).unwrap();
+        assert_eq!(&out, b"lash!");
+        assert_eq!(
+            memory.write(0, b"x"),
+            Err(MemoryError::AccessFault {
+                address: 0,
+                length: 1
+            })
+        );
+        assert_eq!(memory.slice(0, 6).unwrap(), b"flash!");
+    }
+
+    #[cfg(feature = "system")]
+    #[test]
+    fn read_only_regions_have_no_host_pointer_so_stores_cannot_bypass_them() {
+        let mut shared = SharedMemory::new(
+            PhysicalMemory::new(vec![Region::rom(0, vec![0xd5; 0x1000]).unwrap()]).unwrap(),
+        );
+        assert_eq!(shared.host_page(0), None);
+        let mut out = [0u8; 4];
+        shared.read(0, &mut out).unwrap();
+        assert_eq!(out, [0xd5; 4]);
+        assert!(matches!(
+            shared.write(0, &[0]),
+            Err(MemoryError::AccessFault { .. })
+        ));
     }
 
     #[cfg(feature = "system")]

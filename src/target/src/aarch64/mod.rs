@@ -1,5 +1,4 @@
 //! AArch64 encoding, Function-based native selection, object linking and JIT.
-pub mod disasm;
 pub mod encode;
 pub mod isel;
 #[cfg(all(
@@ -11,5 +10,6 @@ pub mod isel;
 ))]
 pub mod jit;
 pub mod link;
+pub mod listing;
 pub mod object;
 pub mod peephole;

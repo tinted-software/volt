@@ -1,11 +1,18 @@
+pub mod aic;
 pub mod bus;
 pub mod gicv2;
 pub mod gicv3;
+pub mod pci;
 pub mod pl011;
+pub mod pmgr;
+pub mod s5l_uart;
 pub mod virtio_blk;
+pub mod virtio_pci;
 
 pub use bus::{Bus, BusDevice, Device};
 pub use gicv2::Gicv2;
 pub use gicv3::Gicv3;
+pub use pci::PciHost;
 pub use pl011::{LEN as PL011_LEN, Pl011};
 pub use virtio_blk::{BlockBackend, VirtioBlock, VirtioIo};
+pub use virtio_pci::VirtioBlockPci;

@@ -10,6 +10,7 @@ use crate::regalloc::wimmer::{
     UseKind,
 };
 use alloc::{vec, vec::Vec};
+use volt_ir::attribute::Endianness;
 use volt_ir::function::*;
 use volt_ir::types::{FloatKind, Type, TypeKind};
 
@@ -88,7 +89,7 @@ fn shape(f: &Function, t: Type) -> Result<(usize, bool), Error> {
                 && matches!(
                     f.types.type_kind(v.elem),
                     TypeKind::Float(FloatKind::F32)
-                        | TypeKind::Int(volt_ir::types::IntDesc { bits: 32, .. })
+                        | TypeKind::Int(volt_ir::types::IntDesc { bits: 32 })
                 ) =>
         {
             ((v.len * 4) as usize, true)
@@ -113,6 +114,31 @@ fn size(f: &Function, t: Type) -> Result<usize, Error> {
         }
         _ => Ok(shape(f, t)?.0),
     }
+}
+/// `n` truncated to `bits` and zero-extended: the canonical register form of an integer.
+fn truncated(n: i64, bits: u16) -> u64 {
+    if bits < 64 {
+        n as u64 & ((1u64 << bits) - 1)
+    } else {
+        n as u64
+    }
+}
+/// Condition code of an integer compare: equality, signed order (`l`, `le`, `g`, `ge`) or
+/// unsigned order (`b`, `be`, `a`, `ae`). The floating-point orders have no integer meaning.
+fn int_condition(op: CmpOp) -> Result<u8, Error> {
+    Ok(match op {
+        CmpOp::Eq => 4,
+        CmpOp::Ne => 5,
+        CmpOp::Slt => 12,
+        CmpOp::Sle => 14,
+        CmpOp::Sgt => 15,
+        CmpOp::Sge => 13,
+        CmpOp::Ult => 2,
+        CmpOp::Ule => 6,
+        CmpOp::Ugt => 7,
+        CmpOp::Uge => 3,
+        CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => return Err(Error::InvalidFunction),
+    })
 }
 struct Ctx<'a> {
     f: &'a Function,
@@ -151,9 +177,6 @@ impl Ctx<'_> {
             _ => 64,
         }
     }
-    fn signed(&self, v: Value) -> bool {
-        matches!(self.ty(v),TypeKind::Int(i) if i.signed)
-    }
     fn wide(&self, v: Value) -> bool {
         self.bytes(v) == 32
     }
@@ -181,7 +204,7 @@ impl Ctx<'_> {
             Location::Reg(s) => self.e.mov(r, s as u8),
             Location::Slot(s) => {
                 let d = self.slot(0, s);
-                self.e.load(r, RBP, d, 64, false);
+                self.e.load(r, RBP, d, 64);
             }
         }
     }
@@ -240,7 +263,7 @@ impl Ctx<'_> {
                     self.e
                         .xmm_mem(d as u8, RBP, off, if wide { 32 } else { 16 }, false)
                 } else {
-                    self.e.load(d as u8, RBP, off, 64, false)
+                    self.e.load(d as u8, RBP, off, 64)
                 }
             }
             (Location::Reg(s), Location::Slot(d)) => {
@@ -261,7 +284,7 @@ impl Ctx<'_> {
                     self.e
                         .xmm_mem(15, RBP, de, if wide { 32 } else { 16 }, true)
                 } else {
-                    self.e.load(R11, RBP, so, 64, false);
+                    self.e.load(R11, RBP, so, 64);
                     self.e.store(RBP, de, R11, 64)
                 }
             }
@@ -282,15 +305,28 @@ impl Ctx<'_> {
         let at = self.e.branch(None);
         self.fixups.push((at, j.target));
     }
+    /// Extends the low `bits` of `r` to 64 bits, sign-extending when `signed` and
+    /// zero-extending otherwise. Every integer narrower than 64 bits is held in its register
+    /// zero-extended; an operation that must read an operand as signed extends a scratch copy
+    /// of it with this first (`R10`/`R11` always hold such copies).
     fn normalize(&mut self, r: u8, bits: u16, signed: bool) {
-        if bits < 64 {
-            let shift = (64 - bits) as u8;
-            self.e.shift(4, r, Some(shift), true);
-            self.e
-                .shift(if signed { 7 } else { 5 }, r, Some(shift), true);
+        match (bits, signed) {
+            (64.., _) => {}
+            (32, false) => self.e.rr(None, &[0x89], r, r, false),
+            (32, true) => self.e.rr(None, &[0x63], r, r, true),
+            _ => {
+                let shift = (64 - bits) as u8;
+                self.e.shift(4, r, Some(shift), true);
+                self.e
+                    .shift(if signed { 7 } else { 5 }, r, Some(shift), true);
+            }
         }
     }
-    fn int_binary_raw(&mut self, op: BinOp, wide: bool, signed: bool) {
+    /// `r10 = r10 <op> r11` in 64-bit (`wide`) or 32-bit registers. A signed divide, remainder
+    /// or arithmetic shift reads its 32/64-bit operands as two's complement, which a
+    /// zero-extended 32-bit value already is; narrower operands must be sign-extended by the
+    /// caller (see `int_binary`).
+    fn int_binary_raw(&mut self, op: BinOp, wide: bool) -> Result<(), Error> {
         match op {
             BinOp::Add | BinOp::Sub | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => self.e.rr(
                 None,
@@ -306,52 +342,66 @@ impl Ctx<'_> {
                 wide,
             ),
             BinOp::Mul => self.e.rr(None, &[0x0f, 0xaf], R10, R11, wide),
-            BinOp::Shl | BinOp::Shr => {
+            BinOp::Shl | BinOp::Shr | BinOp::Sar => {
                 self.e.mov(RCX, R11);
                 self.e.shift(
-                    if op == BinOp::Shl {
-                        4
-                    } else if signed {
-                        7
-                    } else {
-                        5
+                    match op {
+                        BinOp::Shl => 4,
+                        BinOp::Shr => 5,
+                        _ => 7,
                     },
                     R10,
                     None,
                     wide,
                 );
             }
-            BinOp::Div | BinOp::Rem => {
+            BinOp::UDiv | BinOp::URem => {
                 self.e.mov(RAX, R10);
-                if signed {
-                    if wide {
-                        self.e.bytes(&[0x48, 0x99]);
-                    } else {
-                        self.e.bytes(&[0x99]);
-                    }
-                } else {
-                    self.e.rr(None, &[0x31], RDX, RDX, false);
-                }
-                self.e
-                    .rr(None, &[0xf7], if signed { 7 } else { 6 }, R11, wide);
-                self.e.mov(R10, if op == BinOp::Div { RAX } else { RDX });
+                self.e.rr(None, &[0x31], RDX, RDX, false);
+                self.e.rr(None, &[0xf7], 6, R11, wide);
+                self.e.mov(R10, if op == BinOp::UDiv { RAX } else { RDX });
             }
-            BinOp::Mulh => {
+            BinOp::SDiv | BinOp::SRem => {
                 self.e.mov(RAX, R10);
-                self.e
-                    .rr(None, &[0xf7], if signed { 5 } else { 4 }, R11, wide);
+                if wide {
+                    self.e.bytes(&[0x48, 0x99]);
+                } else {
+                    self.e.bytes(&[0x99]);
+                }
+                self.e.rr(None, &[0xf7], 7, R11, wide);
+                self.e.mov(R10, if op == BinOp::SDiv { RAX } else { RDX });
+            }
+            BinOp::UMulh | BinOp::SMulh => {
+                self.e.mov(RAX, R10);
+                self.e.rr(
+                    None,
+                    &[0xf7],
+                    if op == BinOp::SMulh { 5 } else { 4 },
+                    R11,
+                    wide,
+                );
                 self.e.mov(R10, RDX);
             }
+            // Floating-point only: `verify` rejects them on integers.
+            BinOp::Div | BinOp::Rem => return Err(Error::InvalidFunction),
         }
+        Ok(())
     }
-    fn int_binary(&mut self, op: BinOp, lhs: Value, result: Value) -> Result<(), Error> {
+    fn int_binary(&mut self, op: BinOp, result: Value) -> Result<(), Error> {
         let bits = self.bits(result);
-        let signed = self.signed(lhs);
-        if bits != 32 && bits != 64 {
-            self.normalize(R10, bits, signed);
-            self.normalize(R11, bits, signed);
+        let narrow = bits != 32 && bits != 64;
+        if narrow {
+            match op {
+                BinOp::SDiv | BinOp::SRem | BinOp::SMulh => {
+                    self.normalize(R10, bits, true);
+                    self.normalize(R11, bits, true);
+                }
+                BinOp::Sar => self.normalize(R10, bits, true),
+                _ => {}
+            }
         }
-        if op == BinOp::Mulh && bits != 32 && bits != 64 {
+        if narrow && matches!(op, BinOp::UMulh | BinOp::SMulh) {
+            let signed = op == BinOp::SMulh;
             if bits < 32 {
                 self.e.rr(None, &[0x0f, 0xaf], R10, R11, true);
                 self.e
@@ -366,38 +416,44 @@ impl Ctx<'_> {
                 self.e.rr(None, &[0x09], RDX, R10, true);
             }
         } else {
-            self.int_binary_raw(op, bits > 32, signed);
+            self.int_binary_raw(op, bits > 32)?;
         }
-        if bits != 32 && bits != 64 {
-            self.normalize(R10, bits, self.signed(result));
+        // Only these can leave bits above `bits` set in the result.
+        if narrow
+            && matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Shl
+                    | BinOp::SDiv
+                    | BinOp::SRem
+                    | BinOp::Sar
+                    | BinOp::SMulh
+            )
+        {
+            self.normalize(R10, bits, false);
         }
         self.put(result, R10);
         Ok(())
     }
-    fn integer_vector(&self, v: Value) -> Option<bool> {
-        match self.ty(v) {
-            TypeKind::Vector(v) => match self.f.types.type_kind(v.elem) {
-                TypeKind::Int(i) => Some(i.signed),
-                _ => None,
-            },
-            _ => None,
-        }
+    fn integer_vector(&self, v: Value) -> bool {
+        matches!(self.ty(v), TypeKind::Vector(v)
+            if matches!(self.f.types.type_kind(v.elem), TypeKind::Int(_)))
     }
-    fn vector_integer_binary(
-        &mut self,
-        op: BinOp,
-        result: Value,
-        signed: bool,
-    ) -> Result<(), Error> {
+    fn scalar_float(&self, v: Value) -> bool {
+        matches!(self.ty(v), TypeKind::Float(k) if !matches!(k, FloatKind::F128))
+    }
+    fn vector_integer_binary(&mut self, op: BinOp, result: Value) -> Result<(), Error> {
         let left = self.disp(self.temp);
         let right = self.disp(self.temp + 32);
         let out = self.disp(self.temp + 64);
         self.e.xmm_mem(13, RBP, left, self.bytes(result), true);
         self.e.xmm_mem(14, RBP, right, self.bytes(result), true);
         for lane in 0..self.bytes(result) / 4 {
-            self.e.load(R10, RBP, left + lane as i32 * 4, 32, signed);
-            self.e.load(R11, RBP, right + lane as i32 * 4, 32, signed);
-            self.int_binary_raw(op, false, signed);
+            self.e.load(R10, RBP, left + lane as i32 * 4, 32);
+            self.e.load(R11, RBP, right + lane as i32 * 4, 32);
+            self.int_binary_raw(op, false)?;
             self.e.store(RBP, out + lane as i32 * 4, R10, 32);
         }
         self.e.xmm_mem(13, RBP, out, self.bytes(result), false);
@@ -405,8 +461,8 @@ impl Ctx<'_> {
         Ok(())
     }
     fn float_binary(&mut self, op: BinOp, result: Value) -> Result<(), Error> {
-        if let Some(signed) = self.integer_vector(result) {
-            return self.vector_integer_binary(op, result, signed);
+        if self.integer_vector(result) {
+            return self.vector_integer_binary(op, result);
         }
         let opcode = match op {
             BinOp::Add => 0x58,
@@ -439,10 +495,39 @@ impl Ctx<'_> {
         self.xput(result, 13);
         Ok(())
     }
+    /// Rejects an ordered access with no instruction sequence: an ordering the access kind
+    /// cannot carry, or a type other than a 1/2/4/8-byte integer or pointer (legalize has
+    /// already turned atomic floats into integer accesses).
+    fn check_ordering(&self, mem: &MemFlags, v: Value, store: bool) -> Result<(), Error> {
+        let Some(ordering) = mem.ordering else {
+            return Ok(());
+        };
+        let scalar = match self.ty(v) {
+            TypeKind::Int(i) => matches!(i.bits, 8 | 16 | 32 | 64),
+            TypeKind::Ptr(_) => true,
+            _ => false,
+        };
+        let allowed = if store {
+            matches!(
+                ordering,
+                AtomicOrdering::Relaxed | AtomicOrdering::Release | AtomicOrdering::SeqCst
+            )
+        } else {
+            matches!(
+                ordering,
+                AtomicOrdering::Relaxed | AtomicOrdering::Acquire | AtomicOrdering::SeqCst
+            )
+        };
+        if scalar && allowed {
+            Ok(())
+        } else {
+            Err(Error::Unsupported("unorderable atomic access"))
+        }
+    }
     fn memory_load(&mut self, result: Value, base: u8, off: i32) {
         if self.fp(result) {
             if self.half(result) {
-                self.e.load(R10, base, off, 16, false);
+                self.e.load(R10, base, off, 16);
                 self.e.rr(Some(0x66), &[0x0f, 0x6e], 13, R10, false);
                 self.e.vex_rr(2, 1, 0x13, 13, 0, 13, false);
             } else {
@@ -450,8 +535,12 @@ impl Ctx<'_> {
             }
             self.xput(result, 13);
         } else {
-            self.e
-                .load(R10, base, off, self.bits(result), self.signed(result));
+            let bits = self.bits(result);
+            self.e.load(R10, base, off, bits);
+            // A load reads a whole byte, word or doubleword: clear what lies above an odd width.
+            if !matches!(bits, 8 | 16 | 32 | 64) {
+                self.normalize(R10, bits, false);
+            }
             self.put(result, R10);
         }
     }
@@ -471,7 +560,8 @@ impl Ctx<'_> {
             self.e.store(base, off, R10, self.bits(value));
         }
     }
-    fn integer_vector_compare(&mut self, c: Compare, r: Value, signed: bool) {
+    fn integer_vector_compare(&mut self, c: Compare, r: Value) -> Result<(), Error> {
+        let cc = int_condition(c.op)?;
         let left = self.disp(self.temp);
         let right = self.disp(self.temp + 32);
         let out = self.disp(self.temp + 64);
@@ -479,41 +569,9 @@ impl Ctx<'_> {
         self.xget(c.rhs, 14);
         self.e.xmm_mem(13, RBP, left, self.bytes(c.lhs), true);
         self.e.xmm_mem(14, RBP, right, self.bytes(c.rhs), true);
-        let cc = match c.op {
-            CmpOp::Eq => 4,
-            CmpOp::Ne => 5,
-            CmpOp::Lt => {
-                if signed {
-                    12
-                } else {
-                    2
-                }
-            }
-            CmpOp::Le => {
-                if signed {
-                    14
-                } else {
-                    6
-                }
-            }
-            CmpOp::Gt => {
-                if signed {
-                    15
-                } else {
-                    7
-                }
-            }
-            CmpOp::Ge => {
-                if signed {
-                    13
-                } else {
-                    3
-                }
-            }
-        };
         for lane in 0..self.bytes(c.lhs) / 4 {
-            self.e.load(R10, RBP, left + lane as i32 * 4, 32, false);
-            self.e.load(R11, RBP, right + lane as i32 * 4, 32, false);
+            self.e.load(R10, RBP, left + lane as i32 * 4, 32);
+            self.e.load(R11, RBP, right + lane as i32 * 4, 32);
             self.e.rr(None, &[0x39], R11, R10, false);
             self.e.setcc(cc, R10);
             self.e.rr(None, &[0xf7], 3, R10, false);
@@ -521,16 +579,23 @@ impl Ctx<'_> {
         }
         self.e.xmm_mem(13, RBP, out, self.bytes(r), false);
         self.xput(r, 13);
+        Ok(())
     }
     fn comparison(&mut self, c: Compare, r: Value) -> Result<(), Error> {
-        if let Some(signed) = self.integer_vector(c.lhs) {
-            self.integer_vector_compare(c, r, signed);
-            return Ok(());
+        if self.integer_vector(c.lhs) {
+            return self.integer_vector_compare(c, r);
         }
         if self.fp(c.lhs) {
             self.xget(c.lhs, 13);
             self.xget(c.rhs, 14);
             if matches!(self.ty(c.lhs), TypeKind::Vector(_)) {
+                let predicate = match c.op {
+                    CmpOp::Eq => 0,
+                    CmpOp::Ne => 4,
+                    CmpOp::Lt | CmpOp::Gt => 1,
+                    CmpOp::Le | CmpOp::Ge => 2,
+                    _ => return Err(Error::InvalidFunction),
+                };
                 let swap = matches!(c.op, CmpOp::Gt | CmpOp::Ge);
                 let (l, h) = if swap { (14, 13) } else { (13, 14) };
                 if self.wide(c.lhs) {
@@ -539,12 +604,7 @@ impl Ctx<'_> {
                     self.e.xmm_mov(15, l, false);
                     self.e.rr(None, &[0x0f, 0xc2], 15, h, false);
                 }
-                self.e.code.push(match c.op {
-                    CmpOp::Eq => 0,
-                    CmpOp::Ne => 4,
-                    CmpOp::Lt | CmpOp::Gt => 1,
-                    _ => 2,
-                });
+                self.e.code.push(predicate);
                 self.xput(r, 15);
                 return Ok(());
             }
@@ -553,13 +613,6 @@ impl Ctx<'_> {
                     "f128 compare requires softfp legalization",
                 ));
             }
-            self.e.rr(
-                if self.double(c.lhs) { Some(0x66) } else { None },
-                &[0x0f, 0x2e],
-                13,
-                14,
-                false,
-            );
             let cc = match c.op {
                 CmpOp::Eq => 4,
                 CmpOp::Ne => 5,
@@ -567,7 +620,15 @@ impl Ctx<'_> {
                 CmpOp::Le => 6,
                 CmpOp::Gt => 7,
                 CmpOp::Ge => 3,
+                _ => return Err(Error::InvalidFunction),
             };
+            self.e.rr(
+                if self.double(c.lhs) { Some(0x66) } else { None },
+                &[0x0f, 0x2e],
+                13,
+                14,
+                false,
+            );
             self.e.setcc(cc, R10);
             if matches!(c.op, CmpOp::Eq | CmpOp::Lt | CmpOp::Le) {
                 self.e.setcc(11, R11);
@@ -578,63 +639,47 @@ impl Ctx<'_> {
             }
             self.put(r, R10);
         } else {
+            let cc = int_condition(c.op)?;
+            let bits = self.bits(c.lhs);
             self.get(c.lhs, R10);
             self.get(c.rhs, R11);
-            self.e.rr(None, &[0x39], R11, R10, self.bits(c.lhs) > 32);
-            let signed = self.signed(c.lhs);
-            let cc = match c.op {
-                CmpOp::Eq => 4,
-                CmpOp::Ne => 5,
-                CmpOp::Lt => {
-                    if signed {
-                        12
-                    } else {
-                        2
-                    }
-                }
-                CmpOp::Le => {
-                    if signed {
-                        14
-                    } else {
-                        6
-                    }
-                }
-                CmpOp::Gt => {
-                    if signed {
-                        15
-                    } else {
-                        7
-                    }
-                }
-                CmpOp::Ge => {
-                    if signed {
-                        13
-                    } else {
-                        3
-                    }
-                }
-            };
+            // A signed order reads the operands as two's complement of `bits`, which the
+            // zero-extended form only is at 32 and 64 bits.
+            if matches!(c.op, CmpOp::Slt | CmpOp::Sle | CmpOp::Sgt | CmpOp::Sge)
+                && bits != 32
+                && bits != 64
+            {
+                self.normalize(R10, bits, true);
+                self.normalize(R11, bits, true);
+            }
+            self.e.rr(None, &[0x39], R11, R10, bits > 32);
             self.e.setcc(cc, R10);
             self.put(r, R10);
         }
         Ok(())
     }
-    fn convert(&mut self, s: Value, r: Value) -> Result<(), Error> {
-        match (self.fp(s), self.fp(r)) {
-            (false, false) => {
-                self.get(s, R10);
-                if self.bits(r) > self.bits(s) {
-                    self.normalize(R10, self.bits(s), self.signed(s));
+    fn convert(&mut self, c: Convert, r: Value) -> Result<(), Error> {
+        let s = c.value;
+        let (from, to) = (self.bits(s), self.bits(r));
+        match c.kind {
+            ConvertKind::Trunc | ConvertKind::Zext | ConvertKind::Sext => {
+                if self.fp(s) || self.fp(r) {
+                    return Err(Error::InvalidFunction);
                 }
-                self.normalize(R10, self.bits(r), self.signed(r));
+                self.get(s, R10);
+                match c.kind {
+                    // The source is already zero-extended: nothing to do.
+                    ConvertKind::Zext => {}
+                    ConvertKind::Trunc => self.normalize(R10, to, false),
+                    _ => {
+                        self.normalize(R10, from, true);
+                        self.normalize(R10, to, false);
+                    }
+                }
                 self.put(r, R10);
             }
-            (true, true) => {
-                if matches!(self.ty(s), TypeKind::Vector(_))
-                    || matches!(self.ty(r), TypeKind::Vector(_))
-                    || self.bytes(s) == 16
-                    || self.bytes(r) == 16
-                {
+            ConvertKind::FpResize => {
+                if !self.scalar_float(s) || !self.scalar_float(r) {
                     return Err(Error::Unsupported("composite conversion"));
                 }
                 self.xget(s, 13);
@@ -652,11 +697,18 @@ impl Ctx<'_> {
                 }
                 self.xput(r, 13);
             }
-            (false, true) => {
+            ConvertKind::SiToFp | ConvertKind::UiToFp => {
+                if self.fp(s) || !self.scalar_float(r) {
+                    return Err(Error::Unsupported("composite conversion"));
+                }
                 self.get(s, R10);
-                self.normalize(R10, self.bits(s), self.signed(s));
                 let p = Some(if self.double(r) { 0xf2 } else { 0xf3 });
-                if !self.signed(s) && self.bits(s) == 64 {
+                if c.kind == ConvertKind::SiToFp {
+                    self.normalize(R10, from, true);
+                    self.e.rr(p, &[0x0f, 0x2a], 13, R10, true);
+                } else if from == 64 {
+                    // A value with the top bit set does not fit a signed convert: halve it
+                    // (keeping the low bit for rounding), convert, and double the result.
                     self.e.rr(None, &[0x85], R10, R10, true);
                     let normal = self.e.branch(Some(9));
                     self.e.mov(R11, R10);
@@ -677,10 +729,14 @@ impl Ctx<'_> {
                 }
                 self.xput(r, 13);
             }
-            (true, false) => {
+            ConvertKind::FpToSi | ConvertKind::FpToUi => {
+                if !self.scalar_float(s) || self.fp(r) {
+                    return Err(Error::Unsupported("composite conversion"));
+                }
                 self.xget(s, 13);
                 let prefix = Some(if self.double(s) { 0xf2 } else { 0xf3 });
-                if !self.signed(r) && self.bits(r) == 64 {
+                let unsigned = c.kind == ConvertKind::FpToUi;
+                if unsigned && to == 64 {
                     self.e.imm(
                         R10,
                         if self.double(s) {
@@ -708,15 +764,10 @@ impl Ctx<'_> {
                     self.e.rr(prefix, &[0x0f, 0x2c], R10, 13, true);
                     self.e.patch(end, self.e.code.len())?;
                 } else {
-                    self.e.rr(
-                        prefix,
-                        &[0x0f, 0x2c],
-                        R10,
-                        13,
-                        self.bits(r) > 32 || !self.signed(r),
-                    );
+                    self.e
+                        .rr(prefix, &[0x0f, 0x2c], R10, 13, to > 32 || unsigned);
                 }
-                self.normalize(R10, self.bits(r), false);
+                self.normalize(R10, to, false);
                 self.put(r, R10);
             }
         }
@@ -747,7 +798,7 @@ impl Ctx<'_> {
             if self.fp(v) {
                 if xi < 8 {
                     if self.half(v) {
-                        self.e.load(R10, RBP, off, 16, false);
+                        self.e.load(R10, RBP, off, 16);
                         self.e.rr(Some(0x66), &[0x0f, 0x6e], xi, R10, false);
                     } else {
                         self.e.xmm_mem(xi, RBP, off, self.bytes(v), false);
@@ -762,16 +813,11 @@ impl Ctx<'_> {
                     stack += side;
                 }
             } else if gi < 6 {
-                self.e.load(
-                    [RDI, RSI, RDX, RCX, R8, R9][gi],
-                    RBP,
-                    off,
-                    self.bits(v),
-                    self.signed(v),
-                );
+                self.e
+                    .load([RDI, RSI, RDX, RCX, R8, R9][gi], RBP, off, self.bits(v));
                 gi += 1;
             } else {
-                self.e.load(R11, RBP, off, 64, false);
+                self.e.load(R11, RBP, off, 64);
                 self.e.store(RSP, stack, R11, 64);
                 stack += 8;
             }
@@ -780,7 +826,7 @@ impl Ctx<'_> {
             self.e.imm(RAX, xi as u64);
         }
         if target.is_some() {
-            self.e.load(R10, RBP, self.disp(self.temp), 64, false);
+            self.e.load(R10, RBP, self.disp(self.temp), 64);
             self.e.rr(None, &[0xff], 2, R10, false);
         } else {
             self.e.code.push(0xe8);
@@ -803,6 +849,8 @@ impl Ctx<'_> {
                 }
                 self.xput(r, 0);
             } else {
+                // The ABI leaves the bits above a narrow integer return undefined.
+                self.normalize(RAX, self.bits(r), false);
                 self.put(r, RAX);
             }
         }
@@ -884,18 +932,18 @@ impl Ctx<'_> {
         let limit = if fp { 176 } else { 48 };
         let step = if fp { 16 } else { 8 };
         self.get(list, R11);
-        self.e.load(R10, R11, field, 32, false);
+        self.e.load(R10, R11, field, 32);
         self.e.alu_imm(7, R10, limit, false);
         let overflow = self.e.branch(Some(3));
         self.e.mov(RCX, R10);
-        self.e.load(RAX, R11, 16, 64, false);
+        self.e.load(RAX, R11, 16, 64);
         self.e.rr(None, &[0x01], R10, RAX, true);
         self.e.alu_imm(0, RCX, step, false);
         self.e.store(R11, field, RCX, 32);
         self.memory_load(result, RAX, 0);
         let end = self.e.branch(None);
         self.e.patch(overflow, self.e.code.len())?;
-        self.e.load(RAX, R11, 8, 64, false);
+        self.e.load(RAX, R11, 8, 64);
         self.e.mov(RCX, RAX);
         self.e.alu_imm(0, RCX, 8, true);
         self.e.store(R11, 8, RCX, 64);
@@ -921,8 +969,22 @@ impl Ctx<'_> {
         let op = self.f.opcode(i);
         match op {
             Opcode::Store(s) => {
+                if s.mem.endian == Endianness::Big {
+                    return Err(Error::Unsupported("big-endian store"));
+                }
+                self.check_ordering(&s.mem, s.value, true)?;
                 self.get(s.ptr, R11);
-                self.memory_store(s.value, R11, self.fold.off_of(i) as i32);
+                let off = self.fold.off_of(i) as i32;
+                if s.mem.ordering == Some(AtomicOrdering::SeqCst) {
+                    // x86-64 (TSO) already orders relaxed and release stores with plain `mov`;
+                    // only a sequentially consistent store must also not reorder with a later
+                    // load, which `xchg` (implicitly locked) guarantees. It leaves the old
+                    // memory value in R10, a scratch register.
+                    self.get(s.value, R10);
+                    self.e.xchg(R11, off, R10, self.bits(s.value));
+                } else {
+                    self.memory_store(s.value, R11, off);
+                }
             }
             Opcode::Prefetch(p) => {
                 self.get(p.ptr, R11);
@@ -938,12 +1000,12 @@ impl Ctx<'_> {
             }
             Opcode::VaStart(v) => self.va_start(v.list),
             Opcode::VaEnd(_) => {}
+            Opcode::Intrinsic(_) => return Err(Error::Unsupported("intrinsic")),
             _ => {
                 let r = result.ok_or(Error::Unsupported("statement"))?;
                 match op {
                     Opcode::Iconst(n) => {
-                        self.e.imm(R10, n as u64);
-                        self.normalize(R10, self.bits(r), self.signed(r));
+                        self.e.imm(R10, truncated(n, self.bits(r)));
                         self.put(r, R10);
                     }
                     Opcode::Fconst(n) => {
@@ -980,7 +1042,7 @@ impl Ctx<'_> {
                         } else {
                             self.get(a.lhs, R10);
                             self.get(a.rhs, R11);
-                            self.int_binary(a.op, a.lhs, r)?;
+                            self.int_binary(a.op, r)?;
                         }
                     }
                     Opcode::ArithImm(a) => {
@@ -988,8 +1050,8 @@ impl Ctx<'_> {
                             return Err(Error::Unsupported("floating immediate arithmetic"));
                         }
                         self.get(a.lhs, R10);
-                        self.e.imm(R11, a.imm as u64);
-                        self.int_binary(a.op, a.lhs, r)?;
+                        self.e.imm(R11, truncated(a.imm, self.bits(r)));
+                        self.int_binary(a.op, r)?;
                     }
                     Opcode::Icmp(c) => self.comparison(c, r)?,
                     Opcode::Select(s) => {
@@ -1018,7 +1080,7 @@ impl Ctx<'_> {
                             self.e.patch(end, self.e.code.len())?;
                         }
                     }
-                    Opcode::Convert(c) => self.convert(c.value, r)?,
+                    Opcode::Convert(c) => self.convert(c, r)?,
                     Opcode::Unary(u) => {
                         if u.op == UnaryOp::Reinterpret {
                             if self.fp(u.value) == self.fp(r) {
@@ -1088,6 +1150,13 @@ impl Ctx<'_> {
                         }
                     }
                     Opcode::Load(l) => {
+                        if l.mem.endian == Endianness::Big {
+                            return Err(Error::Unsupported("big-endian load"));
+                        }
+                        self.check_ordering(&l.mem, r, false)?;
+                        // Every permitted load ordering is a plain `mov` on x86-64: TSO gives
+                        // loads acquire semantics, and a sequentially consistent load needs
+                        // no extra instruction because the store side is the locked one.
                         self.get(l.ptr, R11);
                         self.memory_load(r, R11, self.fold.off_of(i) as i32);
                     }
@@ -1158,15 +1227,18 @@ impl Ctx<'_> {
                             }
                             self.xput(r, 13);
                         } else {
-                            self.e.load(R10, RBP, off, 32, false);
+                            self.e.load(R10, RBP, off, 32);
                             for j in 1..self.bytes(rd.vector) / 4 {
-                                self.e.load(R11, RBP, off + (j * 4) as i32, 32, false);
-                                self.int_binary(rd.op, r, r)?;
+                                self.e.load(R11, RBP, off + (j * 4) as i32, 32);
+                                self.int_binary(rd.op, r)?;
                             }
                             self.put(r, R10);
                         }
                     }
                     Opcode::Dot(d) => {
+                        if self.integer_vector(d.a) {
+                            return Err(Error::Unsupported("integer dot product"));
+                        }
                         let off = self.disp(self.temp);
                         self.xget(d.a, 13);
                         self.xget(d.b, 14);
@@ -1209,7 +1281,7 @@ impl Ctx<'_> {
                     return Err(Error::Unsupported("too many FP returns"));
                 }
                 if self.half(v) {
-                    self.e.load(R10, RBP, off, 16, false);
+                    self.e.load(R10, RBP, off, 16);
                     self.e.rr(Some(0x66), &[0x0f, 0x6e], xi, R10, false);
                 } else {
                     self.e.xmm_mem(xi, RBP, off, self.bytes(v), false);
@@ -1219,13 +1291,12 @@ impl Ctx<'_> {
                 if gi >= 2 {
                     return Err(Error::Unsupported("too many integer returns"));
                 }
-                self.e
-                    .load([RAX, RDX][gi], RBP, off, self.bits(v), self.signed(v));
+                self.e.load([RAX, RDX][gi], RBP, off, self.bits(v));
                 gi += 1;
             }
         }
         if let Some(home) = self.sret_home {
-            self.e.load(RAX, RBP, self.disp(home), 64, false);
+            self.e.load(RAX, RBP, self.disp(home), 64);
         }
         if self.stack_alignment > 16 {
             self.e.mem(
@@ -1492,7 +1563,7 @@ fn compile_lowered(
                 c.e.store(RBP, off, [RDI, RSI, RDX, RCX, R8, R9][gi], 64);
                 gi += 1;
             } else {
-                c.e.load(R10, RBP, stack, 64, false);
+                c.e.load(R10, RBP, stack, 64);
                 c.e.store(RBP, off, R10, 64);
                 stack += 8;
             }
@@ -1541,4 +1612,132 @@ fn compile_lowered(
         code: c.e.code,
         relocs: c.relocs,
     })
+}
+
+/// Byte-level checks of ordered accesses. They only compile code, so unlike `tests.rs` (which
+/// executes it) they run on every host.
+#[cfg(test)]
+mod ordered_access_codegen {
+    use crate::x86_64::{Error, compile};
+    use volt_ir::function::*;
+
+    fn store_fn(kind: &str, ordering: Option<AtomicOrdering>) -> Function {
+        let mut f = Function::new();
+        let p = f.types.parse_type("ptr").unwrap();
+        let t = f.types.parse_type(kind).unwrap();
+        let b = f.append_block();
+        let ptr = f.append_block_param(b, p);
+        let x = f.append_block_param(b, t);
+        let mem = MemFlags {
+            ordering,
+            ..MemFlags::new()
+        };
+        f.append_store_mem(b, x, ptr, mem);
+        f.set_terminator(b, Terminator::Ret(Ret::none()));
+        f
+    }
+
+    fn load_fn(kind: &str, ordering: Option<AtomicOrdering>) -> Function {
+        let mut f = Function::new();
+        let p = f.types.parse_type("ptr").unwrap();
+        let t = f.types.parse_type(kind).unwrap();
+        let b = f.append_block();
+        let ptr = f.append_block_param(b, p);
+        let mem = MemFlags {
+            ordering,
+            ..MemFlags::new()
+        };
+        let v = f.append_load(b, t, ptr, mem);
+        f.set_terminator(b, Terminator::Ret(Ret::one(v)));
+        f
+    }
+
+    fn contains(code: &[u8], pattern: &[u8]) -> bool {
+        code.windows(pattern.len()).any(|w| w == pattern)
+    }
+
+    /// `[prefix] REX opcode modrm disp32=0` for `[r11]` and `r10`: the shape of both the plain
+    /// `mov [r11], r10` store and the `xchg [r11], r10` the encoder emits (R10 holds the value,
+    /// R11 the address).
+    fn r11_r10(prefix: &[u8], rex: u8, opcode: u8) -> Vec<u8> {
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(&[rex, opcode, 0x93, 0, 0, 0, 0]);
+        bytes
+    }
+
+    #[test]
+    fn seq_cst_stores_are_xchg_and_weaker_stores_are_plain_mov() {
+        // (type, operand-size prefix, REX, xchg opcode, mov opcode)
+        for (kind, prefix, rex, xchg, mov) in [
+            ("i8", &[][..], 0x45u8, 0x86u8, 0x88u8),
+            ("i16", &[0x66][..], 0x45, 0x87, 0x89),
+            ("i32", &[][..], 0x45, 0x87, 0x89),
+            ("i64", &[][..], 0x4d, 0x87, 0x89),
+        ] {
+            let xchg_bytes = r11_r10(prefix, rex, xchg);
+            let mov_bytes = r11_r10(prefix, rex, mov);
+            let plain = compile(&store_fn(kind, None)).unwrap();
+            assert!(contains(&plain, &mov_bytes), "{kind} plain store");
+            assert!(!contains(&plain, &xchg_bytes), "{kind} plain store");
+            for ordering in [AtomicOrdering::Relaxed, AtomicOrdering::Release] {
+                let code = compile(&store_fn(kind, Some(ordering))).unwrap();
+                assert_eq!(code, plain, "{kind} {ordering:?} must be a plain store");
+            }
+            let seq_cst = compile(&store_fn(kind, Some(AtomicOrdering::SeqCst))).unwrap();
+            assert!(contains(&seq_cst, &xchg_bytes), "{kind} seq_cst store");
+            assert!(!contains(&seq_cst, &mov_bytes), "{kind} seq_cst store");
+            assert_eq!(seq_cst.len(), plain.len(), "{kind}: xchg replaces the mov");
+        }
+    }
+
+    #[test]
+    fn ordered_loads_are_plain_movs() {
+        for kind in ["i8", "i16", "i32", "i64", "ptr"] {
+            let plain = compile(&load_fn(kind, None)).unwrap();
+            for ordering in [
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Acquire,
+                AtomicOrdering::SeqCst,
+            ] {
+                let code = compile(&load_fn(kind, Some(ordering))).unwrap();
+                assert_eq!(code, plain, "{kind} {ordering:?} must be a plain load");
+            }
+        }
+    }
+
+    #[test]
+    fn atomic_float_accesses_use_the_integer_register_path() {
+        // The float is reinterpreted into an integer register first, so an atomic f64 store
+        // compiles to the same `xchg` an atomic u64 store does.
+        let mut f = Function::new();
+        let p = f.types.parse_type("ptr").unwrap();
+        let t = f.types.parse_type("f64").unwrap();
+        let b = f.append_block();
+        let ptr = f.append_block_param(b, p);
+        let x = f.append_block_param(b, t);
+        let mem = MemFlags {
+            ordering: Some(AtomicOrdering::SeqCst),
+            ..MemFlags::new()
+        };
+        f.append_store_mem(b, x, ptr, mem);
+        f.set_terminator(b, Terminator::Ret(Ret::none()));
+        let code = compile(&f).unwrap();
+        assert!(contains(&code, &r11_r10(&[], 0x4d, 0x87)));
+    }
+
+    #[test]
+    fn orderings_without_an_instruction_fail_closed() {
+        for ordering in [AtomicOrdering::Release, AtomicOrdering::AcqRel] {
+            assert!(matches!(
+                compile(&load_fn("i32", Some(ordering))),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        for ordering in [AtomicOrdering::Acquire, AtomicOrdering::AcqRel] {
+            assert!(matches!(
+                compile(&store_fn("i32", Some(ordering))),
+                Err(Error::Unsupported(_))
+            ));
+        }
+    }
 }

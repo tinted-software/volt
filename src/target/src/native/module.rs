@@ -3,7 +3,7 @@
 
 use super::{Error as NativeError, JittedFunction, sync_icache};
 use core::{fmt, ptr::NonNull};
-use volt_ir::function::Function;
+use volt_ir::module::{DataKind, Global, Module};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::isel;
@@ -48,38 +48,12 @@ impl From<NativeError> for Error {
     }
 }
 
-pub struct ModuleFunction<'a> {
-    pub name: &'a str,
-    pub function: &'a Function,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DataKind {
-    Rodata,
-    Data,
-    Bss,
-}
-impl DataKind {
-    fn section(self) -> usize {
-        match self {
-            Self::Rodata => 0,
-            Self::Data => 1,
-            Self::Bss => 2,
-        }
+fn section_index(kind: DataKind) -> usize {
+    match kind {
+        DataKind::Rodata => 0,
+        DataKind::Data => 1,
+        DataKind::Bss => 2,
     }
-}
-
-pub struct DataReloc<'a> {
-    pub offset: usize,
-    pub symbol: &'a str,
-}
-
-pub struct ModuleData<'a> {
-    pub name: &'a str,
-    pub bytes: &'a [u8],
-    pub kind: DataKind,
-    pub size: usize,
-    pub relocs: &'a [DataReloc<'a>],
 }
 
 /// One contiguous image. Code is RX, constants R, mutable globals and BSS RW.
@@ -133,32 +107,27 @@ fn symbol_offset(
         .ok_or_else(|| Error::UndefinedSymbol(name.into()))
 }
 
-pub fn jit_module(functions: &[ModuleFunction<'_>]) -> Result<JittedModule, Error> {
-    jit_module_data(functions, &[])
-}
-
-pub fn jit_module_data(
-    functions: &[ModuleFunction<'_>],
-    data: &[ModuleData<'_>],
-) -> Result<JittedModule, Error> {
+/// Compile `module` for the host, map it as one image, and resolve every
+/// intra-module call, `global_addr`, and data relocation.
+pub fn jit_module(module: &Module) -> Result<JittedModule, Error> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (functions, data);
+        let _ = module;
         return Err(NativeError::UnsupportedHost.into());
     }
     #[cfg(target_os = "linux")]
     {
-        let mut compiled = Vec::with_capacity(functions.len());
-        let mut symbols = Vec::with_capacity(functions.len());
+        let mut compiled = Vec::with_capacity(module.functions.len());
+        let mut symbols = Vec::with_capacity(module.functions.len());
         let mut code_len = 0usize;
-        for function in functions {
+        for def in &module.functions {
             #[cfg(target_arch = "aarch64")]
-            let part = isel::compile_function(function.function, &isel::ModelCaps::default())
+            let part = isel::compile_function(&def.function, &isel::ModelCaps::default())
                 .map_err(|e| Error::Compile(Box::new(e)))?;
             #[cfg(target_arch = "x86_64")]
             let part =
-                isel::compile_object(function.function).map_err(|e| Error::Compile(Box::new(e)))?;
-            symbols.push((function.name.to_owned(), code_len));
+                isel::compile_object(&def.function).map_err(|e| Error::Compile(Box::new(e)))?;
+            symbols.push((def.name.clone(), code_len));
             #[cfg(target_arch = "aarch64")]
             let length = part
                 .code
@@ -179,7 +148,7 @@ pub fn jit_module_data(
         map_module(
             code_len,
             symbols,
-            data,
+            &module.globals,
             |memory, base, symbols, data_symbols| {
                 #[cfg(target_arch = "x86_64")]
                 memory[..code_len].fill(0x90);
@@ -293,7 +262,7 @@ pub fn jit_module_data(
 fn map_module(
     code_len: usize,
     symbols: Vec<(String, usize)>,
-    data: &[ModuleData<'_>],
+    data: &[Global],
     fill_code: impl FnOnce(
         &mut [u8],
         usize,
@@ -308,47 +277,42 @@ fn map_module(
     for name in symbols
         .iter()
         .map(|(name, _)| name.as_str())
-        .chain(data.iter().map(|d| d.name))
+        .chain(data.iter().map(|d| d.name.as_str()))
     {
         if !names.insert(name) {
             return Err(Error::DuplicateSymbol(name.into()));
         }
-    }
-    let mut extents = [0usize; 3];
-    let mut placements = Vec::with_capacity(data.len());
-    for object in data {
-        if (object.kind != DataKind::Bss && object.size != object.bytes.len())
-            || (object.kind == DataKind::Bss && !object.bytes.is_empty())
-        {
-            return Err(Error::InvalidData);
-        }
-        let section = object.kind.section();
-        let natural = object
-            .size
-            .max(1)
-            .checked_next_power_of_two()
-            .unwrap_or(8)
-            .min(8);
-        let offset = align(extents[section], natural)?;
-        extents[section] = offset
-            .checked_add(object.size)
-            .ok_or(Error::AddressOverflow)?;
-        for reloc in object.relocs {
-            if reloc
-                .offset
-                .checked_add(8)
-                .is_none_or(|end| end > object.size)
-            {
-                return Err(Error::InvalidRelocation);
-            }
-        }
-        placements.push(offset);
     }
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page <= 0 {
         return Err(NativeError::Mapping(std::io::Error::last_os_error()).into());
     }
     let page = page as usize;
+    let mut extents = [0usize; 3];
+    let mut placements = Vec::with_capacity(data.len());
+    for object in data {
+        if (object.kind != DataKind::Bss && object.size != object.bytes.len() as u64)
+            || (object.kind == DataKind::Bss && !object.bytes.is_empty())
+            || (object.align != 0 && !object.align.is_power_of_two())
+        {
+            return Err(Error::InvalidData);
+        }
+        // Each section starts page-aligned, so no stricter alignment is honorable.
+        let alignment = object.effective_align();
+        if alignment > page {
+            return Err(Error::InvalidData);
+        }
+        let size = usize::try_from(object.size).map_err(|_| Error::AddressOverflow)?;
+        let section = section_index(object.kind);
+        let offset = align(extents[section], alignment)?;
+        extents[section] = offset.checked_add(size).ok_or(Error::AddressOverflow)?;
+        for reloc in &object.relocs {
+            if reloc.offset.checked_add(8).is_none_or(|end| end > size) {
+                return Err(Error::InvalidRelocation);
+            }
+        }
+        placements.push(offset);
+    }
     let mut starts = [0usize; 3];
     let mut mapped_len = align(code_len, page)?;
     for section in 0..3 {
@@ -384,14 +348,14 @@ fn map_module(
     let memory = unsafe { core::slice::from_raw_parts_mut(address.as_ptr(), mapped_len) };
     let mut data_symbols = Vec::with_capacity(data.len());
     for (object, placement) in data.iter().zip(&placements) {
-        let offset = starts[object.kind.section()] + placement;
-        memory[offset..offset + object.bytes.len()].copy_from_slice(object.bytes);
-        data_symbols.push((object.name.to_owned(), offset));
+        let offset = starts[section_index(object.kind)] + placement;
+        memory[offset..offset + object.bytes.len()].copy_from_slice(&object.bytes);
+        data_symbols.push((object.name.clone(), offset));
     }
     let base = address.as_ptr() as usize;
     for (object, (_, offset)) in data.iter().zip(&data_symbols) {
-        for reloc in object.relocs {
-            let target = base + symbol_offset(&symbols, &data_symbols, reloc.symbol)?;
+        for reloc in &object.relocs {
+            let target = base + symbol_offset(&symbols, &data_symbols, &reloc.symbol)?;
             let site = offset + reloc.offset;
             memory[site..site + 8].copy_from_slice(&(target as u64).to_le_bytes());
         }
@@ -447,34 +411,16 @@ pub fn map_linked_aarch64(linked: &crate::aarch64::link::Linked) -> Result<Jitte
             return Err(Error::InvalidRelocation);
         }
     }
-    let data_relocs: Vec<Vec<_>> = linked
+    let objects: Vec<Global> = linked
         .data
         .iter()
-        .map(|object| {
-            object
-                .relocs
-                .iter()
-                .map(|r| DataReloc {
-                    offset: r.off,
-                    symbol: r.symbol.as_str(),
-                })
-                .collect()
-        })
-        .collect();
-    let objects: Vec<_> = linked
-        .data
-        .iter()
-        .zip(&data_relocs)
-        .map(|(object, relocs)| ModuleData {
-            name: &object.name,
-            bytes: &object.bytes,
-            kind: match object.kind {
-                link::DataKind::Rodata => DataKind::Rodata,
-                link::DataKind::Data => DataKind::Data,
-                link::DataKind::Bss => DataKind::Bss,
-            },
-            size: object.size,
-            relocs,
+        .map(|object| Global {
+            name: object.name.clone(),
+            kind: object.kind,
+            bytes: object.bytes.clone(),
+            size: object.size as u64,
+            align: object.align,
+            relocs: object.relocs.clone(),
         })
         .collect();
     map_module(
@@ -519,4 +465,198 @@ pub fn map_linked_aarch64(linked: &crate::aarch64::link::Linked) -> Result<Jitte
             Ok(())
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use volt_ir::function::{
+        ArithImm, BinOp, Function, GlobalAddr, MemFlags, Opcode, Ret, Terminator,
+    };
+    use volt_ir::module::DataReloc;
+
+    type UnaryFn = extern "C" fn(u64) -> u64;
+    type NullaryFn = extern "C" fn() -> u64;
+
+    /// `name(x) = x + 7`.
+    fn add_seven() -> Function {
+        let mut f = Function::new();
+        let ty = f.types.parse_type("i64").unwrap();
+        let block = f.append_block();
+        let x = f.append_block_param(block, ty);
+        let r = f.append_inst(
+            block,
+            ty,
+            Opcode::ArithImm(ArithImm {
+                op: BinOp::Add,
+                lhs: x,
+                imm: 7,
+            }),
+        );
+        f.set_terminator(block, Terminator::Ret(Ret::one(r)));
+        f
+    }
+
+    /// `name(x) = callee(x) * 3`.
+    fn triple_of(callee: &str) -> Function {
+        let mut f = Function::new();
+        let ty = f.types.parse_type("i64").unwrap();
+        let block = f.append_block();
+        let x = f.append_block_param(block, ty);
+        let c = f.append_call(block, ty, callee, &[x]);
+        let r = f.append_inst(
+            block,
+            ty,
+            Opcode::ArithImm(ArithImm {
+                op: BinOp::Mul,
+                lhs: c,
+                imm: 3,
+            }),
+        );
+        f.set_terminator(block, Terminator::Ret(Ret::one(r)));
+        f
+    }
+
+    /// `name() = *global`, a u64 load through `global_addr`.
+    fn load_global(global: &str) -> Function {
+        let mut f = Function::new();
+        let u64_t = f.types.parse_type("i64").unwrap();
+        let ptr_t = f.types.parse_type("ptr").unwrap();
+        let block = f.append_block();
+        let symbol = f.intern_symbol(global);
+        let addr = f.append_inst(
+            block,
+            ptr_t,
+            Opcode::GlobalAddr(GlobalAddr {
+                symbol,
+                via_got: false,
+            }),
+        );
+        let v = f.append_load(block, u64_t, addr, MemFlags::new());
+        f.set_terminator(block, Terminator::Ret(Ret::one(v)));
+        f
+    }
+
+    fn sample_module() -> Module {
+        let mut m = Module::new();
+        m.add_function("caller", triple_of("callee"));
+        m.add_function("callee", add_seven());
+        m.add_function("magic", load_global("constant"));
+        m.add_data("constant", 0x1122_3344_5566_7788u64.to_le_bytes().to_vec());
+        m.add_writable_relocs(
+            "table",
+            vec![0; 16],
+            vec![DataReloc {
+                offset: 8,
+                symbol: "callee".to_string(),
+            }],
+        );
+        m.add_bss("scratch", 24);
+        m
+    }
+
+    #[test]
+    fn functions_call_each_other_and_data_relocates_to_a_function() {
+        let jit = match jit_module(&sample_module()) {
+            Ok(jit) => jit,
+            Err(e) => panic!("jit_module failed: {e}"),
+        };
+        // SAFETY: the signatures match the IR functions above and the host ISA
+        // is the one this module was compiled for.
+        unsafe {
+            let caller: UnaryFn = jit.entry("caller").unwrap();
+            let callee: UnaryFn = jit.entry("callee").unwrap();
+            assert_eq!(callee(5), 12);
+            assert_eq!(caller(5), 36);
+            let magic: NullaryFn = jit.entry("magic").unwrap();
+            assert_eq!(magic(), 0x1122_3344_5566_7788);
+
+            // The data relocation holds the absolute address of `callee`.
+            let table = jit.data_addr("table").unwrap();
+            assert_eq!(
+                core::slice::from_raw_parts(table, 8),
+                &[0; 8],
+                "slot without a relocation stays as initialized"
+            );
+            let slot = table.add(8).cast::<u64>().read_unaligned();
+            assert_eq!(slot, callee as usize as u64);
+            let through_table: UnaryFn = core::mem::transmute::<usize, UnaryFn>(slot as usize);
+            assert_eq!(through_table(1), 8);
+
+            // Writable globals are really writable and BSS starts zeroed.
+            let scratch = jit.data_addr("scratch").unwrap();
+            assert_eq!(core::slice::from_raw_parts(scratch, 24), &[0; 24]);
+            scratch.write(0xAB);
+            assert_eq!(scratch.read(), 0xAB);
+        }
+        assert!(jit.data_addr("callee").is_none(), "functions are not data");
+        assert!(jit.data_addr("nothing").is_none());
+    }
+
+    #[test]
+    fn rejects_undefined_data_relocation_and_duplicate_names() {
+        let mut m = Module::new();
+        m.add_function("f", add_seven());
+        m.add_data_relocs(
+            "t",
+            vec![0; 8],
+            vec![DataReloc {
+                offset: 0,
+                symbol: "missing".to_string(),
+            }],
+        );
+        assert!(matches!(
+            jit_module(&m),
+            Err(Error::UndefinedSymbol(name)) if name == "missing"
+        ));
+
+        let mut m = Module::new();
+        m.add_function("same", add_seven());
+        m.add_data("same", vec![0; 8]);
+        assert!(matches!(
+            jit_module(&m),
+            Err(Error::DuplicateSymbol(name)) if name == "same"
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_globals() {
+        let mut m = Module::new();
+        m.add_function("f", add_seven());
+        m.add_data("d", vec![0; 4]);
+        m.globals[0].size = 8;
+        assert!(matches!(jit_module(&m), Err(Error::InvalidData)));
+
+        let mut m = Module::new();
+        m.add_function("f", add_seven());
+        m.add_data_relocs(
+            "short",
+            vec![0; 4],
+            vec![DataReloc {
+                offset: 0,
+                symbol: "f".to_string(),
+            }],
+        );
+        assert!(matches!(jit_module(&m), Err(Error::InvalidRelocation)));
+
+        let mut m = Module::new();
+        m.add_function("f", add_seven());
+        m.add_bss("odd", 8);
+        m.globals[0].align = 3;
+        assert!(matches!(jit_module(&m), Err(Error::InvalidData)));
+    }
+
+    #[test]
+    fn explicit_alignment_is_honored() {
+        let mut m = Module::new();
+        m.add_function("f", add_seven());
+        m.add_writable("pad", vec![1]);
+        m.add_writable("aligned", vec![0; 8]);
+        m.globals[1].align = 64;
+        let jit = match jit_module(&m) {
+            Ok(jit) => jit,
+            Err(e) => panic!("jit_module failed: {e}"),
+        };
+        assert_eq!(jit.data_addr("aligned").unwrap() as usize % 64, 0);
+    }
 }

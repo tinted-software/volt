@@ -2,6 +2,35 @@
 
 Independent Rust workspace for modular dynamic binary translation.
 
+## Crates
+
+| Crate | Path | Role |
+|---|---|---|
+| `volt-isa-aarch64` | `src/isa/aarch64` | The AArch64 instruction set and nothing else: the single decoder (`decode`, delegating to the `fp`, `simd`, `pauth` and `gxf` families), control-flow classification (`flow`) and assembly text (`format`, `objdump` spelling). `no_std`; knows nothing of guest state, memory, blocks or executable memory. |
+| `volt-ir` | `src/ir` | Typed SSA/CFG intermediate representation, verifier, legalization, bitcode. |
+| `volt-target` | `src/target` | Native code generation (AArch64, x86-64), register allocation, object/link output, executable memory. |
+| `volt-lift-aarch64` | `src/lift/aarch64` | AArch64 instruction semantics lifted to `volt-ir`, generic over an `Environment`. |
+| `volt-emulator` | `src/emulator` | Machine models, translation-block policy (`aarch64::host::ends_block`), host execution of the instruction families the lifter does not implement, devices. |
+| `volt-disasm` | `src/disasm` | Binary images, linear listing, control-flow recovery. |
+
+Every consumer of an instruction word decodes it once through `volt_isa_aarch64::decode`
+and works from the result; nothing else in the workspace masks instruction bits. Where a
+translator cuts its blocks is that translator's policy, not a property of an instruction.
+
+`cargo run --release -p volt-disasm --example fmtdiff -- <elf> [mnemonic] [limit]` checks
+the formatter against GNU `objdump`, and `--example coverage -- <elf>` reports which words
+the decoder does not recognise.
+
+## AArch64 lifter
+
+`volt-lift-aarch64` (`src/lift/aarch64`) is a `no_std` crate that lifts decoded AArch64
+instructions to `volt-ir` over guest state held in memory: each lifted function is
+`fn(state: *mut u8) -> u64` and returns the next guest pc. It implements the architecture
+(integer ALU, flags, branches, register-only SIMD) and leaves the machine to an
+`Environment` trait: the state layout, how memory is reached, and system instructions.
+`volt-emulator` is one environment (`Cpu` state, an inline data TLB, trap-and-resume slow
+paths); a user-mode emulator or a static translator supplies its own.
+
 ## AArch64 Linux boot
 
 `volt-boot` launches a raw arm64 Linux `Image` with a PL011 console, GICv2,
@@ -66,6 +95,79 @@ Not modelled: privileged-access-never is stored and saved in `SPSR_EL1` but not
 enforced by translation, the physical timer is stored but never fires, floating point
 rounds to nearest even and sets no `FPSR` flags, and the GICv3 carries only the
 virtual timer (no SPIs, SGIs or group 1).
+
+## Apple M1 (t8103) SoC
+
+`--dtb` selects the M1 machine in place of the QEMU `virt` board. The device tree is
+the Asahi kernel's board tree, which the kernel tree builds as
+`arch/arm64/boot/dts/apple/t8103-j274.dtb`:
+
+```sh
+cargo run --release --bin volt-boot -- \
+  ~/src/linux/arch/arm64/boot/Image 60 \
+  --dtb ~/src/linux/arch/arm64/boot/dts/apple/t8103-j274.dtb
+```
+
+The SoC addresses come from the M1 Mac mini's own device tree (`DeviceTree.j274ap`
+in a macOS restore image; `ipsw dtree` reads it). DRAM is at `0x8_0000_0000`, the
+interrupt controller (AIC) at `0x2_3b10_0000`, the power-state blocks at
+`0x2_3b70_0000` and `0x2_3d28_0000`, and the console (`apple,s5l-uart`, `stdout-path`)
+at `0x2_3520_0000`. The machine is one vCPU with the M1 Icestorm identity
+(`MIDR_EL1` 0x610f0220) and a 16 KiB granule, which the Asahi kernel requires.
+
+The Linux kernel boots through the AIC and the S5L console, probes its power domains,
+and panics on the missing root filesystem (`VFS: Unable to mount root fs`), which is
+the expected result without one. `--initrd`, `--disk` and `--smp` above 1 are rejected
+on this board. A kernelcache from the restore image (`MH_FILESET`) loads, with its ADT
+as `--dtb`, and enters at its reset trampoline with the cold-boot reset type. It runs
+several hundred blocks of early boot, then executes `genter` (guarded execution) before
+it has set `VBAR_EL1`. The kernel expects iBoot to have enabled GXF and set its monitor
+entry, which volt does not provide; chained fixups are still not applied.
+
+The EL2 regime is modelled: `CurrentEl` reports EL2, exceptions and `ERET` target
+`VBAR_EL2`/`ELR_EL2`/`SPSR_EL2`, translation walks `TTBR0_EL2`/`TCR_EL2`, and
+`HCR_EL2.E2H` (VHE) redirects EL1 register names accessed from EL2 to their EL2 banks.
+`system::monitor` loads Apple's SPTM monitor (`sptm.t8103.release`) the way the boot
+firmware does: the image placed in DRAM at its physical address, the MMU off, EL2, and
+`x0` a boot structure (DRAM's virtual and physical base and size, the device tree, a
+scratch buffer). The monitor builds its own translation tables, turns the MMU on, and
+checks what iBoot would have recorded in `chosen`: the `chosen/memory-map` regions, and
+`dram-base` and `dram-size`. Its strings suggest it applies the kernelcache's chained
+fixups itself (`sptm_fixup`); that is inferred, not confirmed.
+
+The region table is walked in a fixed order, and each present region must start where the
+previous present one ended. In order: `TXM-ro`, `TXM-rx`, `TXM-bx`, `TrustCache`,
+`AuxKC-ro/rx` (optional), `BootKC-rx`, `BootKC-bx`, `BootKC-ro`, `BootKC-rs`,
+`CL4-rx/ro` (optional), `DeviceTree`, `SPTM-ro`, `SPTM-rx`, `SPTM-rw`. Each part is a
+contiguous link span (`monitor::image_parts`), copied whole (`monitor::place_parts`). The
+monitor's own image stays linear, because it runs position-independently before its MMU
+is on. With that packing, validation passes and the monitor reaches `/chosen/dram-base`.
+
+It then stops in a data abort. The monitor maps physical ranges through a table of
+`{VA base, PA base, pages}` entries (the PAPT table, at `0xfffffff027105000 + 0x9d0`) that its registrar
+(`0xfffffff0270bd224`) fills. That function is `SPTM_FUNCTIONID_SLIDE_REGION`
+(found in a dispatch table at `0xfffffff027021dd0`): it registers one physical range into
+the PAPT table for callers that send the command; it checks each physical base against
+`sptm_first_dram`/`sptm_last_dram`. The bootstrap does not call it. The bootstrap fills
+the table in its own DRAM walk (`0xfffffff0270d05f4`, the entry writes at `0xfffffff0270d0804`),
+then zeroes authored pages at `0xfffffff0270d0b0c` through the same table. The abort is a
+lookup miss in that walk (`0x3fe820000000`), after which earlier notes about a
+`VA & 0x0000_ffff_ffff_ffff` physical-address convention are artifacts of the miss, not a
+register convention. GXF (`genter`, `gexit`, `GXF_*`, `VBAR_GL1`) and SPRR are not
+modelled; `genter` raises an undefined instruction.
+
+Two debugging hooks make this tractable. `Machine::set_step_trace` runs one instruction
+per block and reports each step with the system registers it changed, exception entries
+included. `Machine::set_memory_trace` reports every translated load and store (atomics
+and SIMD structure accesses excepted). Installing either turns the inline data TLB off,
+so a traced run is much slower than an untraced one.
+
+Not modelled: any arm-io device other than the AIC, the UART and the power-state
+blocks. Those addresses read as zero and writes are dropped, and the boot report counts
+them as `unmodeled device accesses`, so driver probes of missing hardware (DART, GPU,
+SMC, PCIe) fail rather than fault. Secondary cores stay powered off (the device tree
+gives them no release address), the physical timer never fires, and fast IPIs are
+storage only.
 
 ## Performance
 

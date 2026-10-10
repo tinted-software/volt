@@ -43,6 +43,8 @@ pub enum Error {
     /// A boot option the selected kernel format cannot honour.
     Unsupported(&'static str),
     Memory(MemoryError),
+    /// The device tree the caller supplied cannot be patched.
+    DeviceTree(super::dtb::Error),
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -160,6 +162,65 @@ pub fn prepare_boot(
         entry,
         boot_info: device_tree,
         initrd: initrd_info,
+    })
+}
+
+/// Place a Linux `Image` at its text offset above `ram_base`, with `tree` (a device
+/// tree the caller already built or patched) 2 MiB-aligned after it. The returned
+/// layout's `boot_info` is the tree's address, which the kernel receives in `x0`.
+pub fn place_with_tree(
+    memory: &mut impl GuestMemory,
+    image: &[u8],
+    tree: &[u8],
+    ram_base: u64,
+    ram_size: u64,
+) -> Result<Layout, Error> {
+    let header = parse(image)?;
+    let entry = load_address(ram_base, header)?;
+    let occupied = header.image_size.max(image.len() as u64);
+    let tree_at = align(entry.checked_add(occupied).ok_or(Error::NoRoom)?)?;
+    let end = ram_base.checked_add(ram_size).ok_or(Error::NoRoom)?;
+    if tree_at
+        .checked_add(tree.len() as u64)
+        .is_none_or(|tree_end| tree_end > end)
+    {
+        return Err(Error::NoRoom);
+    }
+    memory.write(entry, image).map_err(Error::Memory)?;
+    memory.write(tree_at, tree).map_err(Error::Memory)?;
+    Ok(Layout {
+        entry,
+        boot_info: tree_at,
+        initrd: None,
+    })
+}
+
+/// Where a firmware image is mapped: flash at address 0, where the core resets.
+pub const FIRMWARE_BASE: u64 = 0;
+
+/// Place a device tree at the base of RAM and enter the firmware at [`FIRMWARE_BASE`] with
+/// `x0` zero. That is what QEMU's `-bios` does: its reset path sets only the PC, and the
+/// tree goes to RAM base for a firmware that looks there. Without a tree in `x0` the
+/// tinted-boot firmware assumes its built-in platform description, which places RAM up to
+/// 4 GiB; passing the tree there would have it reserve memory it already owns.
+pub fn prepare_firmware(
+    memory: &mut impl GuestMemory,
+    ram_base: u64,
+    ram_size: u64,
+) -> Result<Layout, Error> {
+    let tree = super::fdt::build(ram_base, ram_size, "");
+    let end = ram_base.checked_add(ram_size).ok_or(Error::NoRoom)?;
+    if ram_base
+        .checked_add(tree.len() as u64)
+        .is_none_or(|tree_end| tree_end > end)
+    {
+        return Err(Error::NoRoom);
+    }
+    memory.write(ram_base, &tree).map_err(Error::Memory)?;
+    Ok(Layout {
+        entry: FIRMWARE_BASE,
+        boot_info: 0,
+        initrd: None,
     })
 }
 

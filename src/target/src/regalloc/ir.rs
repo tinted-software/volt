@@ -143,6 +143,11 @@ pub fn visit_inst_operands<F: Func>(func: &F, inst: Inst, f: &mut impl FnMut(Val
                 f(rd, false);
             }
         }
+        Opcode::Intrinsic(n) => {
+            for a in func.value_list(n.args) {
+                f(*a, false);
+            }
+        }
         Opcode::If(cf) => {
             f(cf.cond, false);
             for a in func.block_args(cf.then) {

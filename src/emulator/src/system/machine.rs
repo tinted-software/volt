@@ -2,12 +2,12 @@
 use super::afdt;
 use super::fdt;
 use crate::aarch64::cpu::{Exclusive, Trap};
-use crate::aarch64::decode::SignExtend;
 use crate::aarch64::simd_struct;
 use crate::aarch64::{Cache, Cpu};
 use crate::aarch64::{exception, translate};
 use crate::devices::{bus::Device, gicv2::Gicv2, pl011::Pl011};
 use crate::memory::{GuestMemory, MemoryError};
+use volt_isa_aarch64::decode::SignExtend;
 
 #[derive(Debug)]
 pub enum Error {
@@ -43,6 +43,34 @@ pub trait DeviceIo {
     }
     fn write_virtio(&mut self, offset: u64, size: u8, value: u64) {
         let _ = (offset, size, value);
+    }
+    /// A device the board places anywhere in the address space (the M1 SoC's
+    /// interrupt controller and UART). `None` declines the access, which then goes
+    /// to the fixed windows below.
+    fn read_soc(&mut self, cpu_id: u32, address: u64, size: u8) -> Option<u64> {
+        let _ = (cpu_id, address, size);
+        None
+    }
+    /// Returns `false` when the board's devices do not claim the address.
+    fn write_soc(&mut self, cpu_id: u32, address: u64, size: u8, value: u64) -> bool {
+        let _ = (cpu_id, address, size, value);
+        false
+    }
+    /// A read of an address the PCI bus claims: configuration space, or a memory BAR of a
+    /// function that decodes memory. `None` declines the access.
+    fn read_pci(&mut self, address: u64, size: u8) -> Option<u64> {
+        let _ = (address, size);
+        None
+    }
+    /// Returns `false` when no PCI function claims the address.
+    fn write_pci(&mut self, address: u64, size: u8, value: u64) -> bool {
+        let _ = (address, size, value);
+        false
+    }
+    /// Whether the fixed windows below (the QEMU `virt` UART, GIC and virtio) exist on
+    /// this board. A board that maps none of them makes accesses there fault.
+    fn has_fixed_windows(&self) -> bool {
+        true
     }
 }
 
@@ -167,6 +195,10 @@ pub struct Machine<M> {
     /// Set when a GICv3 forwards PPI 27 (the virtual timer) as a group 0 FIQ: the
     /// priority it was given. `None` leaves the timer to the GICv2 path.
     pub vtimer_fiq: Option<u8>,
+    /// A FIQ source the board drives directly. The M1 interrupt controller presents
+    /// the virtual timer this way: it is level-high while the timer's own condition
+    /// holds, with no GIC-style priority gating.
+    pub fiq_line: bool,
     timer_fired: bool,
     pub stalled_at: u64,
     pub stalled: Option<String>,
@@ -175,6 +207,92 @@ pub struct Machine<M> {
     pub blocks_run: u64,
     faulted: bool,
     device_access: bool,
+    /// Per-instruction observer installed by [`Machine::set_step_trace`].
+    step_trace: Option<Box<dyn FnMut(&Step) + Send>>,
+    /// Per-access observer installed by [`Machine::set_memory_trace`].
+    memory_trace: Option<Box<dyn FnMut(&MemoryAccess) + Send>>,
+    /// The step in progress: its start `pc` and the system registers before it ran.
+    step_pending: Option<(u64, crate::aarch64::cpu::System)>,
+}
+
+/// One step seen by a [`Machine::set_step_trace`] observer. Single-stepping makes each
+/// step one instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    /// Address the step started at.
+    pub pc: u64,
+    /// Address after the step.
+    pub next_pc: u64,
+    /// Each watched system register that changed, as `(name, before, after)`.
+    pub changes: Vec<(&'static str, u64, u64)>,
+}
+
+/// One load or store seen by a [`Machine::set_memory_trace`] observer, after translation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryAccess {
+    /// Address of the instruction that made the access.
+    pub pc: u64,
+    pub virtual_address: u64,
+    pub physical: u64,
+    /// Bytes accessed: 1, 2, 4, 8 or 16.
+    pub width: u8,
+    pub write: bool,
+    /// The low 8 bytes stored; 0 for a load, whose value is not known before it runs.
+    pub value: u64,
+}
+
+/// The watched system registers whose values differ between `before` and `after`.
+fn system_changes(
+    before: &crate::aarch64::cpu::System,
+    after: &crate::aarch64::cpu::System,
+) -> Vec<(&'static str, u64, u64)> {
+    macro_rules! watch {
+        ($($field:ident),* $(,)?) => {{
+            let mut changes = Vec::new();
+            $(
+                if before.$field != after.$field {
+                    changes.push((stringify!($field), before.$field as u64, after.$field as u64));
+                }
+            )*
+            changes
+        }};
+    }
+    let mut changes = watch!(
+        el,
+        spsel,
+        daif,
+        pan,
+        spsr_el1,
+        elr_el1,
+        esr_el1,
+        far_el1,
+        vbar_el1,
+        sctlr_el1,
+        ttbr0_el1,
+        ttbr1_el1,
+        tcr_el1,
+        mair_el1,
+        spsr_el2,
+        elr_el2,
+        esr_el2,
+        far_el2,
+        vbar_el2,
+        sctlr_el2,
+        ttbr0_el2,
+        ttbr1_el2,
+        tcr_el2,
+        mair_el2,
+        hcr_el2,
+        tpidr_el2,
+        cntvoff_el2,
+    );
+    const SP_NAMES: [&str; 4] = ["sp_el0", "sp_el1", "sp_el2", "sp_el3"];
+    for (index, name) in SP_NAMES.iter().enumerate() {
+        if before.sp_el[index] != after.sp_el[index] {
+            changes.push((name, before.sp_el[index], after.sp_el[index]));
+        }
+    }
+    changes
 }
 impl<M: GuestMemory> Machine<M> {
     pub fn new(memory: M) -> Self {
@@ -201,6 +319,7 @@ impl<M: GuestMemory> Machine<M> {
             watch_epoch: 0,
             irq_line: false,
             vtimer_fiq: None,
+            fiq_line: false,
             timer_fired: false,
             stalled_at: 0,
             stalled: None,
@@ -209,6 +328,9 @@ impl<M: GuestMemory> Machine<M> {
             blocks_run: 0,
             faulted: false,
             device_access: false,
+            step_trace: None,
+            memory_trace: None,
+            step_pending: None,
         }
     }
     /// A vCPU whose translated blocks are shared with other vCPUs.
@@ -260,16 +382,69 @@ impl<M: GuestMemory> Machine<M> {
                 && self.timer_due()
         })
     }
+    /// Installs a per-instruction trace. While set, blocks are compiled one instruction at
+    /// a time, and `sink` sees each step with the watched system registers it changed.
+    /// `None` removes the trace.
+    pub fn set_step_trace(&mut self, sink: Option<Box<dyn FnMut(&Step) + Send>>) {
+        self.step_trace = sink;
+        self.rebuild_cache();
+    }
+    /// Installs a per-access trace: `sink` sees every load and store the guest makes,
+    /// translated, except atomics and SIMD structure accesses. While set, the inline data
+    /// TLB is off so every access reaches the host. `None` removes the trace.
+    pub fn set_memory_trace(&mut self, sink: Option<Box<dyn FnMut(&MemoryAccess) + Send>>) {
+        self.memory_trace = sink;
+        self.rebuild_cache();
+    }
+    /// A fresh block cache for the trace state: single-step blocks while stepping, no inline
+    /// data TLB while either trace is set, and the default cache otherwise. Compiled blocks
+    /// and background compilation of the previous cache are dropped.
+    fn rebuild_cache(&mut self) {
+        let traced = self.step_trace.is_some() || self.memory_trace.is_some();
+        let inline = !traced && !std::env::var_os("VOLT_INLINE_MEMORY").is_some_and(|v| v == "0");
+        self.cache = if self.step_trace.is_some() {
+            Cache::single_step(false)
+        } else if inline {
+            Cache::with_inline_memory()
+        } else {
+            Cache::new()
+        };
+        self.step_pending = None;
+    }
     pub fn run(&mut self, serial: &mut Pl011, gic: &mut Gicv2) -> Result<Exit, Error> {
         self.run_with_devices(&mut (serial, gic))
     }
+    /// Reports the step in progress, if any, with the registers it changed. A step ends
+    /// when the next one starts or the run returns, so an exception entry the step
+    /// caused is part of it.
+    fn flush_step(&mut self) {
+        if let Some((pc, before)) = self.step_pending.take()
+            && let Some(sink) = self.step_trace.as_mut()
+        {
+            sink(&Step {
+                pc,
+                next_pc: self.cpu.pc,
+                changes: system_changes(&before, &self.cpu.system),
+            });
+        }
+    }
     pub fn run_with_devices(&mut self, devices: &mut impl DeviceIo) -> Result<Exit, Error> {
+        let result = self.run_inner(devices);
+        self.flush_step();
+        result
+    }
+    fn run_inner(&mut self, devices: &mut impl DeviceIo) -> Result<Exit, Error> {
         self.stalled = None;
         for _ in 0..64 {
             if self.timer_edge() {
                 return Ok(Exit::Timer);
             }
-            let fiq = self.fiq_asserted();
+            self.flush_step();
+            self.step_pending = self
+                .step_trace
+                .is_some()
+                .then(|| (self.cpu.pc, self.cpu.system.clone()));
+            let fiq = self.fiq_line || self.fiq_asserted();
             self.cpu.system.isr_el1 = u64::from(self.irq_line) << 7 | u64::from(fiq) << 6;
             let kind = if fiq && self.cpu.system.daif & 1 == 0 {
                 Some(exception::Kind::Fiq)
@@ -312,7 +487,7 @@ impl<M: GuestMemory> Machine<M> {
                     continue;
                 }
                 if let crate::aarch64::compile::Error::Decode { word, pc } = &error
-                    && crate::aarch64::decode::is_undefined(*word)
+                    && volt_isa_aarch64::decode::is_undefined(*word)
                 {
                     // An Undefined Instruction exception (EC 0, 32-bit instruction).
                     self.cpu.pc = *pc;
@@ -384,14 +559,35 @@ impl<M: GuestMemory> Machine<M> {
                     self.cpu.trap = Trap::None;
                     exception::eret(&mut self.cpu);
                 }
-                Trap::Svc | Trap::Brk => {
-                    let ec = if self.cpu.trap == Trap::Svc { 0x15 } else { 0 };
+                Trap::Svc => {
                     self.cpu.trap = Trap::None;
                     let pc = self.cpu.pc;
+                    // The SVC immediate goes in ISS, as a BRK's does.
+                    let immediate = self.cpu.address as u32;
                     exception::take(
                         &mut self.cpu,
                         exception::Reason {
-                            ec,
+                            ec: 0x15,
+                            status: 0,
+                            instruction: true,
+                            iss: immediate,
+                            ..Default::default()
+                        },
+                        pc,
+                    );
+                }
+                Trap::Brk => {
+                    self.cpu.trap = Trap::None;
+                    let pc = self.cpu.pc;
+                    let immediate = self.cpu.address as u32;
+                    // A breakpoint's syndrome is EC 0x3c with its immediate in ISS.
+                    exception::take(
+                        &mut self.cpu,
+                        exception::Reason {
+                            ec: 0x3c,
+                            status: 0,
+                            instruction: true,
+                            iss: immediate,
                             ..Default::default()
                         },
                         pc,
@@ -407,12 +603,12 @@ impl<M: GuestMemory> Machine<M> {
                             ec: 0,
                             instruction: true,
                             status: 0,
+                            iss: 0,
                         },
                         pc,
                     );
                 }
                 Trap::Isb => {
-                    self.tlb.purge_faults();
                     self.cpu.trap = Trap::None;
                 }
                 Trap::Tlbi => {
@@ -613,17 +809,22 @@ impl<M: GuestMemory> Machine<M> {
         }
     }
     fn abort(&mut self, address: u64, permission: bool, instruction: bool, write: bool) {
-        let ec = if instruction {
-            if self.cpu.system.el == 1 { 0x21 } else { 0x20 }
-        } else if self.cpu.system.el == 1 {
-            0x25
-        } else {
-            0x24
+        let status = match (permission, instruction) {
+            (false, _) => exception::status::TRANSLATION,
+            (true, false) => exception::status::PERMISSION,
+            (true, true) => exception::status::PERMISSION_FETCH,
         };
-        let status = if permission {
-            if instruction { 13 } else { 12 }
-        } else {
-            4
+        self.abort_with_status(address, status, instruction, write);
+    }
+    /// A synchronous abort with fault status `status`.
+    fn abort_with_status(&mut self, address: u64, status: u8, instruction: bool, write: bool) {
+        // EC 0x20/0x24 for a lower-EL abort, 0x21/0x25 for one taken from EL1 or EL2.
+        let same_el = self.cpu.system.el != 0;
+        let ec = match (instruction, same_el) {
+            (true, false) => 0x20,
+            (true, true) => 0x21,
+            (false, false) => 0x24,
+            (false, true) => 0x25,
         };
         self.cpu.trap = Trap::None;
         if !instruction {
@@ -636,6 +837,7 @@ impl<M: GuestMemory> Machine<M> {
                 ec,
                 instruction,
                 status,
+                iss: 0,
             },
             address,
         );
@@ -908,6 +1110,16 @@ impl<M: GuestMemory> Machine<M> {
                     return Ok(());
                 }
             };
+        if let Some(sink) = self.memory_trace.as_mut() {
+            sink(&MemoryAccess {
+                pc: self.cpu.pc.wrapping_sub(4),
+                virtual_address: address,
+                physical,
+                width,
+                write: !load,
+                value: if load { 0 } else { value },
+            });
+        }
         let mut bytes = [0u8; 16];
         if !load {
             if self.cpu.vector_dest {
@@ -963,7 +1175,7 @@ impl<M: GuestMemory> Machine<M> {
             };
             if matches!(result, Err(MemoryError::AccessFault { .. })) {
                 self.unmapped += 1;
-                self.abort(address, false, false, !load);
+                self.abort_with_status(address, exception::status::SYNC_EXTERNAL, false, !load);
                 return Ok(());
             }
             result
@@ -973,9 +1185,28 @@ impl<M: GuestMemory> Machine<M> {
             Err(MemoryError::AccessFault { .. }) => {
                 self.device_access = true;
                 let end = physical.checked_add(width as u64);
-                let window =
-                    |base, length| physical >= base && end.is_some_and(|end| end <= base + length);
-                let read = if window(fdt::UART_BASE, crate::devices::pl011::LEN) {
+                let fixed = devices.has_fixed_windows();
+                let window = |base, length| {
+                    fixed && physical >= base && end.is_some_and(|end| end <= base + length)
+                };
+                let soc = if load {
+                    devices.read_soc(self.cpu_id, physical, width).map(Some)
+                } else {
+                    devices
+                        .write_soc(self.cpu_id, physical, width, value)
+                        .then_some(None)
+                };
+                // Only accesses the board's own devices decline reach the PCI bus.
+                let pci = match (&soc, load) {
+                    (Some(_), _) => None,
+                    (None, true) => devices.read_pci(physical, width).map(Some),
+                    (None, false) => devices.write_pci(physical, width, value).then_some(None),
+                };
+                let read = if let Some(read) = soc {
+                    read
+                } else if let Some(read) = pci {
+                    read
+                } else if window(fdt::UART_BASE, crate::devices::pl011::LEN) {
                     if load {
                         Some(devices.read_uart(physical - fdt::UART_BASE, width))
                     } else {
@@ -1026,7 +1257,7 @@ impl<M: GuestMemory> Machine<M> {
                     }
                 } else {
                     self.unmapped += 1;
-                    self.abort(address, false, false, !load);
+                    self.abort_with_status(address, exception::status::SYNC_EXTERNAL, false, !load);
                     return Ok(());
                 };
                 if let Some(value) = read {
@@ -1272,6 +1503,131 @@ mod tests {
             machine.run(&mut serial, &mut gic).unwrap(),
             Exit::Psci { .. }
         ));
+    }
+
+    #[test]
+    fn brk_takes_an_el1_breakpoint_exception_with_its_immediate_in_the_syndrome() {
+        let mut machine = machine();
+        machine.cpu.system.el = 1;
+        machine.cpu.system.spsel = true;
+        machine.cpu.system.vbar_el1 = 0x40000400;
+        // `brk #0x800`, the immediate the kernel's `BUG()` uses.
+        machine
+            .memory
+            .write(0x40000000, &0xd4210000u32.to_le_bytes())
+            .unwrap();
+        // The vector for a synchronous exception from EL1 on SP_EL1: `VBAR + 0x200`.
+        machine
+            .memory
+            .write(0x40000600, &HVC.to_le_bytes())
+            .unwrap();
+        machine.cpu.pc = 0x40000000;
+        let mut serial = Pl011::new(|_| {});
+        let mut gic = Gicv2::default();
+        assert!(matches!(
+            machine.run(&mut serial, &mut gic).unwrap(),
+            Exit::Psci { .. }
+        ));
+        let esr = machine.cpu.system.esr_el1;
+        assert_eq!(esr >> 26, 0x3c, "EC is a breakpoint");
+        assert_eq!((esr >> 25) & 1, 1, "IL: a 32-bit instruction");
+        assert_eq!(esr & 0xffff, 0x800, "ISS is the immediate");
+        assert_eq!(
+            machine.cpu.system.elr_el1, 0x40000000,
+            "ELR is the BRK itself"
+        );
+    }
+
+    #[test]
+    fn el2_with_e2h_sends_el1_register_names_to_the_el2_banks() {
+        let mut machine = machine();
+        machine.cpu.system.el = 2;
+        machine.cpu.system.spsel = true;
+        machine.cpu.system.hcr_el2 = crate::aarch64::cpu::HCR_E2H;
+        machine.cpu.system.vbar_el1 = 0x1111;
+        machine.cpu.system.vbar_el2 = 0x2222;
+        // movz x0, #0x1234; msr vbar_el1, x0; mrs x1, vbar_el1
+        run_to_hvc(&mut machine, &[0xd2824680, 0xd518c000, 0xd538c001, HVC]);
+        assert_eq!(machine.cpu.x[1], 0x1234);
+        assert_eq!(machine.cpu.system.vbar_el2, 0x1234);
+        assert_eq!(machine.cpu.system.vbar_el1, 0x1111);
+    }
+
+    #[test]
+    fn el2_without_e2h_writes_the_el1_bank_and_leaves_el2_alone() {
+        let mut machine = machine();
+        machine.cpu.system.el = 2;
+        machine.cpu.system.spsel = true;
+        machine.cpu.system.hcr_el2 = 0;
+        machine.cpu.system.vbar_el1 = 0x1111;
+        machine.cpu.system.vbar_el2 = 0x2222;
+        run_to_hvc(&mut machine, &[0xd2824680, 0xd518c000, 0xd538c001, HVC]);
+        assert_eq!(machine.cpu.x[1], 0x1234);
+        assert_eq!(machine.cpu.system.vbar_el1, 0x1234);
+        assert_eq!(machine.cpu.system.vbar_el2, 0x2222);
+    }
+
+    #[test]
+    fn step_trace_reports_each_instruction_and_the_system_register_it_changed() {
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let mut machine = machine();
+        machine.cpu.system.el = 1;
+        machine.cpu.system.spsel = true;
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let sink = steps.clone();
+        machine.set_step_trace(Some(Box::new(move |step| {
+            sink.lock().push(step.clone());
+        })));
+        // movz x0, #1; msr vbar_el1, x0; hvc
+        run_to_hvc(&mut machine, &[0xd2800020, 0xd518c000, HVC]);
+        let steps = steps.lock();
+        let pcs: Vec<u64> = steps.iter().map(|s| s.pc).collect();
+        assert_eq!(pcs, [0x40000000, 0x40000004, 0x40000008]);
+        assert!(steps[0].changes.is_empty());
+        assert_eq!(steps[1].changes, [("vbar_el1", 0, 1)]);
+        assert_eq!(steps[1].next_pc, 0x40000008);
+    }
+    #[test]
+    fn memory_trace_reports_each_translated_access_with_its_pc_and_stored_value() {
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let mut machine = machine();
+        machine.cpu.system.el = 1;
+        machine.cpu.system.spsel = true;
+        let accesses = Arc::new(Mutex::new(Vec::new()));
+        let sink = accesses.clone();
+        machine.set_memory_trace(Some(Box::new(move |access| sink.lock().push(*access))));
+        // movz x0,#0x1234; movz x1,#0x4000,lsl #16; add x1,x1,#0x800; str x0,[x1];
+        // ldr w2,[x1,#4]
+        run_to_hvc(
+            &mut machine,
+            &[
+                0xd2824680, 0xd2a80001, 0x91200021, 0xf9000020, 0xb9400422, HVC,
+            ],
+        );
+        let accesses = accesses.lock();
+        assert_eq!(
+            *accesses,
+            [
+                MemoryAccess {
+                    pc: 0x4000000c,
+                    virtual_address: 0x40000800,
+                    physical: 0x40000800,
+                    width: 8,
+                    write: true,
+                    value: 0x1234,
+                },
+                MemoryAccess {
+                    pc: 0x40000010,
+                    virtual_address: 0x40000804,
+                    physical: 0x40000804,
+                    width: 4,
+                    write: false,
+                    value: 0,
+                },
+            ]
+        );
     }
     const LDXR_X1_X0: u32 = 0xc85f7c01;
     const STXR_W2_X3_X0: u32 = 0xc8027c03;

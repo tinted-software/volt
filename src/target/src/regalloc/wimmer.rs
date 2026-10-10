@@ -3697,10 +3697,7 @@ mod tests {
     }
 
     fn i32_ty(func: &mut Function) -> volt_ir::types::Type {
-        func.types.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }))
+        func.types.intern(TypeKind::Int(IntDesc { bits: 32 }))
     }
 
     #[test]

@@ -6,74 +6,7 @@ use super::{
     isel::{self, RelocKind},
 };
 use alloc::{string::String, vec::Vec};
-use volt_ir::function::Function;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DataKind {
-    Rodata,
-    Data,
-    Bss,
-}
-#[derive(Clone, Debug)]
-pub struct DataReloc {
-    pub off: usize,
-    pub symbol: String,
-}
-#[derive(Clone, Debug)]
-pub struct Data {
-    pub name: String,
-    pub bytes: Vec<u8>,
-    pub kind: DataKind,
-    pub size: u64,
-    pub relocs: Vec<DataReloc>,
-}
-#[derive(Clone, Debug, Default)]
-pub struct Module {
-    pub functions: Vec<(String, Function)>,
-    pub data: Vec<Data>,
-}
-impl Module {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn add_function(&mut self, name: &str, function: Function) {
-        self.functions.push((name.into(), function));
-    }
-    pub fn add_data(&mut self, name: &str, bytes: Vec<u8>) {
-        self.add_data_relocs(name, bytes, Vec::new());
-    }
-    pub fn add_data_relocs(&mut self, name: &str, bytes: Vec<u8>, relocs: Vec<DataReloc>) {
-        let size = bytes.len() as u64;
-        self.data.push(Data {
-            name: name.into(),
-            bytes,
-            kind: DataKind::Rodata,
-            size,
-            relocs,
-        });
-    }
-    pub fn add_writable(&mut self, name: &str, bytes: Vec<u8>) {
-        self.add_writable_relocs(name, bytes, Vec::new());
-    }
-    pub fn add_writable_relocs(&mut self, name: &str, bytes: Vec<u8>, relocs: Vec<DataReloc>) {
-        let size = bytes.len() as u64;
-        self.data.push(Data {
-            name: name.into(),
-            bytes,
-            kind: DataKind::Data,
-            size,
-            relocs,
-        });
-    }
-    pub fn add_bss(&mut self, name: &str, size: u64) {
-        self.data.push(Data {
-            name: name.into(),
-            bytes: Vec::new(),
-            kind: DataKind::Bss,
-            size,
-            relocs: Vec::new(),
-        });
-    }
-}
+use volt_ir::module::{Global, Module};
 #[derive(Clone, Debug)]
 pub struct Symbol {
     pub name: String,
@@ -91,12 +24,13 @@ pub struct Reloc {
 pub struct Linked {
     pub code: Vec<u8>,
     pub symbols: Vec<Symbol>,
-    pub data: Vec<Data>,
+    pub data: Vec<Global>,
     pub relocs: Vec<Reloc>,
 }
 pub fn compile_module(module: &Module) -> Result<Linked, Error> {
     let mut result = Linked::default();
-    for (name, f) in &module.functions {
+    for def in &module.functions {
+        let (name, f) = (&def.name, &def.function);
         while result.code.len() % 16 != 0 {
             result.code.push(0x90);
         }
@@ -134,18 +68,34 @@ pub fn compile_module(module: &Module) -> Result<Linked, Error> {
         pending.push(r);
     }
     result.relocs = pending;
-    result.data = module.data.clone();
+    result.data = module.globals.clone();
     Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use volt_ir::function::{Call, Opcode, Ret, RetPiece, Terminator};
+    use volt_ir::function::{Call, Function, Opcode, Ret, RetPiece, Terminator};
+    use volt_ir::module::DataKind;
+    #[test]
+    fn carries_globals_into_the_linked_image() {
+        let mut f = Function::new();
+        let ty = f.types.parse_type("i64").unwrap();
+        let block = f.append_block();
+        let v = f.append_inst(block, ty, Opcode::Iconst(1));
+        f.set_terminator(block, Terminator::Ret(Ret::one(v)));
+        let mut module = Module::new();
+        module.add_function("f", f);
+        module.add_data("ro", alloc::vec![1, 2, 3]);
+        module.add_bss("zero", 32);
+        let linked = compile_module(&module).unwrap();
+        assert_eq!(linked.data, module.globals);
+        assert_eq!(linked.data[1].kind, DataKind::Bss);
+    }
     #[test]
     fn resolves_inter_function_call_displacement() {
         let mut caller = Function::new();
-        let ty = caller.types.parse_type("u64").unwrap();
+        let ty = caller.types.parse_type("i64").unwrap();
         let block = caller.append_block();
         let symbol = caller.intern_symbol("callee");
         let args = caller.intern_values(&[]);
@@ -165,7 +115,7 @@ mod tests {
         );
         caller.set_terminator(block, Terminator::Ret(Ret::one(result)));
         let mut callee = Function::new();
-        let ty = callee.types.parse_type("u64").unwrap();
+        let ty = callee.types.parse_type("i64").unwrap();
         let block = callee.append_block();
         let result = callee.append_inst(block, ty, Opcode::Iconst(42));
         callee.set_terminator(block, Terminator::Ret(Ret::one(result)));

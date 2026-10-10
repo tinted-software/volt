@@ -17,10 +17,11 @@ use alloc::vec::Vec;
 use super::attribute::{AttrValue, Attribute, Custom, Endianness};
 use super::function::{
     Alloca, Arith, ArithImm, AtomicOp, AtomicOrdering, AtomicRmw, AtomicScope, AttrTarget, Barrier,
-    BarrierScope, BinOp, Block, Call, CallIndirect, CmpOp, Compare, Convert, Dot, Extract,
-    Function, GlobalAddr, InputSigns, Inst, Jump, Load, LowFloatConvert, MatMul, MatMulQuant,
-    MatMulQuantOut, MatMulScale, MatMulType, NvFp4Convert, Opcode, Prefetch, Reduce, Ret, RetPiece,
-    Select, Splat, Store, StructNew, Terminator, Unary, UnaryOp, VaArg, VaEnd, VaStart, Value,
+    BarrierScope, BinOp, Block, Call, CallIndirect, CmpOp, Compare, Convert, ConvertKind, Dot,
+    Extract, Function, GlobalAddr, InputSigns, Inst, Intrinsic, Jump, Load, LowFloatConvert,
+    MatMul, MatMulQuant, MatMulQuantOut, MatMulScale, MatMulType, MemFlags, NvFp4Convert, Opcode,
+    Prefetch, Reduce, Ret, RetPiece, Select, Splat, Store, StructNew, Terminator, Unary, UnaryOp,
+    VaArg, VaEnd, VaStart, Value,
 };
 use super::low_float::Format as LowFloatFormat;
 use super::nvfp4::ScaleApplication;
@@ -42,7 +43,68 @@ impl core::fmt::Display for MalformedSegment {
 /// Result alias with the error type as a defaulted parameter.
 pub type Result<T, E = MalformedSegment> = core::result::Result<T, E>;
 
-const MAGIC: &[u8; 4] = b"VBC1";
+/// `VBC3`: integer types carry no signedness (the type record is the tag and the bit width)
+/// and signedness lives on the operation, so `BinOp`, `CmpOp`, `AtomicOp`, `Convert` (a kind
+/// byte) and `Dot` (a flag byte) have the tag values pinned below.
+const MAGIC: &[u8; 4] = b"VBC3";
+
+// The wire tag of each operator enum is its discriminant. Pin them at compile time: the
+// decoder is a hardcoded switch, so a future reorder must fail to build instead of silently
+// turning one operator into another.
+const _: () = {
+    assert!(BinOp::Add as u8 == 0);
+    assert!(BinOp::Sub as u8 == 1);
+    assert!(BinOp::Mul as u8 == 2);
+    assert!(BinOp::Div as u8 == 3);
+    assert!(BinOp::Rem as u8 == 4);
+    assert!(BinOp::BitAnd as u8 == 5);
+    assert!(BinOp::BitOr as u8 == 6);
+    assert!(BinOp::BitXor as u8 == 7);
+    assert!(BinOp::Shl as u8 == 8);
+    assert!(BinOp::Shr as u8 == 9);
+    assert!(BinOp::Sar as u8 == 10);
+    assert!(BinOp::UDiv as u8 == 11);
+    assert!(BinOp::SDiv as u8 == 12);
+    assert!(BinOp::URem as u8 == 13);
+    assert!(BinOp::SRem as u8 == 14);
+    assert!(BinOp::UMulh as u8 == 15);
+    assert!(BinOp::SMulh as u8 == 16);
+    assert!(CmpOp::Eq as u8 == 0);
+    assert!(CmpOp::Ne as u8 == 1);
+    assert!(CmpOp::Lt as u8 == 2);
+    assert!(CmpOp::Le as u8 == 3);
+    assert!(CmpOp::Gt as u8 == 4);
+    assert!(CmpOp::Ge as u8 == 5);
+    assert!(CmpOp::Slt as u8 == 6);
+    assert!(CmpOp::Sle as u8 == 7);
+    assert!(CmpOp::Sgt as u8 == 8);
+    assert!(CmpOp::Sge as u8 == 9);
+    assert!(CmpOp::Ult as u8 == 10);
+    assert!(CmpOp::Ule as u8 == 11);
+    assert!(CmpOp::Ugt as u8 == 12);
+    assert!(CmpOp::Uge as u8 == 13);
+    assert!(ConvertKind::Trunc as u8 == 0);
+    assert!(ConvertKind::Zext as u8 == 1);
+    assert!(ConvertKind::Sext as u8 == 2);
+    assert!(ConvertKind::SiToFp as u8 == 3);
+    assert!(ConvertKind::UiToFp as u8 == 4);
+    assert!(ConvertKind::FpToSi as u8 == 5);
+    assert!(ConvertKind::FpToUi as u8 == 6);
+    assert!(ConvertKind::FpResize as u8 == 7);
+    assert!(AtomicOp::Add as u8 == 0);
+    assert!(AtomicOp::SMin as u8 == 1);
+    assert!(AtomicOp::SMax as u8 == 2);
+    assert!(AtomicOp::BitAnd as u8 == 3);
+    assert!(AtomicOp::BitOr as u8 == 4);
+    assert!(AtomicOp::BitXor as u8 == 5);
+    assert!(AtomicOp::Exchange as u8 == 6);
+    assert!(AtomicOp::CompareExchange as u8 == 7);
+    assert!(AtomicOp::UMin as u8 == 8);
+    assert!(AtomicOp::UMax as u8 == 9);
+};
+
+/// Flag bits of a `dot` record's flag byte.
+const DOT_FLAG_SIGNED: u8 = 1 << 0;
 
 /// Bytes the stream header occupies before the type table: the magic, the
 /// whole-function flag byte, and the fixed-parameter count.
@@ -70,7 +132,7 @@ const ATTR_INLINE: u8 = 0;
 const ATTR_NORETURN: u8 = 1;
 const ATTR_COLD: u8 = 2;
 const ATTR_ALIGN: u8 = 3;
-const ATTR_ENDIAN: u8 = 4;
+// Attribute tag 4 is retired (it was `endian`, now `MemFlags::endian`); 5 stays pinned.
 const ATTR_CUSTOM: u8 = 5;
 
 /// Namespaced attribute payload tags (stable on the wire).
@@ -117,12 +179,81 @@ const OP_DEQUANTIZE_NVFP4: u8 = 28;
 const OP_QUANTIZE_NVFP4: u8 = 29;
 const OP_REDUCE: u8 = 30;
 const OP_SPLAT: u8 = 31;
+const OP_INTRINSIC: u8 = 32;
 
 /// An `atomic_rmw` record flag bit: the compare operand follows the two
 /// ordinary operand slots. Written from the field and read back into it, so a
 /// record round-trips whatever the opcode holds, rather than depending on the
 /// op/compare agreement `verify` enforces.
 const ATOMIC_FLAG_COMPARE: u8 = 1 << 0;
+
+/// An `intrinsic` record flag bit: the intrinsic has side effects.
+const INTRINSIC_FLAG_SIDE_EFFECTS: u8 = 1 << 0;
+
+// `MemFlags` wire layout, two bytes (tag values pinned; a decoder rejects any other):
+//
+//   byte 0, flags:
+//     bit 0      volatile
+//     bits 1..=2 endian:   0 = Native, 1 = Little, 2 = Big (3 invalid)
+//     bits 3..=5 ordering: 0 = none, otherwise 1 + AtomicOrdering tag
+//                          (1 Relaxed, 2 Acquire, 3 Release, 4 AcqRel, 5 SeqCst; 6, 7 invalid)
+//     bits 6..=7 reserved, must be zero
+//   byte 1, align: 0 = no promise, otherwise log2(align) + 1 (so 1..=32)
+const MEM_FLAG_VOLATILE: u8 = 1 << 0;
+const MEM_ENDIAN_SHIFT: u8 = 1;
+const MEM_ORDER_SHIFT: u8 = 3;
+
+/// Write a `MemFlags`. A non-zero `align` that is not a power of two has no encoding (the
+/// verifier rejects it too), so such a function cannot be serialized.
+fn write_mem_flags(w: &mut Writer, mem: &MemFlags) -> Result<()> {
+    let endian: u8 = match mem.endian {
+        Endianness::Native => 0,
+        Endianness::Little => 1,
+        Endianness::Big => 2,
+    };
+    debug_assert_eq!(AtomicOrdering::Relaxed as u8, 0);
+    debug_assert_eq!(AtomicOrdering::Acquire as u8, 1);
+    debug_assert_eq!(AtomicOrdering::Release as u8, 2);
+    debug_assert_eq!(AtomicOrdering::AcqRel as u8, 3);
+    debug_assert_eq!(AtomicOrdering::SeqCst as u8, 4);
+    let ordering: u8 = mem.ordering.map_or(0, |o| 1 + o as u8);
+    let align: u8 = match mem.align {
+        0 => 0,
+        a if a.is_power_of_two() => a.trailing_zeros() as u8 + 1,
+        _ => return Err(MalformedSegment),
+    };
+    w.u8((mem.volatile as u8 * MEM_FLAG_VOLATILE)
+        | endian << MEM_ENDIAN_SHIFT
+        | ordering << MEM_ORDER_SHIFT);
+    w.u8(align);
+    Ok(())
+}
+
+/// Read a `MemFlags`; the bytes come off an UNTRUSTED stream, so every unknown selector is a
+/// recoverable fault and never an invalid enum.
+fn read_mem_flags(r: &mut Reader<'_>) -> Result<MemFlags> {
+    let flags = r.u8()?;
+    let align = r.u8()?;
+    if flags >> 6 != 0 || align > 32 {
+        return Err(MalformedSegment);
+    }
+    let endian = match (flags >> MEM_ENDIAN_SHIFT) & 0b11 {
+        0 => Endianness::Native,
+        1 => Endianness::Little,
+        2 => Endianness::Big,
+        _ => return Err(MalformedSegment),
+    };
+    let ordering = match (flags >> MEM_ORDER_SHIFT) & 0b111 {
+        0 => None,
+        n => Some(try_atomic_ordering(n - 1)?),
+    };
+    Ok(MemFlags {
+        volatile: flags & MEM_FLAG_VOLATILE != 0,
+        align: if align == 0 { 0 } else { 1u32 << (align - 1) },
+        ordering,
+        endian,
+    })
+}
 
 struct Writer {
     bytes: Vec<u8>,
@@ -229,7 +360,7 @@ pub fn encode(func: &Function) -> Result<Vec<u8>> {
         let insts = func.block_insts(block);
         w.u32(insts.len() as u32);
         for inst in insts {
-            write_inst(&mut w, func, *inst, &serial);
+            write_inst(&mut w, func, *inst, &serial)?;
         }
 
         write_term(&mut w, func, block, &serial);
@@ -308,16 +439,6 @@ fn write_attr(w: &mut Writer, attr: &Attribute) {
             w.u8(ATTR_ALIGN);
             w.u32(*a);
         }
-        Attribute::Endian(e) => {
-            w.u8(ATTR_ENDIAN);
-            // The decoder maps this byte back with a range check, so pin the
-            // tag values here. This follows the `float` and `ptr` arms of
-            // `write_type`.
-            debug_assert_eq!(Endianness::Little as u8, 0);
-            debug_assert_eq!(Endianness::Big as u8, 1);
-            debug_assert_eq!(Endianness::Native as u8, 2);
-            w.u8(*e as u8);
-        }
         Attribute::Custom(c) => {
             w.u8(ATTR_CUSTOM);
             w.string(&c.namespace);
@@ -343,7 +464,6 @@ fn write_type(w: &mut Writer, kind: &TypeKind) {
         TypeKind::Bool => w.u8(0),
         TypeKind::Int(i) => {
             w.u8(1);
-            w.u8(if i.signed { 0 } else { 1 });
             w.u16(i.bits);
         }
         TypeKind::Float(f) => {
@@ -392,7 +512,7 @@ fn write_type(w: &mut Writer, kind: &TypeKind) {
     }
 }
 
-fn write_inst(w: &mut Writer, func: &Function, inst: Inst, serial: &[u32]) {
+fn write_inst(w: &mut Writer, func: &Function, inst: Inst, serial: &[u32]) -> Result<()> {
     let result = func.inst_result(inst);
     w.u8(if result.is_some() { 1 } else { 0 });
     if let Some(r) = result {
@@ -452,6 +572,7 @@ fn write_inst(w: &mut Writer, func: &Function, inst: Inst, serial: &[u32]) {
         }
         Opcode::Convert(c) => {
             w.u8(OP_CONVERT);
+            w.u8(c.kind as u8);
             w.u32(serial[c.value.0 as usize]);
         }
         Opcode::DecodeLowFloat(c) => {
@@ -526,19 +647,36 @@ fn write_inst(w: &mut Writer, func: &Function, inst: Inst, serial: &[u32]) {
                 &c.ret_pieces,
             );
         }
-        // `volatile` marks an access the optimizer must not remove, move or
-        // merge. A stream that drops it turns an MMIO register access into an
-        // ordinary one.
+        // The `MemFlags` (volatile, byte order, atomic ordering, alignment) change what the
+        // access means: a stream that drops `volatile` turns an MMIO register access into an
+        // ordinary one, and one that drops `ordering` or `endian` silently changes the data
+        // or the memory model. See `write_mem_flags` for the pinned layout.
         Opcode::Load(l) => {
             w.u8(OP_LOAD);
             w.u32(serial[l.ptr.0 as usize]);
-            w.u8(l.volatile as u8);
+            write_mem_flags(w, &l.mem)?;
         }
         Opcode::Store(st) => {
             w.u8(OP_STORE);
             w.u32(serial[st.value.0 as usize]);
             w.u32(serial[st.ptr.0 as usize]);
-            w.u8(st.volatile as u8);
+            write_mem_flags(w, &st.mem)?;
+        }
+        // Operands are the arguments, then the immediate and the effect flag.
+        Opcode::Intrinsic(i) => {
+            w.u8(OP_INTRINSIC);
+            w.u32(i.symbol);
+            let args = func.value_list(i.args);
+            w.u32(args.len() as u32);
+            for a in args {
+                w.u32(serial[a.0 as usize]);
+            }
+            w.u64(i.imm as u64);
+            w.u8(if i.side_effects {
+                INTRINSIC_FLAG_SIDE_EFFECTS
+            } else {
+                0
+            });
         }
         Opcode::Prefetch(pf) => {
             w.u8(OP_PREFETCH);
@@ -572,14 +710,6 @@ fn write_inst(w: &mut Writer, func: &Function, inst: Inst, serial: &[u32]) {
             w.u8(OP_ATOMIC_RMW);
             // The decoder maps these three bytes back with range checks, so pin
             // the tag values here.
-            debug_assert_eq!(AtomicOp::Add as u8, 0);
-            debug_assert_eq!(AtomicOp::Min as u8, 1);
-            debug_assert_eq!(AtomicOp::Max as u8, 2);
-            debug_assert_eq!(AtomicOp::BitAnd as u8, 3);
-            debug_assert_eq!(AtomicOp::BitOr as u8, 4);
-            debug_assert_eq!(AtomicOp::BitXor as u8, 5);
-            debug_assert_eq!(AtomicOp::Exchange as u8, 6);
-            debug_assert_eq!(AtomicOp::CompareExchange as u8, 7);
             debug_assert_eq!(AtomicOrdering::Relaxed as u8, 0);
             debug_assert_eq!(AtomicOrdering::Acquire as u8, 1);
             debug_assert_eq!(AtomicOrdering::Release as u8, 2);
@@ -604,6 +734,7 @@ fn write_inst(w: &mut Writer, func: &Function, inst: Inst, serial: &[u32]) {
         }
         Opcode::Dot(d) => {
             w.u8(OP_DOT);
+            w.u8(if d.signed { DOT_FLAG_SIGNED } else { 0 });
             w.u32(serial[d.acc.0 as usize]);
             w.u32(serial[d.a.0 as usize]);
             w.u32(serial[d.b.0 as usize]);
@@ -649,6 +780,7 @@ fn write_inst(w: &mut Writer, func: &Function, inst: Inst, serial: &[u32]) {
             w.u8(ga.via_got as u8);
         }
     }
+    Ok(())
 }
 
 /// Write the quant epilogue, mirroring the Zig field order: relu, out,
@@ -967,17 +1099,6 @@ fn read_attr(r: &mut Reader<'_>) -> Result<Attribute> {
         ATTR_NORETURN => Attribute::Noreturn,
         ATTR_COLD => Attribute::Cold,
         ATTR_ALIGN => Attribute::Align(r.u32()?),
-        ATTR_ENDIAN => {
-            // The byte comes off an UNTRUSTED stream, so an unknown value is a
-            // recoverable fault and never an invalid enum.
-            let order = match r.u8()? {
-                0 => Endianness::Little,
-                1 => Endianness::Big,
-                2 => Endianness::Native,
-                _ => return Err(MalformedSegment),
-            };
-            Attribute::Endian(order)
-        }
         ATTR_CUSTOM => {
             let namespace = read_string(r)?;
             let key = read_string(r)?;
@@ -1013,9 +1134,8 @@ fn read_type(
     Ok(match r.u8()? {
         0 => func.types.intern(TypeKind::Bool),
         1 => {
-            let signed = r.u8()? == 0; // 0 = signed, 1 = unsigned
             let bits = r.u16()?;
-            func.types.intern(TypeKind::Int(IntDesc { signed, bits }))
+            func.types.intern(TypeKind::Int(IntDesc { bits }))
         }
         2 => {
             let kind = match r.u8()? {
@@ -1241,6 +1361,12 @@ impl Fixup {
             }
             Opcode::Reduce(red) => red.vector = next(),
             Opcode::Splat(sp) => sp.scalar = next(),
+            Opcode::Intrinsic(i) => {
+                let args = i.args;
+                for a in func.value_list_mut(args) {
+                    *a = next();
+                }
+            }
             Opcode::Matmul(mm) => {
                 mm.a = next();
                 mm.b = next();
@@ -1391,6 +1517,7 @@ fn requires_result(tag: u8) -> bool {
     !matches!(
         tag,
         OP_STORE
+            | OP_INTRINSIC
             | OP_PREFETCH
             | OP_VA_START
             | OP_VA_END
@@ -1404,7 +1531,7 @@ fn requires_result(tag: u8) -> bool {
 }
 
 /// The result canonicality a record's own has-result type must satisfy: a
-/// low-float decode yields f32, an encode yields the unsigned payload width;
+/// low-float decode yields f32, an encode yields the payload-width integer;
 /// anything else is a stream this build cannot read.
 fn canonical_low_float_result(
     func: &Function,
@@ -1414,16 +1541,16 @@ fn canonical_low_float_result(
 ) -> bool {
     match func.types.type_kind(result_type) {
         TypeKind::Float(f) => decode_direction && *f == FloatKind::F32,
-        TypeKind::Int(i) => !decode_direction && !i.signed && i.bits == format.payload_bits(),
+        TypeKind::Int(i) => !decode_direction && i.bits == format.payload_bits(),
         _ => false,
     }
 }
 
-/// Same rule for the NVFP4 records: dequantize yields f32, quantize yields u8.
+/// Same rule for the NVFP4 records: dequantize yields f32, quantize yields i8.
 fn canonical_nvfp4_result(func: &Function, result_type: Type, dequantize_direction: bool) -> bool {
     match func.types.type_kind(result_type) {
         TypeKind::Float(f) => dequantize_direction && *f == FloatKind::F32,
-        TypeKind::Int(i) => !dequantize_direction && !i.signed && i.bits == 8,
+        TypeKind::Int(i) => !dequantize_direction && i.bits == 8,
         _ => false,
     }
 }
@@ -1581,13 +1708,14 @@ fn read_inst(
             )
         }
         OP_CONVERT => {
+            let kind = try_convert_kind(r.u8()?)?;
             fixups.push_slot(r.u32()?);
             append_res(
                 func,
                 block,
                 serial,
                 rty,
-                Opcode::Convert(Convert { value: dummy }),
+                Opcode::Convert(Convert { value: dummy, kind }),
             )
         }
         OP_DECODE_LOW_FLOAT | OP_ENCODE_LOW_FLOAT => {
@@ -1717,31 +1845,60 @@ fn read_inst(
         }
         OP_LOAD => {
             fixups.push_slot(r.u32()?);
-            let is_volatile = r.u8()? != 0;
+            let mem = read_mem_flags(r)?;
             append_res(
                 func,
                 block,
                 serial,
                 rty,
-                Opcode::Load(Load {
-                    ptr: dummy,
-                    volatile: is_volatile,
-                }),
+                Opcode::Load(Load { ptr: dummy, mem }),
             )
         }
         OP_STORE => {
             for _ in 0..2 {
                 fixups.push_slot(r.u32()?);
             }
-            let is_volatile = r.u8()? != 0;
+            let mem = read_mem_flags(r)?;
             func.append_stmt_raw(
                 block,
                 Opcode::Store(Store {
                     value: dummy,
                     ptr: dummy,
-                    volatile: is_volatile,
+                    mem,
                 }),
             )
+        }
+        OP_INTRINSIC => {
+            let symbol = r.u32()?;
+            // The stream is UNTRUSTED: the name must exist in the symbol table.
+            if symbol as usize >= func.symbol_count() {
+                return Err(MalformedSegment);
+            }
+            let n = r.u32()? as usize;
+            if n > r.remaining() {
+                return Err(MalformedSegment);
+            }
+            for _ in 0..n {
+                fixups.push_slot(r.u32()?);
+            }
+            let imm = r.u64()? as i64;
+            let flags = r.u8()?;
+            if flags & !INTRINSIC_FLAG_SIDE_EFFECTS != 0 {
+                return Err(MalformedSegment);
+            }
+            let dummies = alloc::vec![dummy; n];
+            let op = Opcode::Intrinsic(Intrinsic {
+                symbol,
+                args: func.intern_values(&dummies),
+                imm,
+                side_effects: flags & INTRINSIC_FLAG_SIDE_EFFECTS != 0,
+            });
+            // The result is OPTIONAL, exactly as for a `call`.
+            if has_result {
+                append_res(func, block, serial, rty, op)
+            } else {
+                func.append_stmt_raw(block, op)
+            }
         }
         OP_PREFETCH => {
             fixups.push_slot(r.u32()?);
@@ -1822,6 +1979,10 @@ fn read_inst(
             }
         }
         OP_DOT => {
+            let flags = r.u8()?;
+            if flags & !DOT_FLAG_SIGNED != 0 {
+                return Err(MalformedSegment);
+            }
             for _ in 0..3 {
                 fixups.push_slot(r.u32()?);
             }
@@ -1834,6 +1995,7 @@ fn read_inst(
                     acc: dummy,
                     a: dummy,
                     b: dummy,
+                    signed: flags & DOT_FLAG_SIGNED != 0,
                 }),
             )
         }
@@ -1982,13 +2144,15 @@ fn read_inst(
 fn try_atomic_op(raw: u8) -> Result<AtomicOp> {
     Ok(match raw {
         0 => AtomicOp::Add,
-        1 => AtomicOp::Min,
-        2 => AtomicOp::Max,
+        1 => AtomicOp::SMin,
+        2 => AtomicOp::SMax,
         3 => AtomicOp::BitAnd,
         4 => AtomicOp::BitOr,
         5 => AtomicOp::BitXor,
         6 => AtomicOp::Exchange,
         7 => AtomicOp::CompareExchange,
+        8 => AtomicOp::UMin,
+        9 => AtomicOp::UMax,
         _ => return Err(MalformedSegment),
     })
 }
@@ -2026,7 +2190,13 @@ fn try_bin_op(raw: u8) -> Result<BinOp> {
         7 => BinOp::BitXor,
         8 => BinOp::Shl,
         9 => BinOp::Shr,
-        10 => BinOp::Mulh,
+        10 => BinOp::Sar,
+        11 => BinOp::UDiv,
+        12 => BinOp::SDiv,
+        13 => BinOp::URem,
+        14 => BinOp::SRem,
+        15 => BinOp::UMulh,
+        16 => BinOp::SMulh,
         _ => return Err(MalformedSegment),
     })
 }
@@ -2039,6 +2209,28 @@ fn try_cmp_op(raw: u8) -> Result<CmpOp> {
         3 => CmpOp::Le,
         4 => CmpOp::Gt,
         5 => CmpOp::Ge,
+        6 => CmpOp::Slt,
+        7 => CmpOp::Sle,
+        8 => CmpOp::Sgt,
+        9 => CmpOp::Sge,
+        10 => CmpOp::Ult,
+        11 => CmpOp::Ule,
+        12 => CmpOp::Ugt,
+        13 => CmpOp::Uge,
+        _ => return Err(MalformedSegment),
+    })
+}
+
+fn try_convert_kind(raw: u8) -> Result<ConvertKind> {
+    Ok(match raw {
+        0 => ConvertKind::Trunc,
+        1 => ConvertKind::Zext,
+        2 => ConvertKind::Sext,
+        3 => ConvertKind::SiToFp,
+        4 => ConvertKind::UiToFp,
+        5 => ConvertKind::FpToSi,
+        6 => ConvertKind::FpToUi,
+        7 => ConvertKind::FpResize,
         _ => return Err(MalformedSegment),
     })
 }
@@ -2107,7 +2299,7 @@ mod tests {
 
     /// The stream header a hand-built test module starts with: the magic, no
     /// whole-function flags, and a zero fixed-parameter count.
-    const TEST_HEADER: &[u8] = b"VBC1\x00\x00\x00\x00\x00";
+    const TEST_HEADER: &[u8] = b"VBC3\x00\x00\x00\x00\x00";
 
     /// A structural printer for the oracle: renders a function's blocks,
     /// params, instructions (operands numbered by canonical serial) and
@@ -2173,10 +2365,37 @@ mod tests {
                         vn(c.lhs),
                         vn(c.rhs)
                     )),
-                    Opcode::Convert(c) => out.push_str(&format!("convert {}", vn(c.value))),
+                    Opcode::Convert(c) => {
+                        out.push_str(&format!("convert {} {}", c.kind.name(), vn(c.value)))
+                    }
+                    Opcode::Dot(d) => out.push_str(&format!(
+                        "dot {} {} {} {}",
+                        if d.signed { "signed" } else { "unsigned" },
+                        vn(d.acc),
+                        vn(d.a),
+                        vn(d.b)
+                    )),
                     Opcode::Call(c) => {
                         out.push_str(&format!("call \"{}\"", func.symbol_name(c.symbol)));
                         for a in func.value_list(c.args) {
+                            out.push_str(&format!(" {}", vn(*a)));
+                        }
+                    }
+                    Opcode::Load(l) => out.push_str(&format!("load {} {:?}", vn(l.ptr), l.mem)),
+                    Opcode::Store(st) => out.push_str(&format!(
+                        "store {} {} {:?}",
+                        vn(st.value),
+                        vn(st.ptr),
+                        st.mem
+                    )),
+                    Opcode::Intrinsic(i) => {
+                        out.push_str(&format!(
+                            "intrinsic \"{}\" imm {} effects {}",
+                            func.symbol_name(i.symbol),
+                            i.imm,
+                            i.side_effects
+                        ));
+                        for a in func.value_list(i.args) {
                             out.push_str(&format!(" {}", vn(*a)));
                         }
                     }
@@ -2242,10 +2461,7 @@ mod tests {
         // f(x, y): if x<y { jump m(x*y) } else { jump m(x+y) }, m(z): ret z + 1
         use super::super::function::EdgeDesc;
         let mut func = Function::new();
-        let i32_t = func.types.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }));
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
         let bool_t = func.types.intern(TypeKind::Bool);
         let entry = func.append_block();
         let merge = func.append_block();
@@ -2256,7 +2472,7 @@ mod tests {
             entry,
             bool_t,
             Opcode::Icmp(Compare {
-                op: CmpOp::Lt,
+                op: CmpOp::Slt,
                 lhs: x,
                 rhs: y,
             }),
@@ -2411,10 +2627,7 @@ mod tests {
         // FIELD BY FIELD, not by comparing printed text: a printed comparison
         // hides a field the printer never prints.
         let mut func = Function::new();
-        let i32_t = func.types.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }));
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
         let ptr_t = func.types.ptr_global();
         let entry = func.append_block();
         let p = func.append_block_param(entry, ptr_t);
@@ -2422,7 +2635,7 @@ mod tests {
         let old = func.append_atomic_rmw(
             entry,
             AtomicRmw {
-                op: AtomicOp::Min,
+                op: AtomicOp::SMin,
                 ptr: p,
                 value: v,
                 compare: None,
@@ -2453,7 +2666,7 @@ mod tests {
             super::super::function::Opcode::AtomicRmw(a) => a,
             _ => unreachable!(),
         };
-        assert_eq!(AtomicOp::Min, reading.op);
+        assert_eq!(AtomicOp::SMin, reading.op);
         assert_eq!(AtomicOrdering::AcqRel, reading.ordering);
         assert_eq!(AtomicScope::Device, reading.scope);
         assert_eq!(None, reading.compare);
@@ -2480,12 +2693,290 @@ mod tests {
     }
 
     #[test]
+    fn the_operator_tags_are_pinned_on_the_wire() {
+        let bins = [
+            (0, BinOp::Add),
+            (1, BinOp::Sub),
+            (2, BinOp::Mul),
+            (3, BinOp::Div),
+            (4, BinOp::Rem),
+            (5, BinOp::BitAnd),
+            (6, BinOp::BitOr),
+            (7, BinOp::BitXor),
+            (8, BinOp::Shl),
+            (9, BinOp::Shr),
+            (10, BinOp::Sar),
+            (11, BinOp::UDiv),
+            (12, BinOp::SDiv),
+            (13, BinOp::URem),
+            (14, BinOp::SRem),
+            (15, BinOp::UMulh),
+            (16, BinOp::SMulh),
+        ];
+        for (tag, op) in bins {
+            assert_eq!(op as u8, tag, "{op:?}");
+            assert_eq!(try_bin_op(tag), Ok(op));
+        }
+        assert!(try_bin_op(17).is_err());
+
+        let cmps = [
+            (0, CmpOp::Eq),
+            (1, CmpOp::Ne),
+            (2, CmpOp::Lt),
+            (3, CmpOp::Le),
+            (4, CmpOp::Gt),
+            (5, CmpOp::Ge),
+            (6, CmpOp::Slt),
+            (7, CmpOp::Sle),
+            (8, CmpOp::Sgt),
+            (9, CmpOp::Sge),
+            (10, CmpOp::Ult),
+            (11, CmpOp::Ule),
+            (12, CmpOp::Ugt),
+            (13, CmpOp::Uge),
+        ];
+        for (tag, op) in cmps {
+            assert_eq!(op as u8, tag, "{op:?}");
+            assert_eq!(try_cmp_op(tag), Ok(op));
+        }
+        assert!(try_cmp_op(14).is_err());
+
+        let kinds = [
+            (0, ConvertKind::Trunc),
+            (1, ConvertKind::Zext),
+            (2, ConvertKind::Sext),
+            (3, ConvertKind::SiToFp),
+            (4, ConvertKind::UiToFp),
+            (5, ConvertKind::FpToSi),
+            (6, ConvertKind::FpToUi),
+            (7, ConvertKind::FpResize),
+        ];
+        for (tag, kind) in kinds {
+            assert_eq!(kind as u8, tag, "{kind:?}");
+            assert_eq!(try_convert_kind(tag), Ok(kind));
+        }
+        assert!(try_convert_kind(8).is_err());
+
+        let atomics = [
+            (0, AtomicOp::Add),
+            (1, AtomicOp::SMin),
+            (2, AtomicOp::SMax),
+            (3, AtomicOp::BitAnd),
+            (4, AtomicOp::BitOr),
+            (5, AtomicOp::BitXor),
+            (6, AtomicOp::Exchange),
+            (7, AtomicOp::CompareExchange),
+            (8, AtomicOp::UMin),
+            (9, AtomicOp::UMax),
+        ];
+        for (tag, op) in atomics {
+            assert_eq!(op as u8, tag, "{op:?}");
+            assert_eq!(try_atomic_op(tag), Ok(op));
+        }
+        assert!(try_atomic_op(10).is_err());
+    }
+
+    /// Appends one instruction of every signedness-carrying form to a single block.
+    fn every_operator_function() -> Function {
+        let mut func = Function::new();
+        let i8_t = func.types.intern(TypeKind::Int(IntDesc { bits: 8 }));
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
+        let i64_t = func.types.intern(TypeKind::Int(IntDesc { bits: 64 }));
+        let f32_t = func.types.intern(TypeKind::Float(FloatKind::F32));
+        let f64_t = func.types.intern(TypeKind::Float(FloatKind::F64));
+        let bool_t = func.types.intern(TypeKind::Bool);
+        let ptr_t = func.types.ptr_global();
+        let v16i8 = func.types.intern(TypeKind::Vector(VectorDesc {
+            len: 16,
+            elem: i8_t,
+        }));
+        let v4i32 = func.types.intern(TypeKind::Vector(VectorDesc {
+            len: 4,
+            elem: i32_t,
+        }));
+        let entry = func.append_block();
+        let a = func.append_block_param(entry, i32_t);
+        let b = func.append_block_param(entry, i32_t);
+        let x = func.append_block_param(entry, f32_t);
+        let y = func.append_block_param(entry, f32_t);
+        let p = func.append_block_param(entry, ptr_t);
+        let acc = func.append_block_param(entry, v4i32);
+        let va = func.append_block_param(entry, v16i8);
+        let vb = func.append_block_param(entry, v16i8);
+        let flag = func.append_block_param(entry, bool_t);
+        let narrow = func.append_block_param(entry, i8_t);
+        let double = func.append_block_param(entry, f64_t);
+
+        for op in [
+            BinOp::Add,
+            BinOp::Sub,
+            BinOp::Mul,
+            BinOp::BitAnd,
+            BinOp::BitOr,
+            BinOp::BitXor,
+            BinOp::Shl,
+            BinOp::Shr,
+            BinOp::Sar,
+            BinOp::UDiv,
+            BinOp::SDiv,
+            BinOp::URem,
+            BinOp::SRem,
+            BinOp::UMulh,
+            BinOp::SMulh,
+        ] {
+            func.append_inst(entry, i32_t, Opcode::Arith(Arith { op, lhs: a, rhs: b }));
+            func.append_arith_imm(entry, i32_t, op, a, 5);
+        }
+        for op in [BinOp::Div, BinOp::Rem] {
+            func.append_inst(entry, f32_t, Opcode::Arith(Arith { op, lhs: x, rhs: y }));
+        }
+        for op in [
+            CmpOp::Eq,
+            CmpOp::Ne,
+            CmpOp::Slt,
+            CmpOp::Sle,
+            CmpOp::Sgt,
+            CmpOp::Sge,
+        ]
+        .into_iter()
+        .chain([CmpOp::Ult, CmpOp::Ule, CmpOp::Ugt, CmpOp::Uge])
+        {
+            func.append_inst(entry, bool_t, Opcode::Icmp(Compare { op, lhs: a, rhs: b }));
+        }
+        for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+            func.append_inst(entry, bool_t, Opcode::Icmp(Compare { op, lhs: x, rhs: y }));
+        }
+        func.append_convert(entry, i8_t, ConvertKind::Trunc, a);
+        func.append_convert(entry, i32_t, ConvertKind::Zext, flag);
+        func.append_convert(entry, i64_t, ConvertKind::Zext, a);
+        func.append_convert(entry, i64_t, ConvertKind::Sext, a);
+        func.append_convert(entry, f32_t, ConvertKind::SiToFp, a);
+        func.append_convert(entry, f32_t, ConvertKind::UiToFp, narrow);
+        func.append_convert(entry, i32_t, ConvertKind::FpToSi, x);
+        func.append_convert(entry, i64_t, ConvertKind::FpToUi, double);
+        func.append_convert(entry, f64_t, ConvertKind::FpResize, x);
+        func.append_dot(entry, acc, va, vb, true);
+        func.append_dot(entry, acc, va, vb, false);
+        for op in [
+            AtomicOp::Add,
+            AtomicOp::SMin,
+            AtomicOp::SMax,
+            AtomicOp::UMin,
+            AtomicOp::UMax,
+            AtomicOp::BitAnd,
+            AtomicOp::BitOr,
+            AtomicOp::BitXor,
+            AtomicOp::Exchange,
+            AtomicOp::CompareExchange,
+        ] {
+            func.append_atomic_rmw(
+                entry,
+                AtomicRmw {
+                    op,
+                    ptr: p,
+                    value: a,
+                    compare: (op == AtomicOp::CompareExchange).then_some(b),
+                    ordering: AtomicOrdering::SeqCst,
+                    scope: AtomicScope::Device,
+                },
+            );
+        }
+        func.set_terminator(entry, Terminator::Ret(Ret::none()));
+        func
+    }
+
+    #[test]
+    fn every_operator_round_trips_field_by_field() {
+        let func = every_operator_function();
+        let decoded = expect_round_trip(&func);
+        let entry = Block(0);
+        let (want, got) = (func.block_insts(entry), decoded.block_insts(entry));
+        assert_eq!(want.len(), got.len());
+        for (w, g) in want.iter().zip(got) {
+            // Values are numbered by the canonical walk, which here is creation order.
+            assert_eq!(func.opcode(*w), decoded.opcode(*g));
+            let (wt, gt) = (
+                func.inst_result(*w).map(|r| func.value_type(r)),
+                decoded.inst_result(*g).map(|r| decoded.value_type(r)),
+            );
+            let text = |f: &Function, t: Option<Type>| t.map(|t| format!("{}", f.types.display(t)));
+            assert_eq!(text(&func, wt), text(&decoded, gt));
+        }
+    }
+
+    #[test]
+    fn integer_type_records_have_no_signedness_byte() {
+        // tag, then the width: `i32` is exactly `[1, 32, 0]`.
+        let mut func = Function::new();
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
+        let entry = func.append_block();
+        func.append_block_param(entry, i32_t);
+        func.set_terminator(entry, Terminator::Ret(Ret::none()));
+        let bytes = encode(&func).unwrap();
+        assert_eq!(&bytes[..4], b"VBC3");
+        assert_eq!(
+            &bytes[HEADER_LEN..HEADER_LEN + 4],
+            &[1, 0, 0, 0],
+            "one type"
+        );
+        assert_eq!(&bytes[HEADER_LEN + 4..HEADER_LEN + 7], &[1, 32, 0]);
+        assert!(decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn a_stream_with_the_previous_magic_is_rejected() {
+        let func = every_operator_function();
+        let mut bytes = encode(&func).unwrap();
+        assert!(decode(&bytes).is_ok());
+        bytes[..4].copy_from_slice(b"VBC2");
+        assert!(decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn an_unknown_convert_kind_or_dot_flag_is_malformed() {
+        let mut func = Function::new();
+        let i8_t = func.types.intern(TypeKind::Int(IntDesc { bits: 8 }));
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
+        let v4i32 = func.types.intern(TypeKind::Vector(VectorDesc {
+            len: 4,
+            elem: i32_t,
+        }));
+        let entry = func.append_block();
+        let a = func.append_block_param(entry, i8_t);
+        let acc = func.append_block_param(entry, v4i32);
+        func.append_convert(entry, i32_t, ConvertKind::Zext, a);
+        func.append_dot(entry, acc, acc, acc, true);
+        func.set_terminator(entry, Terminator::Ret(Ret::none()));
+        let bytes = encode(&func).unwrap();
+        assert!(decode(&bytes).is_ok());
+
+        // The first operand of the convert is value 0, of the dot value 1.
+        let convert_at = bytes
+            .windows(6)
+            .position(|w| w == [OP_CONVERT, ConvertKind::Zext as u8, 0, 0, 0, 0])
+            .expect("convert record");
+        let mut bad = bytes.clone();
+        bad[convert_at + 1] = 8;
+        assert!(decode(&bad).is_err());
+
+        let dot_at = bytes
+            .windows(6)
+            .position(|w| w == [OP_DOT, DOT_FLAG_SIGNED, 1, 0, 0, 0])
+            .expect("dot record");
+        let mut bad = bytes.clone();
+        bad[dot_at + 1] = DOT_FLAG_SIGNED | 0x80;
+        assert!(decode(&bad).is_err());
+        let mut unsigned = bytes.clone();
+        unsigned[dot_at + 1] = 0;
+        let back = decode(&unsigned).unwrap();
+        let last = *back.block_insts(entry).last().unwrap();
+        assert!(matches!(back.opcode(last), Opcode::Dot(d) if !d.signed));
+    }
+
+    #[test]
     fn round_trips_a_compare_exchange_and_its_compare_operand() {
         let mut func = Function::new();
-        let i32_t = func.types.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }));
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
         let ptr_t = func.types.ptr_global();
         let entry = func.append_block();
         let p = func.append_block_param(entry, ptr_t);
@@ -2524,10 +3015,7 @@ mod tests {
     #[test]
     fn an_unknown_atomic_selector_byte_is_rejected() {
         let mut func = Function::new();
-        let i32_t = func.types.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }));
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
         let ptr_t = func.types.ptr_global();
         let entry = func.append_block();
         let p = func.append_block_param(entry, ptr_t);
@@ -2631,17 +3119,14 @@ mod tests {
 
     #[test]
     fn rejects_truncated_bitcode() {
-        assert!(decode(b"VBC1\x01").is_err());
+        assert!(decode(b"VBC3\x01").is_err());
         assert!(decode(b"nope").is_err());
     }
 
     #[test]
     fn round_trips_va_start_va_arg_va_end_through_bitcode() {
         let mut func = Function::new();
-        let i32_t = func.types.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }));
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
         let ptr_t = func.types.ptr_global();
         let entry = func.append_block();
         let list = func.append_block_param(entry, ptr_t);
@@ -2719,17 +3204,17 @@ mod tests {
         // An unknown arith operator byte, no such BinOp.
         let bad_arith = bconcat![
             TEST_HEADER,
-            [1, 0, 0, 0],  // type_count = 1
-            [1, 0, 32, 0], // int, signed, 32 bits
-            [0, 0, 0, 0],  // sym_count = 0
-            [1, 0, 0, 0],  // block_count = 1
-            [1, 0, 0, 0],  // block 0 param_count = 1
-            [0, 0, 0, 0],  // param 0 type 0
-            [1, 0, 0, 0],  // inst_count = 1
-            [1],           // has_result = 1
-            [0, 0, 0, 0],  // result type 0
-            [2],           // tag = op_arith
-            [0xff],        // operator byte: no such BinOp
+            [1, 0, 0, 0], // type_count = 1
+            [1, 32, 0],   // int, 32 bits
+            [0, 0, 0, 0], // sym_count = 0
+            [1, 0, 0, 0], // block_count = 1
+            [1, 0, 0, 0], // block 0 param_count = 1
+            [0, 0, 0, 0], // param 0 type 0
+            [1, 0, 0, 0], // inst_count = 1
+            [1],          // has_result = 1
+            [0, 0, 0, 0], // result type 0
+            [2],          // tag = op_arith
+            [0xff],       // operator byte: no such BinOp
         ];
         assert!(decode(&bad_arith[..]).is_err());
 
@@ -2812,10 +3297,7 @@ mod tests {
         let mut func = Function::new();
         let s = func.types.intern(TypeKind::Ptr(AddressSpace::Shared));
         let g = func.types.ptr_global();
-        let i32_t = func.types.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }));
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
         let b = func.append_block();
         let ps = func.append_block_param(b, s);
         let pg = func.append_block_param(b, g);
@@ -2838,10 +3320,7 @@ mod tests {
     #[test]
     fn a_two_value_ret_round_trips_through_bitcode() {
         let mut func = Function::new();
-        let i32_t = func.types.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }));
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
         let entry = func.append_block();
         let a = func.append_block_param(entry, i32_t);
         let b = func.append_block_param(entry, i32_t);
@@ -2858,5 +3337,164 @@ mod tests {
         assert_eq!(params[0], decoded_ret.values[0]);
         assert_eq!(params[1], decoded_ret.values[1]);
         let _ = expect_round_trip(&func);
+    }
+
+    fn all_mem_flags() -> Vec<MemFlags> {
+        let orderings = [
+            None,
+            Some(AtomicOrdering::Relaxed),
+            Some(AtomicOrdering::Acquire),
+            Some(AtomicOrdering::Release),
+            Some(AtomicOrdering::AcqRel),
+            Some(AtomicOrdering::SeqCst),
+        ];
+        let endians = [Endianness::Native, Endianness::Little, Endianness::Big];
+        let mut out = Vec::new();
+        for volatile in [false, true] {
+            for align in [0u32, 1, 2, 8, 4096, 1 << 31] {
+                for ordering in orderings {
+                    for endian in endians {
+                        out.push(MemFlags {
+                            volatile,
+                            align,
+                            ordering,
+                            endian,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn loads_and_stores_with_every_mem_flag_round_trip_through_bitcode() {
+        let mut func = Function::new();
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
+        let ptr_t = func.types.ptr_global();
+        let entry = func.append_block();
+        let p = func.append_block_param(entry, ptr_t);
+        let mut expected = Vec::new();
+        let mut last = None;
+        for mem in all_mem_flags() {
+            let v = func.append_load(entry, i32_t, p, mem);
+            func.append_store_mem(entry, v, p, mem);
+            expected.push(mem);
+            expected.push(mem);
+            last = Some(v);
+        }
+        func.set_terminator(entry, Terminator::Ret(Ret::one(last.unwrap())));
+
+        let decoded = expect_round_trip(&func);
+        let got: Vec<MemFlags> = decoded
+            .block_insts(entry)
+            .iter()
+            .map(|&i| match decoded.opcode(i) {
+                Opcode::Load(l) => l.mem,
+                Opcode::Store(st) => st.mem,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn mem_flags_wire_layout_is_pinned() {
+        let encoded = |mem: MemFlags| {
+            let mut w = Writer::new();
+            write_mem_flags(&mut w, &mem).unwrap();
+            w.bytes
+        };
+        assert_eq!(encoded(MemFlags::new()), [0, 0]);
+        assert_eq!(
+            encoded(MemFlags {
+                volatile: true,
+                align: 8,
+                ordering: Some(AtomicOrdering::SeqCst),
+                endian: Endianness::Big,
+            }),
+            [1 | (2 << 1) | (5 << 3), 4]
+        );
+        assert_eq!(
+            encoded(MemFlags {
+                endian: Endianness::Little,
+                ordering: Some(AtomicOrdering::Relaxed),
+                align: 1,
+                ..MemFlags::new()
+            }),
+            [(1 << 1) | (1 << 3), 1]
+        );
+    }
+
+    #[test]
+    fn malformed_mem_flags_are_rejected() {
+        let read = |bytes: &[u8]| read_mem_flags(&mut Reader { bytes, pos: 0 });
+        assert!(read(&[0, 0]).is_ok());
+        assert!(read(&[3 << 1, 0]).is_err(), "endian selector 3");
+        assert!(read(&[6 << 3, 0]).is_err(), "ordering selector 6");
+        assert!(read(&[7 << 3, 0]).is_err(), "ordering selector 7");
+        assert!(read(&[1 << 6, 0]).is_err(), "reserved flag bit");
+        assert!(read(&[0, 33]).is_err(), "align code past 2^31");
+        assert!(read(&[0]).is_err(), "truncated");
+        let mut w = Writer::new();
+        let odd = MemFlags {
+            align: 3,
+            ..MemFlags::new()
+        };
+        assert!(write_mem_flags(&mut w, &odd).is_err());
+    }
+
+    #[test]
+    fn a_non_power_of_two_align_fails_to_encode() {
+        let mut func = Function::new();
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
+        let ptr_t = func.types.ptr_global();
+        let entry = func.append_block();
+        let p = func.append_block_param(entry, ptr_t);
+        let v = func.append_load(
+            entry,
+            i32_t,
+            p,
+            MemFlags {
+                align: 6,
+                ..MemFlags::new()
+            },
+        );
+        func.set_terminator(entry, Terminator::Ret(Ret::one(v)));
+        assert!(encode(&func).is_err());
+    }
+
+    #[test]
+    fn intrinsics_round_trip_through_bitcode() {
+        let mut func = Function::new();
+        let i32_t = func.types.intern(TypeKind::Int(IntDesc { bits: 32 }));
+        let entry = func.append_block();
+        let a = func.append_block_param(entry, i32_t);
+        let b = func.append_block_param(entry, i32_t);
+        let valued = func.append_intrinsic(entry, i32_t, "aarch64.aese", &[a, b], -7, true);
+        let pure = func.append_intrinsic(entry, i32_t, "x86.bswap", &[valued], 0, false);
+        func.append_intrinsic_void(entry, "arm.dmb", &[], 15, true);
+        func.append_intrinsic_void(entry, "nop.pure", &[a], i64::MIN, false);
+        func.set_terminator(entry, Terminator::Ret(Ret::one(pure)));
+
+        let decoded = expect_round_trip(&func);
+        let insts = decoded.block_insts(entry).to_vec();
+        assert_eq!(insts.len(), 4);
+        let get = |n: usize| match decoded.opcode(insts[n]) {
+            Opcode::Intrinsic(i) => i,
+            _ => panic!("expected intrinsic"),
+        };
+        let params = decoded.block_params(entry).to_vec();
+        let v0 = decoded.inst_result(insts[0]).unwrap();
+        assert_eq!(decoded.symbol_name(get(0).symbol), "aarch64.aese");
+        assert_eq!(decoded.value_list(get(0).args), &params[..]);
+        assert_eq!((get(0).imm, get(0).side_effects), (-7, true));
+        assert_eq!(decoded.value_list(get(1).args), &[v0]);
+        assert!(!get(1).side_effects && decoded.inst_result(insts[1]).is_some());
+        assert_eq!(decoded.symbol_name(get(2).symbol), "arm.dmb");
+        assert!(decoded.inst_result(insts[2]).is_none() && get(2).imm == 15);
+        assert_eq!(get(3).imm, i64::MIN);
+        assert!(!get(3).side_effects);
+        assert_eq!(decoded.value_list(get(3).args), &params[..1]);
     }
 }
