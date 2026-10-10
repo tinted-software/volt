@@ -34,13 +34,15 @@
 //! families) is architecture and is lifted here.
 //!
 //! The lifter lifts instructions; the *caller* owns the block: it decodes,
-//! decides where a block ends (see [`Instruction::terminates_with`]), and
-//! calls [`Lifter::exit`] when a block runs off its end without a
-//! terminating instruction. An instruction that falls through leaves the
-//! [`Builder`] positioned for the next one. An instruction that does not (a
-//! branch, or a trap the environment ends with [`Environment::exit`]) has
-//! already terminated the current block. An environment must therefore end the
-//! block for every forwarded instruction for which `terminates_with` is true.
+//! decides where a block ends, and calls [`Lifter::exit`] when a block runs
+//! off its end without a terminating instruction. Architectural branches come
+//! from `Instruction::flow`; any further cut (an emulator ending a block at
+//! every access it hands to the machine, say) is the caller's policy. An
+//! instruction that falls through leaves the [`Builder`] positioned for the
+//! next one. An instruction that does not (a branch, or a trap the environment
+//! ends with [`Environment::exit`]) has already terminated the current block.
+//! An environment must therefore end the block for every forwarded instruction
+//! that the caller's policy treats as ending it.
 
 #![no_std]
 extern crate alloc;
@@ -56,7 +58,7 @@ mod tests;
 pub use builder::Builder;
 use core::fmt;
 use volt_ir::function::{BinOp as B, CmpOp as C, Function, Value};
-use volt_target::aarch64::decode::*;
+use volt_isa_aarch64::decode::*;
 
 /// A load, store or other guest memory instruction handed to
 /// [`Environment::memory`].
@@ -206,7 +208,7 @@ impl<E: Environment> Lifter<E> {
             Instruction::ArithImm(a) => {
                 let t = b.ty(a.width);
                 let lhs = b.reg(t, a.rn, false);
-                let rhs = b.k(t, a.immediate as u64);
+                let rhs = b.k(t, u64::from(a.operand()));
                 let r = b.bin(t, int::arithmetic_op(a.op), lhs, rhs);
                 if a.flags {
                     b.put(a.rd, r);
@@ -414,7 +416,7 @@ impl<E: Environment> Lifter<E> {
             }
             Instruction::Indirect(a) => {
                 let target = b.reg(b.i64, a.rn, false);
-                if a.link {
+                if a.kind == IndirectKind::Call {
                     b.put(30, b.k(b.i64, pc.wrapping_add(4)))
                 }
                 env.exit(b, target);
@@ -448,7 +450,6 @@ impl<E: Environment> Lifter<E> {
                 memory(env, b, pc, &insn, None, None)?
             }
             Instruction::SimdImm(a) => simd::imm(b, a),
-            Instruction::SimdMove { rd, rn } => simd::mov(b, rd, rn),
             Instruction::SimdInsert(a) => simd::insert(b, a),
             Instruction::SimdInsertElement(a) => simd::insert_element(b, a),
             Instruction::SimdExtract(a) => simd::extract(b, a),
@@ -464,6 +465,7 @@ impl<E: Environment> Lifter<E> {
             | Instruction::Hint(_)
             | Instruction::Prefetch(_)
             | Instruction::PrefetchLiteral(_)
+            | Instruction::RangePrefetch(_)
             | Instruction::Dsb(_)
             | Instruction::Dmb(_)
             | Instruction::Yield => {}
@@ -482,6 +484,14 @@ impl<E: Environment> Lifter<E> {
             | Instruction::Clrex(_)
             | Instruction::Psci
             | Instruction::CacheOp(_) => env.event(b, pc, &insn)?,
+            // Decoded by the same decoder, but the lifter has no semantics for these
+            // families: a machine that wants them runs them itself.
+            Instruction::Fp(_)
+            | Instruction::Simd(_)
+            | Instruction::Pauth(_)
+            | Instruction::Gxf(_) => {
+                return Err(LiftError::Unsupported);
+            }
         }
         Ok(())
     }

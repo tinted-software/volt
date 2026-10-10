@@ -6,7 +6,7 @@
 //! [`execute`] against its own memory, one element at a time, so each backend keeps
 //! its own translation, device and fault handling.
 
-use volt_target::aarch64::simd_struct::{Shape, StructDesc};
+use volt_isa_aarch64::simd_struct::{Shape, StructDesc};
 
 fn mask(esize: u8) -> u64 {
     if esize >= 8 {

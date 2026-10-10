@@ -2,6 +2,25 @@
 
 Independent Rust workspace for modular dynamic binary translation.
 
+## Crates
+
+| Crate | Path | Role |
+|---|---|---|
+| `volt-isa-aarch64` | `src/isa/aarch64` | The AArch64 instruction set and nothing else: the single decoder (`decode`, delegating to the `fp`, `simd`, `pauth` and `gxf` families), control-flow classification (`flow`) and assembly text (`format`, `objdump` spelling). `no_std`; knows nothing of guest state, memory, blocks or executable memory. |
+| `volt-ir` | `src/ir` | Typed SSA/CFG intermediate representation, verifier, legalization, bitcode. |
+| `volt-target` | `src/target` | Native code generation (AArch64, x86-64), register allocation, object/link output, executable memory. |
+| `volt-lift-aarch64` | `src/lift/aarch64` | AArch64 instruction semantics lifted to `volt-ir`, generic over an `Environment`. |
+| `volt-emulator` | `src/emulator` | Machine models, translation-block policy (`aarch64::host::ends_block`), host execution of the instruction families the lifter does not implement, devices. |
+| `volt-disasm` | `src/disasm` | Binary images, linear listing, control-flow recovery. |
+
+Every consumer of an instruction word decodes it once through `volt_isa_aarch64::decode`
+and works from the result; nothing else in the workspace masks instruction bits. Where a
+translator cuts its blocks is that translator's policy, not a property of an instruction.
+
+`cargo run --release -p volt-disasm --example fmtdiff -- <elf> [mnemonic] [limit]` checks
+the formatter against GNU `objdump`, and `--example coverage -- <elf>` reports which words
+the decoder does not recognise.
+
 ## AArch64 lifter
 
 `volt-lift-aarch64` (`src/lift/aarch64`) is a `no_std` crate that lifts decoded AArch64

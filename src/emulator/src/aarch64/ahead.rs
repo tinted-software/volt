@@ -19,13 +19,16 @@
 //! on a worker thread.
 
 use super::cache::{MAX_INSNS, SharedBlocks};
-use super::host::{Dispatch, dispatch};
+use super::host::ends_block;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use std::collections::HashSet;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use volt_target::aarch64::decode::Instruction;
+use volt_isa_aarch64::{
+    decode::{Instruction, decode},
+    flow::Flow,
+};
 
 /// Reads guest-physical bytes without any vCPU state, for worker threads.
 pub trait CodeReader: Send + Sync {
@@ -67,25 +70,15 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 
 /// Where control can go after `last`, a block's final instruction at `last_pc`.
 /// Fixed targets only: an indirect branch or return has none to offer.
-fn successors(last: Dispatch, last_pc: u64) -> ([u64; 2], usize) {
+fn successors(instruction: Instruction, last_pc: u64) -> ([u64; 2], usize) {
     let next = last_pc.wrapping_add(4);
-    let at = |offset: i64| last_pc.wrapping_add(offset as u64);
-    let instruction = match last {
-        Dispatch::Guest(instruction) => instruction,
-        // A host word falls through, as a block end that does not branch does.
-        Dispatch::Host(_) => return ([next, 0], 1),
-    };
-    match instruction {
-        Instruction::B(offset) => ([at(offset), 0], 1),
-        Instruction::Call(call) if call.link => ([at(call.target), next], 2),
-        Instruction::Call(call) => ([at(call.target), 0], 1),
-        Instruction::BCond(branch) => ([at(branch.offset), next], 2),
-        Instruction::TestBranch(test) => ([at(test.offset), next], 2),
-        Instruction::Indirect(branch) if branch.link => ([next, 0], 1),
-        Instruction::Indirect(_) | Instruction::Eret => ([0, 0], 0),
-        // Every other block end, a trap or a cut at the instruction limit, resumes
-        // at the next instruction.
-        _ => ([next, 0], 1),
+    match instruction.flow(last_pc) {
+        Flow::Jump(target) => ([target, 0], 1),
+        Flow::CondJump(target) | Flow::Call(target) => ([target, next], 2),
+        Flow::JumpIndirect | Flow::Return => ([0, 0], 0),
+        // Every other block end, a call returning, a trap or a cut at the
+        // instruction limit, resumes at the next instruction.
+        Flow::Next | Flow::CallIndirect | Flow::Stop | Flow::Unrecognized => ([next, 0], 1),
     }
 }
 
@@ -119,7 +112,7 @@ impl Ahead {
     /// Offer the blocks that can follow `last` (the final instruction of the
     /// block just built, at `last_pc`). `physical` is the physical address of
     /// `last_pc`; only successors on its page are taken.
-    pub fn offer_successors(&self, last: Dispatch, last_pc: u64, physical: u64) {
+    pub fn offer_successors(&self, last: Instruction, last_pc: u64, physical: u64) {
         let (targets, count) = successors(last, last_pc);
         self.offer(&targets[..count], last_pc, physical, 0);
     }
@@ -188,12 +181,12 @@ impl Ahead {
                 return;
             }
             let word = u32::from_le_bytes(page[count..count + 4].try_into().unwrap());
-            let Ok(instruction) = dispatch(word) else {
+            let Ok(instruction) = decode(word) else {
                 return;
             };
             last = Some((instruction, job.pc + count as u64));
             count += 4;
-            if instruction.terminates_with(shared.inline_memory())
+            if ends_block(&instruction, shared.inline_memory())
                 || n + 1 == MAX_INSNS
                 || (job.pc + count as u64) & 0xfff == 0
             {
@@ -265,7 +258,7 @@ mod tests {
 
     #[test]
     fn fixed_targets_follow_each_kind_of_block_end() {
-        use volt_target::aarch64::decode::{Call, Test, Width};
+        use volt_isa_aarch64::decode::{Call, Indirect, IndirectKind, Test, Width};
         let at = 0x1000;
         let test = Instruction::TestBranch(Test {
             rt: 0,
@@ -281,14 +274,17 @@ mod tests {
             (call(false), vec![0x1040]),
             (test, vec![0x0ff8, 0x1004]),
             (
-                Instruction::Indirect(volt_target::aarch64::decode::Indirect {
+                Instruction::Indirect(Indirect {
                     rn: 1,
-                    link: false,
+                    kind: IndirectKind::Jump,
                 }),
                 vec![],
             ),
             (
-                Instruction::Indirect(volt_target::aarch64::decode::Indirect { rn: 1, link: true }),
+                Instruction::Indirect(Indirect {
+                    rn: 1,
+                    kind: IndirectKind::Call,
+                }),
                 vec![0x1004],
             ),
             (Instruction::Eret, vec![]),
@@ -296,7 +292,7 @@ mod tests {
             (Instruction::Nop, vec![0x1004]),
         ];
         for (last, expected) in cases {
-            let (targets, n) = successors(Dispatch::Guest(last), at);
+            let (targets, n) = successors(last, at);
             assert_eq!(&targets[..n], expected.as_slice(), "{last:?}");
         }
     }
@@ -313,14 +309,14 @@ mod tests {
         ]);
         let shared = Arc::new(SharedBlocks::new(false));
         let ahead = Ahead::start(&shared, memory, 2);
-        ahead.offer_successors(Dispatch::Guest(Instruction::B(0x10)), 0x1004, 0x1004);
+        ahead.offer_successors(Instruction::B(0x10), 0x1004, 0x1004);
         wait_for(&shared, 2);
         // The block after the branch, and the one after its `svc`: nothing more,
         // even though the last one branches to itself.
         thread::sleep(Duration::from_millis(50));
         assert_eq!(shared.compiled(), 2);
         // Offering again builds nothing new.
-        ahead.offer_successors(Dispatch::Guest(Instruction::B(0x10)), 0x1004, 0x1004);
+        ahead.offer_successors(Instruction::B(0x10), 0x1004, 0x1004);
         thread::sleep(Duration::from_millis(50));
         assert_eq!(shared.compiled(), 2);
         // The vCPU's own lookup of the same bytes finds the block already built.
@@ -337,7 +333,7 @@ mod tests {
         let shared = Arc::new(SharedBlocks::new(false));
         let ahead = Ahead::start(&shared, memory, 1);
         // A branch from page 1 to page 2 must not be read on this page's translation.
-        ahead.offer_successors(Dispatch::Guest(Instruction::B(0x1004)), 0x1ffc, 0x1ffc);
+        ahead.offer_successors(Instruction::B(0x1004), 0x1ffc, 0x1ffc);
         thread::sleep(Duration::from_millis(50));
         assert_eq!(shared.compiled(), 0);
         ahead.shutdown();

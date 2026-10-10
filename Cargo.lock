@@ -173,12 +173,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
+name = "volt-disasm"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "volt-isa-aarch64",
+]
+
+[[package]]
 name = "volt-emulator"
 version = "0.1.0"
 dependencies = [
  "libc",
  "parking_lot",
  "volt-ir",
+ "volt-isa-aarch64",
  "volt-lift-aarch64",
  "volt-target",
 ]
@@ -197,10 +206,15 @@ name = "volt-ir"
 version = "0.1.0"
 
 [[package]]
+name = "volt-isa-aarch64"
+version = "0.1.0"
+
+[[package]]
 name = "volt-lift-aarch64"
 version = "0.1.0"
 dependencies = [
  "volt-ir",
+ "volt-isa-aarch64",
  "volt-target",
 ]
 
@@ -211,6 +225,7 @@ dependencies = [
  "libc",
  "object",
  "volt-ir",
+ "volt-isa-aarch64",
 ]
 
 [[package]]

@@ -60,7 +60,7 @@ pub fn identify(cpu: &mut crate::aarch64::cpu::Cpu) {
     // The SPTM monitor polls `S3_6_c15_c12_4` until bit 0 is set before it continues
     // (`mrs x0, s3_6_c15_c12_4; and x1, x0, #1; cbz x1, <mrs>`). Nothing here names the
     // register, so bit 0 reads as set, which is the only value that lets the loop exit.
-    cpu.apple_bank.0[volt_target::aarch64::decode::apple_bank_slot(6, 12, 4)] = 1;
+    cpu.apple_bank.0[volt_isa_aarch64::decode::apple_bank_slot(6, 12, 4)] = 1;
 }
 
 /// The SoC devices on the bus: the AIC, the power-state blocks, the console, and the

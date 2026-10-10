@@ -767,14 +767,16 @@ fn instruction_diagnostic<M: GuestMemory>(
         let mut bytes = [0; 4];
         machine.memory.read(physical, &mut bytes).ok()?;
         let word = u32::from_le_bytes(bytes);
-        let decoded = host::dispatch(word);
+        let decoded = volt_isa_aarch64::decode::decode(word);
         last = Some(InstructionDiagnostic {
             virtual_address: address,
             physical_address: physical,
             word,
             decoded: decoded.is_ok(),
         });
-        if !stalled || decoded.is_err() || decoded.is_ok_and(|instruction| instruction.terminates())
+        if !stalled
+            || decoded.is_err()
+            || decoded.is_ok_and(|instruction| host::ends_block(&instruction, false))
         {
             break;
         }

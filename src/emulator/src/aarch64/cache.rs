@@ -2,7 +2,7 @@ use super::{
     ahead::{Ahead, CodeReader},
     compile::{Block, Error, compile_with},
     cpu::Cpu,
-    host::dispatch,
+    host::ends_block,
 };
 use core::hash::{Hash, Hasher};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -356,7 +356,7 @@ impl Cache {
             }
             count += 4;
             let word = u32::from_le_bytes(room.try_into().unwrap());
-            let instruction = match dispatch(word) {
+            let instruction = match volt_isa_aarch64::decode::decode(word) {
                 Ok(insn) => insn,
                 // Run the decoded prefix first: the undecodable word then heads the
                 // next block, where it is reported at its own address.
@@ -366,14 +366,14 @@ impl Cache {
                 }
                 Err(_) => {
                     // Architecturally undefined words are the guest's to handle.
-                    if !volt_target::aarch64::decode::is_undefined(word) {
+                    if !volt_isa_aarch64::decode::is_undefined(word) {
                         eprintln!("cache decode failure at pc {at:x}: word {word:08x}");
                     }
                     return Err(Error::Decode { word, pc: at });
                 }
             };
             last = Some((instruction, at));
-            if instruction.terminates_with(self.shared.inline_memory()) {
+            if ends_block(&instruction, self.shared.inline_memory()) {
                 complete = true;
                 break;
             }

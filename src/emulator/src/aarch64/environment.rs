@@ -4,13 +4,13 @@
 use super::cpu::{Cpu, DTLB_ENTRIES, Exclusive as CpuExclusive, System as CpuSystem, Trap};
 use core::mem::offset_of;
 use volt_ir::function::{BinOp as B, CmpOp as C, Value};
+use volt_isa_aarch64::decode::*;
 use volt_lift_aarch64::{Builder, Environment, LiftError, MemoryAccess, Writeback};
-use volt_target::aarch64::decode::*;
 
 /// Lowers guest instructions against [`Cpu`]: the lifter's machine policy.
 pub(super) struct CpuEnvironment {
     /// Plain loads and stores get an inline data-TLB fast path and do not end
-    /// the block; the block scan must use `Instruction::terminates_with(true)`.
+    /// the block; the block scan must use `host::ends_block(_, true)`.
     inline_memory: bool,
     /// Guest instructions started but not yet added to `cntvct_el0`. The
     /// counter is bumped once per exit path (`exit`) and before anything that
@@ -265,6 +265,8 @@ impl CpuEnvironment {
             None => {}
         }
     }
+    // `a.ordered` (`ldar`, `stlr`, `ldapr`, ...) and the unscaled/unprivileged offset forms
+    // run as the plain access: the machines model no memory ordering or EL0 permission check.
     fn scalar(&self, b: &Builder, pc: u64, a: Memory, address: Value, post: Option<Writeback>) {
         let trap = if a.op == MemoryOp::Store {
             Trap::Store
@@ -293,15 +295,15 @@ impl CpuEnvironment {
                 a.size,
                 MemoryOp::Load,
                 a.rt,
-                SignExtend::None,
+                a.signed,
                 None,
                 |env| {
-                    env.setup_memory(b, address, a.size, a.rt, SignExtend::None, MemoryOp::Load);
+                    env.setup_memory(b, address, a.size, a.rt, a.signed, MemoryOp::Load);
                     env.trap(b, pc.wrapping_add(4), Trap::Load);
                 },
             );
         } else {
-            self.setup_memory(b, address, a.size, a.rt, SignExtend::None, MemoryOp::Load);
+            self.setup_memory(b, address, a.size, a.rt, a.signed, MemoryOp::Load);
             self.trap(b, pc.wrapping_add(4), Trap::Load);
         }
     }
@@ -401,6 +403,7 @@ impl CpuEnvironment {
             b.set_block(resume);
         }
     }
+    // `a.access` (`ldr q` vs one-register `ld1`) and unscaled offsets move the same bytes.
     fn simd_memory(
         &self,
         b: &Builder,
@@ -470,6 +473,7 @@ impl CpuEnvironment {
             b.set_block(resume);
         }
     }
+    // `a.order` (`ldaxr`/`stlxr`) is ignored: the monitor and host accesses already order.
     fn exclusive(&self, b: &Builder, pc: u64, a: Exclusive) {
         self.setup_memory(
             b,
@@ -500,6 +504,8 @@ impl CpuEnvironment {
             },
         );
     }
+    // `a.order` (acquire/release) is ignored: every host read-modify-write is sequentially
+    // consistent.
     fn atomic(&self, b: &Builder, pc: u64, a: Atomic) {
         // Read-modify-write needs a host atomic, so it always takes the machine
         // slow path. `dests` receive the words read (31 discards) and `operands`
@@ -531,7 +537,7 @@ impl CpuEnvironment {
         self.trap(b, pc.wrapping_add(4), Trap::Atomic);
     }
     fn simd_struct(&self, b: &Builder, pc: u64, a: SimdStruct) {
-        use volt_target::aarch64::simd_struct::StructDesc;
+        use volt_isa_aarch64::simd_struct::StructDesc;
         // Element-wise accesses with lane merging need the machine slow path.
         let d = a.desc;
         let address = b.reg(b.i64, a.rn, false);
@@ -654,7 +660,7 @@ impl CpuEnvironment {
                     b.store(pan, b.imm(b.i64, B::BitAnd, bit, 1));
                 }
             }
-            RazWi | AppleZero => {
+            RazWi { .. } | AppleZero { .. } => {
                 if a.read {
                     b.put(a.rt, b.k(b.i64, 0));
                 }

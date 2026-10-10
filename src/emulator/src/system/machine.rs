@@ -7,7 +7,7 @@ use crate::aarch64::{Cache, Cpu};
 use crate::aarch64::{exception, translate};
 use crate::devices::{bus::Device, gicv2::Gicv2, pl011::Pl011};
 use crate::memory::{GuestMemory, MemoryError};
-use volt_target::aarch64::decode::SignExtend;
+use volt_isa_aarch64::decode::SignExtend;
 
 #[derive(Debug)]
 pub enum Error {
@@ -487,7 +487,7 @@ impl<M: GuestMemory> Machine<M> {
                     continue;
                 }
                 if let crate::aarch64::compile::Error::Decode { word, pc } = &error
-                    && volt_target::aarch64::decode::is_undefined(*word)
+                    && volt_isa_aarch64::decode::is_undefined(*word)
                 {
                     // An Undefined Instruction exception (EC 0, 32-bit instruction).
                     self.cpu.pc = *pc;

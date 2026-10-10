@@ -1,0 +1,15 @@
+[package]
+name = "volt-disasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+object = { workspace = true, features = ["read_core", "elf", "macho", "std"] }
+volt-isa-aarch64.workspace = true
+
+[lints.clippy]
+too_many_arguments = "allow"

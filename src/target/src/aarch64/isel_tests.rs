@@ -330,7 +330,7 @@ fn listing(f: &Function) -> Vec<String> {
     compile(f)
         .unwrap()
         .iter()
-        .map(|&w| crate::aarch64::disasm::one(w))
+        .map(|&w| crate::aarch64::listing::one(w))
         .collect()
 }
 

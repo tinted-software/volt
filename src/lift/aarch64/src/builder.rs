@@ -4,7 +4,7 @@ use volt_ir::{
     function::{self as ir, BinOp as B, CmpOp as C, Function, Opcode, Value},
     types::{IntDesc, Type, TypeKind},
 };
-use volt_target::aarch64::decode::{Addressing, Width};
+use volt_isa_aarch64::decode::{Addressing, Width};
 
 /// Emits IR for one lifted function and knows where guest state lives.
 ///
@@ -251,7 +251,10 @@ impl Builder {
     pub fn address(&self, rn: u8, a: Addressing) -> (Value, Option<Writeback>) {
         let base = self.reg(self.i64, rn, false);
         match a {
-            Addressing::Offset(n) => (self.imm(self.i64, B::Add, base, n as u64), None),
+            // The machines do not tell the unprivileged `ldtr`/`sttr` from a plain access.
+            Addressing::Offset(n) | Addressing::Unscaled(n) | Addressing::Unprivileged(n) => {
+                (self.imm(self.i64, B::Add, base, n as u64), None)
+            }
             Addressing::PreIndex(n) => {
                 let address = self.imm(self.i64, B::Add, base, n as u64);
                 let writeback = Writeback {
@@ -275,7 +278,7 @@ impl Builder {
                     self.i64,
                     B::Add,
                     base,
-                    self.imm(self.i64, B::Shl, v, amount as u64),
+                    self.imm(self.i64, B::Shl, v, u64::from(amount.unwrap_or(0))),
                 );
                 (address, None)
             }

@@ -5,7 +5,7 @@ use volt_ir::{
     function::{BinOp as B, CmpOp as C, Value},
     types::Type,
 };
-use volt_target::aarch64::decode::*;
+use volt_isa_aarch64::decode::*;
 
 impl Builder {
     pub(crate) fn not(&self, v: Value) -> Value {

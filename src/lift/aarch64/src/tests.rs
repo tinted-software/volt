@@ -4,10 +4,8 @@ use crate::{Builder, Environment, LiftError, Lifter, MemoryAccess};
 use alloc::vec::Vec;
 use core::mem::offset_of;
 use volt_ir::function::{BinOp as B, Function, Value};
-use volt_target::{
-    aarch64::decode::*,
-    native::{self, JittedFunction},
-};
+use volt_isa_aarch64::{decode::*, flow::Flow};
+use volt_target::native::{self, JittedFunction};
 
 /// Guest state of the test environment.
 #[repr(C)]
@@ -104,7 +102,7 @@ impl Environment for Flat {
                 Self::load(b, address, 0, a.size, a.rt, a.signed)
             }
             (Instruction::Literal(a), Some(address)) => {
-                Self::load(b, address, 0, a.size, a.rt, SignExtend::None)
+                Self::load(b, address, 0, a.size, a.rt, a.signed)
             }
             (Instruction::Pair(a), Some(address)) if a.op == MemoryOp::Store => {
                 Self::store(b, address, 0, a.size, a.rt);
@@ -136,8 +134,8 @@ impl Environment for Flat {
     }
 }
 
-/// Lift `bytes` as one block at `pc`: instructions until one terminates it
-/// (plain memory accesses do not), then an exit at the next pc.
+/// Lift `bytes` as one block at `pc`: instructions until an architectural branch
+/// ends it (plain memory accesses do not), then an exit at the next pc.
 fn lift(pc: u64, bytes: &[u8]) -> Result<(Function, Flat), LiftError> {
     let mut lifter = Lifter::new(Flat::default());
     let mut at = pc;
@@ -145,7 +143,7 @@ fn lift(pc: u64, bytes: &[u8]) -> Result<(Function, Flat), LiftError> {
     for chunk in bytes.chunks_exact(4) {
         let word = u32::from_le_bytes(chunk.try_into().unwrap());
         let instruction = decode(word).unwrap();
-        ended = instruction.terminates_with(true);
+        ended = instruction.flow(at) != Flow::Next;
         lifter.lift(at, instruction)?;
         at += 4;
         if ended {
@@ -457,6 +455,65 @@ fn simd_dup_from_element_replicates_a_lane() {
         block.run(&mut cpu);
         assert_eq!(cpu.v[0], want, "{word:08x}");
     }
+}
+#[test]
+fn simd_ext_uses_the_arrangement_it_encodes() {
+    let setup = || {
+        let mut cpu = State::default();
+        cpu.v[0] = [0xdead_beef_dead_beef, 0xdead_beef_dead_beef];
+        cpu.v[1] = [0x0102_0304_0506_0708, 0x090a_0b0c_0d0e_0f10];
+        cpu.v[2] = [0x1112_1314_1516_1718, 0x191a_1b1c_1d1e_1f20];
+        cpu
+    };
+    // ext v0.8b, v1.8b, v2.8b, #3 windows the low halves and clears the upper half.
+    let mut cpu = setup();
+    compile(0x1000, &bytes(&[0x2e021820]))
+        .unwrap()
+        .run(&mut cpu);
+    assert_eq!(cpu.v[0], [0x1617_1801_0203_0405, 0]);
+    // ext v0.16b, v1.16b, v2.16b, #3.
+    let mut cpu = setup();
+    compile(0x1000, &bytes(&[0x6e021820]))
+        .unwrap()
+        .run(&mut cpu);
+    assert_eq!(cpu.v[0], [0x0e0f_1001_0203_0405, 0x1617_1809_0a0b_0c0d]);
+}
+#[test]
+fn simd_modified_immediates_write_the_expanded_pattern() {
+    for (word, want) in [
+        // movi v0.2d, #0 and movi d0, #0xff (which clears the upper half).
+        (0x6f00e400u32, [0u64, 0]),
+        (0x2f00e420, [0xff, 0]),
+        // mvni v31.4s, #0xff inverts every 32-bit lane.
+        (0x6f0707ff, [0xffff_ff00_ffff_ff00; 2]),
+        // fmov v0.8h/.4h, #2.0 and #-2.5 expand the half-precision pattern.
+        (0x4f00fc00, [0x4000_4000_4000_4000; 2]),
+        (0x0f00fc00, [0x4000_4000_4000_4000, 0]),
+        (0x4f04fc80, [0xc100_c100_c100_c100; 2]),
+    ] {
+        let rd = (word & 31) as usize;
+        let mut cpu = State::default();
+        cpu.v[rd] = [0x5555_5555_5555_5555; 2];
+        compile(0x1000, &bytes(&[word])).unwrap().run(&mut cpu);
+        assert_eq!(cpu.v[rd], want, "{word:08x}");
+    }
+}
+#[test]
+fn simd_fmov_upper_doubleword_keeps_the_lower_half() {
+    let mut cpu = State::default();
+    cpu.v[0] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+    cpu.x[3] = 0x3333_3333_3333_3333;
+    // fmov v0.d[1], x3.
+    compile(0x1000, &bytes(&[0x9eaf0060]))
+        .unwrap()
+        .run(&mut cpu);
+    assert_eq!(cpu.v[0], [0x1111_1111_1111_1111, 0x3333_3333_3333_3333]);
+    // fmov x4, v0.d[1].
+    cpu.v[0][1] = 0x4444_4444_4444_4444;
+    compile(0x1000, &bytes(&[0x9eae0004]))
+        .unwrap()
+        .run(&mut cpu);
+    assert_eq!(cpu.x[4], 0x4444_4444_4444_4444);
 }
 #[test]
 fn simd_table_lookup_selects_bytes() {

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 volt-ir.workspace = true
+volt-isa-aarch64.workspace = true
 volt-target.workspace = true
 volt-lift-aarch64.workspace = true
 libc = { workspace = true, optional = true }

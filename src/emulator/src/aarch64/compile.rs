@@ -1,10 +1,11 @@
 use super::{
     cpu::{Cpu, Trap},
     environment::CpuEnvironment,
-    host::{Dispatch, dispatch},
+    host::{ends_block, runs_on_host},
 };
 use crate::memory::MemoryError;
 use core::fmt;
+use volt_isa_aarch64::decode::decode;
 use volt_lift_aarch64::{LiftError, Lifter};
 use volt_target::native;
 
@@ -82,7 +83,7 @@ pub fn compile(guest_pc: u64, bytes: &[u8]) -> Result<Block, Error> {
 
 /// Compile a block. With `inline_memory`, plain loads and stores get an inline
 /// data-TLB fast path and do not end the block; the caller's block scan must
-/// use `Instruction::terminates_with(true)` to match.
+/// use `host::ends_block(_, true)` to match.
 pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<Block, Error> {
     if bytes.is_empty() {
         return Err(Error::EmptyBlock);
@@ -95,16 +96,16 @@ pub fn compile_with(guest_pc: u64, bytes: &[u8], inline_memory: bool) -> Result<
     let mut ended = false;
     for chunk in bytes.chunks_exact(4) {
         let word = u32::from_le_bytes(chunk.try_into().unwrap());
-        match dispatch(word) {
-            Ok(Dispatch::Guest(instruction)) => {
-                ended = instruction.terminates_with(inline_memory);
-                lifter.lift(pc, instruction)?;
-            }
-            Ok(Dispatch::Host(host_word)) => {
+        match decode(word) {
+            Ok(instruction) if runs_on_host(&instruction) => {
                 // The host runs this word (see `host::run`), and it ends the block.
                 let (builder, env) = lifter.parts();
-                env.host(builder, pc, host_word);
+                env.host(builder, pc, word);
                 ended = true;
+            }
+            Ok(instruction) => {
+                ended = ends_block(&instruction, inline_memory);
+                lifter.lift(pc, instruction)?;
             }
             Err(_) => {
                 eprintln!("compile decode failure at pc {pc:x}: word {word:08x}, full block:");

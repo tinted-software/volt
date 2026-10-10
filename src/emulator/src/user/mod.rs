@@ -10,12 +10,12 @@ pub mod syscalls;
 pub use memory::Space;
 
 use crate::aarch64::cpu::{Exclusive, Trap};
-use crate::aarch64::host::{Dispatch, dispatch};
+use crate::aarch64::host::run as run_host;
 use crate::aarch64::{Cache, Cpu};
 use crate::memory::{GuestMemory, MemoryError};
 use std::ffi::OsString;
 use std::path::Path;
-use volt_target::aarch64::decode::{Instruction, SignExtend, SystemRegister};
+use volt_isa_aarch64::decode::{Instruction, SignExtend, SystemRegister, decode};
 
 #[derive(Debug)]
 pub enum Error {
@@ -110,7 +110,7 @@ pub fn run(path: &Path, args: &[OsString], env: &[(OsString, OsString)]) -> Resu
                 Trap::SimdStruct => simd_struct(&mut space, &mut cpu)?,
                 Trap::Host => {
                     let word = cpu.value as u32;
-                    crate::aarch64::host::run(&mut cpu, word);
+                    run_host(&mut cpu, word);
                     cpu.trap = Trap::None;
                 }
                 Trap::Svc => {
@@ -151,18 +151,16 @@ fn fetch(
         }
     }
     let word = u32::from_le_bytes(bytes);
-    let dispatched =
-        dispatch(word).map_err(|_| crate::aarch64::compile::Error::Decode { word, pc: address })?;
-    if let Dispatch::Guest(instruction) = &dispatched {
-        if !user_instruction(instruction) {
+    let instruction =
+        decode(word).map_err(|_| crate::aarch64::compile::Error::Decode { word, pc: address })?;
+    if !user_instruction(&instruction) {
+        return Err(crate::aarch64::compile::Error::InvalidUserInstruction);
+    }
+    if let Instruction::CacheOp(sys) = &instruction {
+        // The decoder groups EL0 and privileged cache operations together.
+        // Only IC IVAU and DC CVAC/CVAU/CIVAC are permitted in userspace.
+        if sys.op1 != 3 || sys.op2 != 1 || !matches!(sys.crm, 5 | 10 | 11 | 14) {
             return Err(crate::aarch64::compile::Error::InvalidUserInstruction);
-        }
-        if let Instruction::CacheOp(sys) = instruction {
-            // The decoder groups EL0 and privileged cache operations together.
-            // Only IC IVAU and DC CVAC/CVAU/CIVAC are permitted in userspace.
-            if sys.op1 != 3 || sys.op2 != 1 || !matches!(sys.crm, 5 | 10 | 11 | 14) {
-                return Err(crate::aarch64::compile::Error::InvalidUserInstruction);
-            }
         }
     }
     if into.len() < 4 {

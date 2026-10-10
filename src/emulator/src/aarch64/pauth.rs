@@ -1,6 +1,7 @@
 //! Pointer authentication (FEAT_PAuth): the QARMA5 `ComputePAC` the architecture
 //! defines, the sign, authenticate and strip operations on 48-bit pointers, and the
-//! PAuth instructions the JIT hands to the host ([`super::host`]).
+//! PAuth instructions the JIT hands to the host ([`super::host`]); decoding lives in
+//! `volt_isa_aarch64::pauth`.
 //!
 //! The emulated CPU advertises the architected QARMA5 algorithm without TBI, EPAC or
 //! FPAC (`ID_AA64ISAR1_EL1.APA` = 1). A pointer's PAC then occupies bits 63:56 and 54:48,
@@ -10,295 +11,13 @@
 //! `target/arm/tcg/pauth_helper.c`; the tests check it against that implementation.
 
 use super::{Cpu, exception};
+use volt_isa_aarch64::pauth::{KeyId, Modifier, Op};
 
 /// A 128-bit PAuth key: `hi` is bits 127:64 (`APxAKeyHi_EL1`), `lo` bits 63:0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Key {
     pub hi: u64,
     pub lo: u64,
-}
-
-/// The key the instruction uses, as an index into [`super::cpu::System::pac_keys`]
-/// (two words per key, low word first).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KeyId {
-    Ia,
-    Ib,
-    Da,
-    Db,
-    Ga,
-}
-
-impl KeyId {
-    fn index(self) -> usize {
-        match self {
-            Self::Ia => 0,
-            Self::Ib => 1,
-            Self::Da => 2,
-            Self::Db => 3,
-            Self::Ga => 4,
-        }
-    }
-
-    /// The `SCTLR_EL1` bit that enables the key, if any. The generic key has none.
-    fn enable_bit(self) -> Option<u32> {
-        match self {
-            Self::Ia => Some(31),
-            Self::Ib => Some(30),
-            Self::Da => Some(27),
-            Self::Db => Some(13),
-            Self::Ga => None,
-        }
-    }
-
-    /// The `keynumber` the architecture reports in an authentication failure.
-    fn number(self) -> u64 {
-        match self {
-            Self::Ia => 0,
-            Self::Ib => 1,
-            Self::Da => 2,
-            Self::Db => 3,
-            Self::Ga => 4,
-        }
-    }
-}
-
-/// The modifier operand: zero, or a register where register 31 is `SP`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Modifier {
-    Zero,
-    Reg(u8),
-}
-
-/// One PAuth instruction, decoded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Op {
-    Sign {
-        key: KeyId,
-        reg: u8,
-        modifier: Modifier,
-    },
-    Auth {
-        key: KeyId,
-        reg: u8,
-        modifier: Modifier,
-    },
-    Strip {
-        reg: u8,
-    },
-    Pacga {
-        rd: u8,
-        rn: u8,
-        modifier: Modifier,
-    },
-    /// `BRAA`, `BRAB`, `BLRAA`, `BLRAB` and their zero-modifier forms.
-    Branch {
-        key: KeyId,
-        link: bool,
-        target: u8,
-        modifier: Modifier,
-    },
-    /// `RETAA` and `RETAB`: return to `LR`, authenticated with `SP`.
-    Return {
-        key: KeyId,
-    },
-    /// `ERETAA` and `ERETAB`: return from the exception, authenticating `ELR_EL1`.
-    ExceptionReturn {
-        key: KeyId,
-    },
-}
-
-/// The hint-space forms (`PACIASP` and friends), which are no-ops without PAuth.
-const HINTS: [(u32, Op); 13] = [
-    (
-        0xd503_233f,
-        Op::Sign {
-            key: KeyId::Ia,
-            reg: 30,
-            modifier: Modifier::Reg(31),
-        },
-    ),
-    (
-        0xd503_23bf,
-        Op::Auth {
-            key: KeyId::Ia,
-            reg: 30,
-            modifier: Modifier::Reg(31),
-        },
-    ),
-    (
-        0xd503_237f,
-        Op::Sign {
-            key: KeyId::Ib,
-            reg: 30,
-            modifier: Modifier::Reg(31),
-        },
-    ),
-    (
-        0xd503_23ff,
-        Op::Auth {
-            key: KeyId::Ib,
-            reg: 30,
-            modifier: Modifier::Reg(31),
-        },
-    ),
-    (
-        0xd503_211f,
-        Op::Sign {
-            key: KeyId::Ia,
-            reg: 17,
-            modifier: Modifier::Reg(16),
-        },
-    ),
-    (
-        0xd503_219f,
-        Op::Auth {
-            key: KeyId::Ia,
-            reg: 17,
-            modifier: Modifier::Reg(16),
-        },
-    ),
-    (
-        0xd503_215f,
-        Op::Sign {
-            key: KeyId::Ib,
-            reg: 17,
-            modifier: Modifier::Reg(16),
-        },
-    ),
-    (
-        0xd503_21df,
-        Op::Auth {
-            key: KeyId::Ib,
-            reg: 17,
-            modifier: Modifier::Reg(16),
-        },
-    ),
-    (
-        0xd503_231f,
-        Op::Sign {
-            key: KeyId::Ia,
-            reg: 30,
-            modifier: Modifier::Zero,
-        },
-    ),
-    (
-        0xd503_239f,
-        Op::Auth {
-            key: KeyId::Ia,
-            reg: 30,
-            modifier: Modifier::Zero,
-        },
-    ),
-    (
-        0xd503_235f,
-        Op::Sign {
-            key: KeyId::Ib,
-            reg: 30,
-            modifier: Modifier::Zero,
-        },
-    ),
-    (
-        0xd503_23df,
-        Op::Auth {
-            key: KeyId::Ib,
-            reg: 30,
-            modifier: Modifier::Zero,
-        },
-    ),
-    (0xd503_20ff, Op::Strip { reg: 30 }),
-];
-
-fn decode_word(word: u32) -> Option<Op> {
-    let rd = (word & 31) as u8;
-    let rn = ((word >> 5) & 31) as u8;
-    let rm = rd;
-    // Data-processing, one source: PAC and AUT (opcodes 0-15), and XPAC (16-17).
-    if word & 0xffff_0000 == 0xdac1_0000 {
-        let opcode = (word >> 10) & 0x3f;
-        let key = [KeyId::Ia, KeyId::Ib, KeyId::Da, KeyId::Db][(opcode & 3) as usize];
-        let modifier = if opcode & 8 != 0 {
-            Modifier::Zero
-        } else {
-            Modifier::Reg(rn)
-        };
-        return match opcode {
-            0..=15 if opcode & 4 == 0 => Some(Op::Sign {
-                key,
-                reg: rd,
-                modifier,
-            }),
-            0..=15 => Some(Op::Auth {
-                key,
-                reg: rd,
-                modifier,
-            }),
-            16 | 17 if rn == 31 => Some(Op::Strip { reg: rd }),
-            _ => None,
-        };
-    }
-    // Data-processing, two sources: PACGA Xd, Xn, Xm|SP.
-    if word & 0xffe0_fc00 == 0x9ac0_3000 {
-        let rm = ((word >> 16) & 31) as u8;
-        return Some(Op::Pacga {
-            rd,
-            rn,
-            modifier: Modifier::Reg(rm),
-        });
-    }
-    // Branches with authentication. Bit 10 selects the B key; bit 11 is always set.
-    let b_key = if word & 0x400 != 0 {
-        KeyId::Ib
-    } else {
-        KeyId::Ia
-    };
-    if word & 0xffff_f800 == 0xd71f_0800 {
-        return Some(Op::Branch {
-            key: b_key,
-            link: false,
-            target: rn,
-            modifier: Modifier::Reg(rm),
-        });
-    }
-    if word & 0xffff_f81f == 0xd61f_081f {
-        return Some(Op::Branch {
-            key: b_key,
-            link: false,
-            target: rn,
-            modifier: Modifier::Zero,
-        });
-    }
-    if word & 0xffff_f800 == 0xd73f_0800 {
-        return Some(Op::Branch {
-            key: b_key,
-            link: true,
-            target: rn,
-            modifier: Modifier::Reg(rm),
-        });
-    }
-    if word & 0xffff_f81f == 0xd63f_081f {
-        return Some(Op::Branch {
-            key: b_key,
-            link: true,
-            target: rn,
-            modifier: Modifier::Zero,
-        });
-    }
-    if word & 0xffff_fbff == 0xd65f_0bff {
-        return Some(Op::Return { key: b_key });
-    }
-    if word & 0xffff_fbff == 0xd69f_0bff {
-        return Some(Op::ExceptionReturn { key: b_key });
-    }
-    HINTS
-        .iter()
-        .find(|(hint, _)| *hint == word)
-        .map(|&(_, op)| op)
-}
-
-/// Whether [`run`] implements `word`.
-pub fn is_supported(word: u32) -> bool {
-    decode_word(word).is_some()
 }
 
 /// The 48-bit pointer's bits 63:48 all equal bit 47, so the pointer is canonical.
@@ -556,11 +275,22 @@ pub fn compute_pac(data: u64, modifier: u64, key: Key) -> u64 {
     working ^ modk0
 }
 
+/// Index of `id` into `System::pac_keys` (two words per key, low word first).
+fn key_slot(id: KeyId) -> usize {
+    match id {
+        KeyId::Ia => 0,
+        KeyId::Ib => 1,
+        KeyId::Da => 2,
+        KeyId::Db => 3,
+        KeyId::Ga => 4,
+    }
+}
+
 fn key(cpu: &Cpu, id: KeyId) -> Key {
     let keys = &cpu.system.pac_keys;
     Key {
-        lo: keys[2 * id.index()],
-        hi: keys[2 * id.index() + 1],
+        lo: keys[2 * key_slot(id)],
+        hi: keys[2 * key_slot(id) + 1],
     }
 }
 
@@ -593,15 +323,16 @@ fn modifier_value(cpu: &Cpu, modifier: Modifier) -> u64 {
     }
 }
 
-/// Execute the PAuth instruction `word` on `cpu`. `word` must satisfy [`is_supported`].
+/// Execute the decoded PAuth instruction `op` on `cpu`.
 /// `cpu.pc` is the address of the next instruction, which a link writes to `LR`.
-pub fn run(cpu: &mut Cpu, word: u32) {
-    let op = decode_word(word).expect("pauth::run is only called for supported words");
+pub fn run(cpu: &mut Cpu, op: Op) {
     match op {
+        // `hint` only selects the disassembly spelling (`paciasp` vs `pacia x30, sp`).
         Op::Sign {
             key: id,
             reg,
             modifier,
+            hint: _,
         } => {
             if enabled(cpu, id) {
                 let value = add_pac(
@@ -616,6 +347,7 @@ pub fn run(cpu: &mut Cpu, word: u32) {
             key: id,
             reg,
             modifier,
+            hint: _,
         } => {
             if enabled(cpu, id) {
                 let value = auth(
@@ -627,7 +359,8 @@ pub fn run(cpu: &mut Cpu, word: u32) {
                 write_x(cpu, reg, value);
             }
         }
-        Op::Strip { reg } => {
+        // `xpaci` and `xpacd` strip identically here.
+        Op::Strip { reg, .. } => {
             let value = strip(cpu.x[reg as usize]);
             write_x(cpu, reg, value);
         }
@@ -687,6 +420,10 @@ mod tests {
         hi: 0xec28_02d4_e0a4_88e9,
         lo: 0x84be_85ce_9804_e94b,
     };
+
+    fn op(word: u32) -> Op {
+        volt_isa_aarch64::pauth::decode(word).unwrap()
+    }
 
     /// `ComputePAC` values from QEMU's `pauth_computepac_architected`, compiled from its
     /// source with the same key: `(data, modifier, pac)`.
@@ -783,69 +520,6 @@ mod tests {
     }
 
     #[test]
-    fn the_instruction_encodings_decode_as_their_names() {
-        // Assembled with GNU as for armv8.3-a.
-        assert_eq!(
-            decode_word(0xdac1_0020),
-            Some(Op::Sign {
-                key: KeyId::Ia,
-                reg: 0,
-                modifier: Modifier::Reg(1)
-            })
-        );
-        assert_eq!(
-            decode_word(0xdac1_11ac),
-            Some(Op::Auth {
-                key: KeyId::Ia,
-                reg: 12,
-                modifier: Modifier::Reg(13)
-            })
-        );
-        assert_eq!(
-            decode_word(0xdac1_23f0),
-            Some(Op::Sign {
-                key: KeyId::Ia,
-                reg: 16,
-                modifier: Modifier::Zero
-            })
-        );
-        assert_eq!(decode_word(0xdac1_43f8), Some(Op::Strip { reg: 24 }));
-        assert_eq!(
-            decode_word(0xd71f_0c43),
-            Some(Op::Branch {
-                key: KeyId::Ib,
-                link: false,
-                target: 2,
-                modifier: Modifier::Reg(3)
-            })
-        );
-        assert_eq!(
-            decode_word(0xd63f_095f),
-            Some(Op::Branch {
-                key: KeyId::Ia,
-                link: true,
-                target: 10,
-                modifier: Modifier::Zero
-            })
-        );
-        assert_eq!(
-            decode_word(0xd65f_0fff),
-            Some(Op::Return { key: KeyId::Ib })
-        );
-        assert_eq!(
-            decode_word(0xd503_233f),
-            Some(Op::Sign {
-                key: KeyId::Ia,
-                reg: 30,
-                modifier: Modifier::Reg(31)
-            })
-        );
-        // Plain BR and ordinary one-source data processing are not PAuth.
-        assert!(!is_supported(0xd61f_0000));
-        assert!(!is_supported(0xdac0_0000));
-    }
-
-    #[test]
     fn a_pac_instruction_signs_its_register_and_a_branch_jumps_to_the_authenticated_target() {
         let mut cpu = Cpu::default();
         cpu.system.sctlr_el1 = 1 << 31;
@@ -854,12 +528,12 @@ mod tests {
         let ptr = 0x0000_0008_1234_5678;
         cpu.x[0] = ptr;
         cpu.x[1] = 0x2222;
-        run(&mut cpu, 0xdac1_0020);
+        run(&mut cpu, op(0xdac1_0020));
         assert_eq!(cpu.x[0], add_pac(ptr, 0x2222, KEY));
         cpu.x[2] = add_pac(0x4000, 0x2222, KEY);
         cpu.x[3] = 0x2222;
         cpu.pc = 0x1000;
-        run(&mut cpu, 0xd71f_0800 | 2 << 5 | 3);
+        run(&mut cpu, op(0xd71f_0800 | 2 << 5 | 3));
         assert_eq!(cpu.pc, 0x4000);
     }
 }

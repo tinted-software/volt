@@ -9,6 +9,9 @@ path = "src/lib.rs"
 
 [dependencies]
 volt-ir.workspace = true
+volt-isa-aarch64.workspace = true
+
+[dev-dependencies]
 volt-target = { path = "../../target", default-features = false, features = ["aarch64"] }
 
 [lints]

@@ -6,11 +6,11 @@
 use crate::Builder;
 use alloc::vec::Vec;
 use volt_ir::function::{BinOp as B, CmpOp as C, Value};
-use volt_target::aarch64::decode::*;
+use volt_isa_aarch64::decode::*;
 pub(crate) fn imm(b: &Builder, a: SimdImmediate) {
     let at = b.v_at(a.rd);
     match a.combine {
-        ImmCombine::Set => {
+        ImmCombine::Set | ImmCombine::SetInverted => {
             b.store(at, b.k(b.i64, a.low));
             b.store(at + 8, b.k(b.i64, a.high));
         }
@@ -31,14 +31,6 @@ pub(crate) fn imm(b: &Builder, a: SimdImmediate) {
             );
         }
     }
-}
-pub(crate) fn mov(b: &Builder, rd: u8, rn: u8) {
-    let at_d = b.v_at(rd);
-    let at_n = b.v_at(rn);
-    let lo = b.load(b.i64, at_n);
-    let hi = b.load(b.i64, at_n + 8);
-    b.store(at_d, lo);
-    b.store(at_d + 8, hi);
 }
 pub(crate) fn insert(b: &Builder, a: SimdInsert) {
     // Replace one lane of the destination with the low bits of a GPR.
@@ -185,7 +177,21 @@ pub(crate) fn ext(b: &Builder, a: SimdExt) {
     let vn_hi = b.load(b.i64, at_n + 8);
     let vm_lo = b.load(b.i64, at_m);
     let vm_hi = b.load(b.i64, at_m + 8);
-    let (lo, hi) = if a.imm == 0 {
+    let (lo, hi) = if !a.q {
+        // `.8b`: a byte window over the low halves of `rm:rn`; the upper half clears.
+        let lo = if a.imm == 0 {
+            vn_lo
+        } else {
+            let s = a.imm as u64 * 8;
+            b.bin(
+                b.i64,
+                B::BitOr,
+                b.imm(b.i64, B::Shr, vn_lo, s),
+                b.imm(b.i64, B::Shl, vm_lo, 64 - s),
+            )
+        };
+        (lo, b.k(b.i64, 0))
+    } else if a.imm == 0 {
         (vn_lo, vn_hi)
     } else if a.imm == 8 {
         (vn_hi, vm_lo)
@@ -341,6 +347,8 @@ pub(crate) fn table(b: &Builder, a: SimdTable) {
 }
 pub(crate) fn fmov(b: &Builder, a: SimdFmov) {
     // Pure bit move; no FP arithmetic involved.
+    // `fmov Vd.D[1], Xn` writes only the upper doubleword; `fmov Xd, Vn.D[1]` reads it.
+    let half = if a.upper { 8 } else { 0 };
     if a.to_fp {
         let v = b.reg(b.i64, a.rn, true);
         let bits = if a.double {
@@ -349,11 +357,13 @@ pub(crate) fn fmov(b: &Builder, a: SimdFmov) {
             b.imm(b.i64, B::BitAnd, v, 0xffff_ffff)
         };
         let at = b.v_at(a.rd);
-        b.store(at, bits);
-        b.store(at + 8, b.k(b.i64, 0));
+        b.store(at + half, bits);
+        if !a.upper {
+            b.store(at + 8, b.k(b.i64, 0));
+        }
     } else {
         let at = b.v_at(a.rn);
-        let v = b.load(b.i64, at);
+        let v = b.load(b.i64, at + half);
         let bits = if a.double {
             v
         } else {
