@@ -2,7 +2,7 @@ use super::{
     ahead::{Ahead, CodeReader},
     compile::{Block, Error, compile_with},
     cpu::Cpu,
-    decode::decode,
+    host::ends_block,
 };
 use core::hash::{Hash, Hasher};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -26,6 +26,8 @@ pub struct Cache {
     /// Where blocks come from on a local miss. Private to this cache unless
     /// built with `with_shared`.
     shared: Arc<SharedBlocks>,
+    /// Instructions one block scan may take: `MAX_INSNS`, or 1 when single-stepping.
+    max_insns: usize,
 }
 impl Default for Cache {
     fn default() -> Self {
@@ -34,6 +36,7 @@ impl Default for Cache {
             index: HashMap::new(),
             direct: alloc_direct(),
             shared: Arc::new(SharedBlocks::new(false)),
+            max_insns: MAX_INSNS,
         }
     }
 }
@@ -192,6 +195,17 @@ impl Cache {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// A cache whose blocks are one instruction each, so a trace sees every step.
+    pub fn single_step(inline_memory: bool) -> Self {
+        let mut cache = if inline_memory {
+            Self::with_inline_memory()
+        } else {
+            Self::new()
+        };
+        cache.max_insns = 1;
+        cache
+    }
     /// Whether blocks from this cache read `Cpu::dtlb`.
     pub fn inline_memory(&self) -> bool {
         self.shared.inline_memory()
@@ -326,7 +340,7 @@ impl Cache {
         let mut count = 0usize;
         let mut complete = false;
         let mut last = None;
-        for n in 0..MAX_INSNS {
+        for n in 0..self.max_insns {
             let at = cpu
                 .pc
                 .checked_add(count as u64)
@@ -342,7 +356,7 @@ impl Cache {
             }
             count += 4;
             let word = u32::from_le_bytes(room.try_into().unwrap());
-            let instruction = match decode(word) {
+            let instruction = match volt_isa_aarch64::decode::decode(word) {
                 Ok(insn) => insn,
                 // Run the decoded prefix first: the undecodable word then heads the
                 // next block, where it is reported at its own address.
@@ -352,21 +366,21 @@ impl Cache {
                 }
                 Err(_) => {
                     // Architecturally undefined words are the guest's to handle.
-                    if !super::decode::is_undefined(word) {
+                    if !volt_isa_aarch64::decode::is_undefined(word) {
                         eprintln!("cache decode failure at pc {at:x}: word {word:08x}");
                     }
                     return Err(Error::Decode { word, pc: at });
                 }
             };
             last = Some((instruction, at));
-            if instruction.terminates_with(self.shared.inline_memory()) {
+            if ends_block(&instruction, self.shared.inline_memory()) {
                 complete = true;
                 break;
             }
             // Never straddle a page: a block inside one page is validated by
             // that page's version alone, and the next page is translated and
             // checked when its own block starts.
-            complete = n + 1 == MAX_INSNS || (pc + count as u64) & 0xfff == 0;
+            complete = n + 1 == self.max_insns || (pc + count as u64) & 0xfff == 0;
             if complete {
                 break;
             }

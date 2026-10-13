@@ -23,10 +23,7 @@ pub use module::map_linked_aarch64;
     all(target_arch = "x86_64", feature = "x86_64"),
     all(target_arch = "aarch64", feature = "aarch64")
 ))]
-pub use module::{
-    DataKind, DataReloc, Error as ModuleError, JittedModule, ModuleData, ModuleFunction,
-    jit_module, jit_module_data,
-};
+pub use module::{Error as ModuleError, JittedModule, jit_module};
 
 #[derive(Debug)]
 pub enum Error {

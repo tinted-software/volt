@@ -9,9 +9,10 @@ use crate::regalloc::wimmer::{
 };
 use alloc::{vec, vec::Vec};
 use e::{Cond, FKind, Reg};
-use volt_ir::attribute::{AttrValue, Attribute};
+use volt_ir::attribute::{AttrValue, Attribute, Endianness};
 use volt_ir::function::{
-    AttrTarget, BinOp, Block, CmpOp, Function, Inst, Jump, Opcode, Ret, Terminator, UnaryOp, Value,
+    AtomicOrdering, AttrTarget, BinOp, Block, CmpOp, ConvertKind, Function, Inst, Jump, MemFlags,
+    Opcode, Ret, Terminator, UnaryOp, Value,
 };
 use volt_ir::types::{FloatKind, Type, TypeKind};
 
@@ -39,9 +40,8 @@ fn quad(f: &Function, v: Value) -> bool {
 fn vector(f: &Function, v: Value) -> bool {
     matches!(kind(f, v), TypeKind::Vector(_))
 }
-fn signed(f: &Function, v: Value) -> bool {
-    matches!(kind(f,v), TypeKind::Int(i) if i.signed)
-}
+/// Integer values of fewer than 64 bits are held zero-extended in registers; signedness is a
+/// property of the operation, which sign-extends its operands on demand (`signed_operand`).
 fn bits(f: &Function, v: Value) -> u16 {
     match kind(f, v) {
         TypeKind::Int(i) => i.bits,
@@ -54,11 +54,23 @@ fn canonical_constant(f: &Function, v: Value, n: u64) -> u64 {
     let bits = u32::from(bits(f, v));
     if bits >= 64 {
         n
-    } else if signed(f, v) {
-        (((n << (64 - bits)) as i64) >> (64 - bits)) as u64
     } else {
         n & ((1u64 << bits) - 1)
     }
+}
+/// Width in bytes of an `ldar`/`stlr` access to a value of `v`'s type: whole-byte integers up to
+/// 64 bits that are a power of two wide, and pointers. Other types have no ordered form.
+fn ordered_size(f: &Function, v: Value) -> Option<u8> {
+    match kind(f, v) {
+        TypeKind::Int(i) if matches!(i.bits, 8 | 16 | 32 | 64) => Some((i.bits / 8) as u8),
+        TypeKind::Ptr(_) => Some(8),
+        _ => None,
+    }
+}
+/// Whether the access is lowered to `ldar`/`stlr`, which only take a bare `[xn]` address, so no
+/// offset may be folded into it. A relaxed access is an ordinary `ldr`/`str` and folds freely.
+fn needs_bare_address(mem: &MemFlags) -> bool {
+    matches!(mem.ordering, Some(o) if o != AtomicOrdering::Relaxed)
 }
 fn wide(f: &Function, v: Value) -> bool {
     bits(f, v) > 32
@@ -530,6 +542,15 @@ impl Emitter<'_> {
         self.frame_imm(false, Reg::X8, base, off)?;
         Ok((Reg::X8, 0))
     }
+    /// The base register for an `ldar`/`stlr` of `[base + off]`: these have no offset form, so
+    /// a non-zero `off` is added into the x8 scratch first.
+    fn bare_base(&mut self, base: Reg, off: usize) -> Result<Reg, Error> {
+        if off == 0 {
+            return Ok(base);
+        }
+        self.frame_imm(false, Reg::X8, base, off)?;
+        Ok(Reg::X8)
+    }
     fn loc(&self, v: Value) -> Result<Location, Error> {
         if let Some(&r) = self.alloc.single_regs.get(v.index())
             && r != u16::MAX
@@ -597,14 +618,14 @@ impl Emitter<'_> {
     }
     /// Whether `v = lhs op rhs` (rhs a constant when `imm` is given) is already
     /// in canonical form, given canonical operands. Values narrower than 64 bits
-    /// are kept zero- (unsigned) or sign-extended (signed) to the full register.
-    /// Operations on 32-bit or narrower types run in 32-bit form, which zeroes
-    /// the upper half, so an unsigned 32-bit result is always canonical; a
-    /// narrower unsigned result only is if the operation cannot set bits above
+    /// are kept zero-extended to the full register. Operations on 32-bit or
+    /// narrower types run in 32-bit form, which zeroes the upper half, so a
+    /// 32-bit result is always canonical (`SMulh` excepted: it works in 64-bit
+    /// form); a narrower result only is if the operation cannot set bits above
     /// the type.
     fn keeps_canonical_form(&self, v: Value, op: BinOp, imm: Option<i64>) -> bool {
         let n = bits(self.f, v);
-        if class(self.f, v) != 0 || n >= 64 || signed(self.f, v) || wide(self.f, v) {
+        if class(self.f, v) != 0 || n >= 64 || wide(self.f, v) || op == BinOp::SMulh {
             return false;
         }
         if n == 32 {
@@ -613,7 +634,13 @@ impl Emitter<'_> {
         let in_range = imm.is_none_or(|k| k >= 0 && (k as u64) >> n == 0);
         matches!(
             op,
-            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shr | BinOp::Div | BinOp::Rem
+            BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shr
+                | BinOp::UDiv
+                | BinOp::URem
+                | BinOp::UMulh
         ) && in_range
     }
     /// `rd = rn op imm` as a single instruction, if the operation has an
@@ -622,11 +649,17 @@ impl Emitter<'_> {
         let is64 = wide(self.f, v);
         let width = if is64 { 64 } else { 32 };
         match op {
-            BinOp::Shl | BinOp::Shr if (0..width).contains(&imm) => Some(match op {
-                BinOp::Shl => e::lsl_imm(rd, rn, imm as u32, is64),
-                _ if signed(self.f, v) => e::asr_imm(rd, rn, imm as u32, is64),
-                _ => e::lsr_imm(rd, rn, imm as u32, is64),
-            }),
+            BinOp::Shl | BinOp::Shr | BinOp::Sar if (0..width).contains(&imm) => {
+                let n = bits(self.f, v);
+                Some(match op {
+                    BinOp::Shl => e::lsl_imm(rd, rn, imm as u32, is64),
+                    BinOp::Shr => e::lsr_imm(rd, rn, imm as u32, is64),
+                    _ if n == 32 || n == 64 => e::asr_imm(rd, rn, imm as u32, is64),
+                    // A zero-extended narrow value: extract its bitfield from `imm` up,
+                    // sign-extended from bit `n - 1`.
+                    _ => e::sbfm(rd, rn, imm.min(i64::from(n) - 1) as u8, (n - 1) as u8),
+                })
+            }
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                 let value = if is64 {
                     imm as u64
@@ -646,12 +679,44 @@ impl Emitter<'_> {
     fn normalize(&mut self, v: Value, r: Reg) {
         let n = bits(self.f, v);
         if n < 64 {
-            self.push(if signed(self.f, v) {
-                e::sbfm(r, r, 0, (n - 1) as u8)
-            } else {
-                e::ubfm(r, r, 0, (n - 1) as u8)
-            });
+            self.push(e::ubfm(r, r, 0, (n - 1) as u8));
         }
+    }
+    /// Whether `signed_operand` has to emit an extension for a value of `v`'s
+    /// type. Narrow operations read only the low 32 bits of a register, so a
+    /// 32-bit value needs none unless the whole register is read (`full`).
+    fn needs_sign_extension(&self, v: Value, full: bool) -> bool {
+        let n = bits(self.f, v);
+        n < 64 && (n != 32 || full)
+    }
+    /// `r`, which holds `v` zero-extended, as a sign-extended value for an
+    /// operation that reads its sign: `r` itself when no extension is needed,
+    /// else `scratch` after an extension into it.
+    fn signed_operand(&mut self, v: Value, r: Reg, scratch: Reg, full: bool) -> Reg {
+        if !self.needs_sign_extension(v, full) {
+            return r;
+        }
+        self.push(e::sbfm(scratch, r, 0, (bits(self.f, v) - 1) as u8));
+        scratch
+    }
+    /// Sets the flags for an integer compare of `a` and `b` (holding `lhs`'s
+    /// type) and returns the condition that `op` tests.
+    fn compare_flags(&mut self, op: CmpOp, lhs: Value, a: Reg, b: Reg) -> Result<Cond, Error> {
+        let cond = int_cond(op)?;
+        let (a, b) = if matches!(op, CmpOp::Slt | CmpOp::Sle | CmpOp::Sgt | CmpOp::Sge) {
+            (
+                self.signed_operand(lhs, a, reg(16), false),
+                self.signed_operand(lhs, b, reg(17), false),
+            )
+        } else {
+            (a, b)
+        };
+        self.push(if wide(self.f, lhs) {
+            e::cmp64(a, b)
+        } else {
+            e::cmp(a, b)
+        });
+        Ok(cond)
     }
     fn move_one(&mut self, m: Move) -> Result<(), Error> {
         if m.src == m.dst {
@@ -759,18 +824,15 @@ impl Emitter<'_> {
                 e::str_fp(r, base, off, double(self.f, v))
             }
         } else {
-            match (load, size, signed(self.f, v)) {
-                (true, 1, true) => e::ldrsb_off(r, base, off),
-                (true, 1, false) => e::ldrb_off(r, base, off),
-                (true, 2, true) => e::ldrsh_off(r, base, off),
-                (true, 2, false) => e::ldrh_off(r, base, off),
-                (true, 3..=4, true) => e::ldrsw(r, base, off),
-                (true, 3..=4, false) => e::ldr_w(r, base, off),
-                (true, 5..=8, _) => e::ldr_off(r, base, off),
-                (false, 1, _) => e::strb_off(r, base, off),
-                (false, 2, _) => e::strh_off(r, base, off),
-                (false, 3..=4, _) => e::str_w(r, base, off),
-                (false, 5..=8, _) => e::str_off(r, base, off),
+            match (load, size) {
+                (true, 1) => e::ldrb_off(r, base, off),
+                (true, 2) => e::ldrh_off(r, base, off),
+                (true, 3..=4) => e::ldr_w(r, base, off),
+                (true, 5..=8) => e::ldr_off(r, base, off),
+                (false, 1) => e::strb_off(r, base, off),
+                (false, 2) => e::strh_off(r, base, off),
+                (false, 3..=4) => e::str_w(r, base, off),
+                (false, 5..=8) => e::str_off(r, base, off),
                 _ => return Err(Error::Unsupported),
             }
         };
@@ -789,50 +851,67 @@ impl Emitter<'_> {
         b: Reg,
     ) -> Result<(), Error> {
         let sf = if wide(self.f, v) { 1 << 31 } else { 0 };
-        let si = signed(self.f, v);
         let w = match op {
             BinOp::Add => e::add(rd, a, b),
             BinOp::Sub => e::sub(rd, a, b),
             BinOp::Mul => e::mul(rd, a, b),
-            BinOp::Mulh => {
-                if bits(self.f, v) != 64 {
+            BinOp::UMulh | BinOp::SMulh => {
+                let n = bits(self.f, v);
+                if n == 64 {
+                    self.push(if op == BinOp::SMulh {
+                        e::smulh(rd, a, b)
+                    } else {
+                        e::umulh(rd, a, b)
+                    });
+                    return Ok(());
+                }
+                // The product of two values of up to 32 bits fits a register.
+                if n > 32 {
                     return Err(Error::Unsupported);
                 }
-                if si {
-                    e::smulh(rd, a, b)
+                if op == BinOp::SMulh {
+                    let a = self.signed_operand(v, a, reg(16), true);
+                    let b = self.signed_operand(v, b, reg(17), true);
+                    self.push(e::mul64(rd, a, b));
+                    self.push(e::asr_imm(rd, rd, u32::from(n), true));
                 } else {
-                    e::umulh(rd, a, b)
+                    self.push(e::mul64(rd, a, b));
+                    self.push(e::lsr_imm(rd, rd, u32::from(n), true));
                 }
+                return Ok(());
             }
-            BinOp::Div => {
-                if si {
-                    e::sdiv(rd, a, b)
-                } else {
-                    e::udiv(rd, a, b)
-                }
+            BinOp::UDiv => e::udiv(rd, a, b),
+            BinOp::SDiv => {
+                let a = self.signed_operand(v, a, reg(16), false);
+                let b = self.signed_operand(v, b, reg(17), false);
+                e::sdiv(rd, a, b)
             }
-            BinOp::Rem => {
-                self.push(
-                    sf | if si {
-                        e::sdiv(reg(16), a, b)
-                    } else {
-                        e::udiv(reg(16), a, b)
-                    },
-                );
+            BinOp::URem => {
+                self.push(sf | e::udiv(reg(16), a, b));
                 self.push(sf | e::msub(rd, reg(16), b, a));
+                return Ok(());
+            }
+            BinOp::SRem => {
+                // Extended operands live in x16/x17, so the quotient can use `rd`.
+                let extend = self.needs_sign_extension(v, false);
+                let a = self.signed_operand(v, a, reg(16), false);
+                let b = self.signed_operand(v, b, reg(17), false);
+                let q = if extend { rd } else { reg(16) };
+                self.push(sf | e::sdiv(q, a, b));
+                self.push(sf | e::msub(rd, q, b, a));
                 return Ok(());
             }
             BinOp::BitAnd => e::andr(rd, a, b),
             BinOp::BitOr => e::orr(rd, a, b),
             BinOp::BitXor => e::eor(rd, a, b),
             BinOp::Shl => e::lslv(rd, a, b),
-            BinOp::Shr => {
-                if si {
-                    e::asrv(rd, a, b)
-                } else {
-                    e::lsrv(rd, a, b)
-                }
+            BinOp::Shr => e::lsrv(rd, a, b),
+            BinOp::Sar => {
+                let a = self.signed_operand(v, a, reg(16), false);
+                e::asrv(rd, a, b)
             }
+            // Floating-point only.
+            BinOp::Div | BinOp::Rem => return Err(Error::Unsupported),
         };
         self.push(sf | w);
         Ok(())
@@ -915,7 +994,7 @@ impl Emitter<'_> {
         }
         self.finish(v, rd)
     }
-    fn convert(&mut self, v: Value, src: Value) -> Result<(), Error> {
+    fn convert(&mut self, v: Value, src: Value, kind: ConvertKind) -> Result<(), Error> {
         if quad(self.f, v) || quad(self.f, src) || vector(self.f, v) || vector(self.f, src) {
             return Err(Error::Unsupported);
         }
@@ -923,25 +1002,43 @@ impl Emitter<'_> {
         let dc = class(self.f, v);
         let a = self.read(src, reg(if sc == 1 { 24 } else { 13 }))?;
         let rd = self.result(v)?;
-        match (sc, dc) {
-            (0, 1) => {
-                self.push(e::cvt_int_to_float(
-                    rd,
-                    a,
-                    fkind(self.f, v, self.caps),
-                    signed(self.f, src),
-                ));
+        match kind {
+            ConvertKind::SiToFp | ConvertKind::UiToFp => {
+                if (sc, dc) != (0, 1) {
+                    return Err(Error::Unsupported);
+                }
+                let si = kind == ConvertKind::SiToFp;
+                let a = if si {
+                    self.signed_operand(src, a, reg(16), false)
+                } else {
+                    a
+                };
+                let sf = if wide(self.f, src) { 1 << 31 } else { 0 };
+                self.push(sf | e::cvt_int_to_float(rd, a, fkind(self.f, v, self.caps), si));
                 if half(self.f, v) && !self.caps.fp16 {
                     self.half_round(rd);
                 }
             }
-            (1, 0) => self.push(e::cvt_float_to_int(
-                rd,
-                a,
-                fkind(self.f, src, self.caps),
-                signed(self.f, v),
-            )),
-            (1, 1) => {
+            ConvertKind::FpToSi | ConvertKind::FpToUi => {
+                if (sc, dc) != (1, 0) {
+                    return Err(Error::Unsupported);
+                }
+                // A destination narrower than 32 bits keeps the low bits of the 32-bit
+                // saturating conversion (`finish` truncates).
+                let sf = if wide(self.f, v) { 1 << 31 } else { 0 };
+                self.push(
+                    sf | e::cvt_float_to_int(
+                        rd,
+                        a,
+                        fkind(self.f, src, self.caps),
+                        kind == ConvertKind::FpToSi,
+                    ),
+                );
+            }
+            ConvertKind::FpResize => {
+                if (sc, dc) != (1, 1) {
+                    return Err(Error::Unsupported);
+                }
                 if self.caps.fp16 && (half(self.f, src) || half(self.f, v)) {
                     self.push(if half(self.f, src) && half(self.f, v) {
                         e::fmov_reg(rd, a)
@@ -969,16 +1066,27 @@ impl Emitter<'_> {
                     self.push(e::fcvt(rd, a, double(self.f, v)));
                 }
             }
-            _ => {
+            ConvertKind::Trunc | ConvertKind::Zext | ConvertKind::Sext => {
+                if (sc, dc) != (0, 0) {
+                    return Err(Error::Unsupported);
+                }
                 let n = bits(self.f, src);
-                if bits(self.f, v) > n && n < 64 {
-                    self.push(if signed(self.f, src) {
-                        e::sbfm(rd, a, 0, (n - 1) as u8)
-                    } else {
-                        e::ubfm(rd, a, 0, (n - 1) as u8)
-                    });
+                let m = bits(self.f, v);
+                if kind == ConvertKind::Sext && m > n && n < 64 {
+                    let word = e::sbfm(rd, a, 0, (n - 1) as u8);
+                    if m == 32 {
+                        // The 32-bit form clears the upper half: already canonical.
+                        self.push(word & !(1 << 31 | 1 << 22));
+                        return self.finish_normal(v, rd);
+                    }
+                    self.push(word);
                 } else {
+                    // A zero-extension of a canonical value, a truncation (`finish`
+                    // clears the bits above `m`) or a same-width copy.
                     self.push(e::mov(rd, a));
+                    if kind == ConvertKind::Zext {
+                        return self.finish_normal(v, rd);
+                    }
                 }
             }
         }
@@ -1132,19 +1240,12 @@ impl Emitter<'_> {
             if let Fusion::Compare { lhs, rhs, op } = fusion {
                 let a = self.read(lhs, reg(13))?;
                 let b = self.read(rhs, reg(14))?;
-                self.push(if wide(self.f, lhs) {
-                    e::cmp64(a, b)
-                } else {
-                    e::cmp(a, b)
-                });
+                let cond = self.compare_flags(op, lhs, a, b)?;
                 let Opcode::If(cf) = self.f.opcode_ref(inst) else {
                     return Err(Error::Unsupported);
                 };
                 let other = self.local_label();
-                self.branch(
-                    other,
-                    e::bcc(e::invert(int_cond(op, signed(self.f, lhs))), 0),
-                );
+                self.branch(other, e::bcc(e::invert(cond), 0));
                 self.edge(cf.then)?;
                 self.bind(other);
                 self.edge(cf.else_)?;
@@ -1222,7 +1323,7 @@ impl Emitter<'_> {
                 } else if let Some(word) = self.immediate_form(v, a.op, rd, r, a.imm) {
                     self.push(word);
                 } else {
-                    self.constant(reg(14), a.imm as u64);
+                    self.constant(reg(14), canonical_constant(self.f, v, a.imm as u64));
                     self.integer_binary(v, a.op, rd, r, reg(14))?;
                 }
                 if self.keeps_canonical_form(v, a.op, Some(a.imm)) {
@@ -1247,6 +1348,7 @@ impl Emitter<'_> {
                         CmpOp::Le => e::fcmge_vec(rd, b, a),
                         CmpOp::Gt => e::fcmgt_vec(rd, a, b),
                         CmpOp::Ge => e::fcmge_vec(rd, a, b),
+                        _ => return Err(Error::Unsupported),
                     });
                     if c.op == CmpOp::Ne {
                         self.push(e::mvn_vec(rd, rd));
@@ -1255,15 +1357,12 @@ impl Emitter<'_> {
                     if quad(self.f, c.lhs) {
                         return Err(Error::Unsupported);
                     }
+                    let cond = float_cond(c.op)?;
                     self.push(e::fcmp(a, b, fkind(self.f, c.lhs, self.caps)));
-                    self.push(e::cset(rd, float_cond(c.op)));
+                    self.push(e::cset(rd, cond));
                 } else {
-                    self.push(if wide(self.f, c.lhs) {
-                        e::cmp64(a, b)
-                    } else {
-                        e::cmp(a, b)
-                    });
-                    self.push(e::cset(rd, int_cond(c.op, signed(self.f, c.lhs))));
+                    let cond = self.compare_flags(c.op, c.lhs, a, b)?;
+                    self.push(e::cset(rd, cond));
                 }
                 // `cset` already yields 0 or 1.
                 if !fp && !vector(self.f, c.lhs) && bits(self.f, v) == 1 {
@@ -1297,15 +1396,17 @@ impl Emitter<'_> {
                         e::csel(rd, a, b, Cond::Ne) | if wide(self.f, v) { 1 << 31 } else { 0 }
                     });
                 }
-                // `csel` copies one of two canonical operands, so an unsigned
-                // result needs no extension.
-                if class(self.f, v) == 0 && !signed(self.f, v) && !vector(self.f, v) {
+                // `csel` copies one of two canonical operands, so the result
+                // needs no extension.
+                if class(self.f, v) == 0 && !vector(self.f, v) {
                     self.finish_normal(v, rd)?;
                 } else {
                     self.finish(v, rd)?;
                 }
             }
-            Opcode::Convert(c) => self.convert(result.ok_or(Error::Unsupported)?, c.value)?,
+            Opcode::Convert(c) => {
+                self.convert(result.ok_or(Error::Unsupported)?, c.value, c.kind)?
+            }
             Opcode::Unary(u) => {
                 let v = result.ok_or(Error::Unsupported)?;
                 let rd = self.result(v)?;
@@ -1370,25 +1471,73 @@ impl Emitter<'_> {
                 self.finish(v, rd)?;
             }
             Opcode::Load(l) => {
+                if l.mem.endian == Endianness::Big {
+                    return Err(Error::Unsupported);
+                }
                 let v = result.ok_or(Error::Unsupported)?;
+                let size = ordered_size(self.f, v);
+                let acquire = match l.mem.ordering {
+                    None => false,
+                    // Relaxed: an ordinary, naturally aligned load is single-copy atomic.
+                    Some(AtomicOrdering::Relaxed) => {
+                        if size.is_none() {
+                            return Err(Error::Unsupported);
+                        }
+                        false
+                    }
+                    Some(AtomicOrdering::Acquire | AtomicOrdering::SeqCst) => true,
+                    Some(AtomicOrdering::Release | AtomicOrdering::AcqRel) => {
+                        return Err(Error::Unsupported);
+                    }
+                };
                 let a = self.read(l.ptr, reg(13))?;
                 let rd = self.result(v)?;
-                self.memory(true, v, rd, a, self.fold.off_of(inst) as usize)?;
-                // `ldrb`/`ldrh`/`ldr w` already zero-extend a whole-byte unsigned value.
+                if acquire {
+                    let size = size.ok_or(Error::Unsupported)?;
+                    let base = self.bare_base(a, self.fold.off_of(inst) as usize)?;
+                    self.push(e::ldar(rd, base, size));
+                } else {
+                    self.memory(true, v, rd, a, self.fold.off_of(inst) as usize)?;
+                }
+                // `ldrb`/`ldrh`/`ldr w`/`ldar*` already zero-extend a whole-byte value.
                 let n = bits(self.f, v);
-                if class(self.f, v) == 0 && !signed(self.f, v) && matches!(n, 8 | 16 | 32 | 64) {
+                if class(self.f, v) == 0 && matches!(n, 8 | 16 | 32 | 64) {
                     self.finish_normal(v, rd)?;
                 } else {
                     self.finish(v, rd)?;
                 }
             }
             Opcode::Store(s) => {
+                if s.mem.endian == Endianness::Big {
+                    return Err(Error::Unsupported);
+                }
+                let size = ordered_size(self.f, s.value);
+                let release = match s.mem.ordering {
+                    None => false,
+                    // Relaxed: an ordinary, naturally aligned store is single-copy atomic.
+                    Some(AtomicOrdering::Relaxed) => {
+                        if size.is_none() {
+                            return Err(Error::Unsupported);
+                        }
+                        false
+                    }
+                    Some(AtomicOrdering::Release | AtomicOrdering::SeqCst) => true,
+                    Some(AtomicOrdering::Acquire | AtomicOrdering::AcqRel) => {
+                        return Err(Error::Unsupported);
+                    }
+                };
                 let a = self.read(
                     s.value,
                     reg(if class(self.f, s.value) == 1 { 24 } else { 13 }),
                 )?;
                 let p = self.read(s.ptr, reg(14))?;
-                self.memory(false, s.value, a, p, self.fold.off_of(inst) as usize)?;
+                if release {
+                    let size = size.ok_or(Error::Unsupported)?;
+                    let base = self.bare_base(p, self.fold.off_of(inst) as usize)?;
+                    self.push(e::stlr(a, base, size));
+                } else {
+                    self.memory(false, s.value, a, p, self.fold.off_of(inst) as usize)?;
+                }
             }
             Opcode::Prefetch(p) => {
                 let a = self.read(p.ptr, reg(13))?;
@@ -1464,7 +1613,12 @@ impl Emitter<'_> {
                 } else {
                     e::umov_lane(rd, a, x.index as u8)
                 });
-                self.finish(v, rd)?;
+                if fp {
+                    self.finish(v, rd)?;
+                } else {
+                    // `umov` to a w register zero-extends the 32-bit lane.
+                    self.finish_normal(v, rd)?;
+                }
             }
             Opcode::StructNew(s) => {
                 let v = result.ok_or(Error::Unsupported)?;
@@ -1520,12 +1674,10 @@ impl Emitter<'_> {
                 let b = self.read(d.a, reg(25))?;
                 let c = self.read(d.b, reg(26))?;
                 self.push(e::mov_vec(reg(27), a));
-                let si = match kind(self.f, d.a) {
-                    TypeKind::Vector(x) => {
-                        matches!(self.f.types.type_kind(x.elem),TypeKind::Int(i) if i.signed)
-                    }
-                    _ => return Err(Error::Unsupported),
-                };
+                if !vector(self.f, d.a) {
+                    return Err(Error::Unsupported);
+                }
+                let si = d.signed;
                 self.push(if si {
                     e::sdot(reg(27), b, c)
                 } else {
@@ -1601,49 +1753,33 @@ impl Emitter<'_> {
         Ok(())
     }
 }
-fn int_cond(op: CmpOp, si: bool) -> Cond {
-    match op {
+/// The condition code that holds after comparing the operands of an integer
+/// (or pointer) `op`; the signed forms need sign-extended operands.
+fn int_cond(op: CmpOp) -> Result<Cond, Error> {
+    Ok(match op {
         CmpOp::Eq => Cond::Eq,
         CmpOp::Ne => Cond::Ne,
-        CmpOp::Lt => {
-            if si {
-                Cond::Lt
-            } else {
-                Cond::Lo
-            }
-        }
-        CmpOp::Le => {
-            if si {
-                Cond::Le
-            } else {
-                Cond::Ls
-            }
-        }
-        CmpOp::Gt => {
-            if si {
-                Cond::Gt
-            } else {
-                Cond::Hi
-            }
-        }
-        CmpOp::Ge => {
-            if si {
-                Cond::Ge
-            } else {
-                Cond::Hs
-            }
-        }
-    }
+        CmpOp::Slt => Cond::Lt,
+        CmpOp::Sle => Cond::Le,
+        CmpOp::Sgt => Cond::Gt,
+        CmpOp::Sge => Cond::Ge,
+        CmpOp::Ult => Cond::Lo,
+        CmpOp::Ule => Cond::Ls,
+        CmpOp::Ugt => Cond::Hi,
+        CmpOp::Uge => Cond::Hs,
+        CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => return Err(Error::Unsupported),
+    })
 }
-fn float_cond(op: CmpOp) -> Cond {
-    match op {
+fn float_cond(op: CmpOp) -> Result<Cond, Error> {
+    Ok(match op {
         CmpOp::Eq => Cond::Eq,
         CmpOp::Ne => Cond::Ne,
         CmpOp::Lt => Cond::Mi,
         CmpOp::Le => Cond::Ls,
         CmpOp::Gt => Cond::Gt,
         CmpOp::Ge => Cond::Ge,
-    }
+        _ => return Err(Error::Unsupported),
+    })
 }
 
 /// True for a function made only of scalar integer, boolean and pointer
@@ -1669,6 +1805,14 @@ fn is_plain_integer(f: &Function) -> bool {
                     | Opcode::Store(_)
                     | Opcode::If(_)
             ) {
+                return false;
+            }
+            let mem = match f.opcode_ref(*i) {
+                Opcode::Load(l) => Some(&l.mem),
+                Opcode::Store(s) => Some(&s.mem),
+                _ => None,
+            };
+            if mem.is_some_and(|m| !m.is_plain()) {
                 return false;
             }
         }
@@ -1709,13 +1853,16 @@ pub(super) fn compile_owned(
             _ => false,
         });
         volt_ir::softfp::lower(&mut f);
+        // Legalize rewrites byte-swapped and atomic float accesses into forms selected below;
+        // ordered int/pointer accesses become `ldar`/`stlr` (or plain accesses when relaxed).
+        volt_ir::legalize::legalize(&mut f);
         volt_ir::critical_edge::split_critical_edges(&mut f);
         volt_ir::reachable::neutralize_unreachable(&mut f);
     }
     let fold = crate::regalloc::addrfold::analyze(&f, |f, i| {
         let (p, v) = match f.opcode_ref(i) {
-            Opcode::Load(l) => (l.ptr, f.inst_result(i)?),
-            Opcode::Store(s) => (s.ptr, s.value),
+            Opcode::Load(l) if !needs_bare_address(&l.mem) => (l.ptr, f.inst_result(i)?),
+            Opcode::Store(s) if !needs_bare_address(&s.mem) => (s.ptr, s.value),
             _ => return None,
         };
         let add = match f.opcode_ref(f.defining_inst(p)?) {

@@ -26,23 +26,66 @@ pub struct Entry {
     pub generation: u64,
     pub ap: u8,
     pub executable: bool,
-    pub faulted: bool,
 }
+/// The translation regime for the current EL. `split` regimes (EL1&0, and EL2 with
+/// `HCR_EL2.E2H`, or EL0 under TGE with E2H) walk a TTBR0 and a TTBR1 range under the
+/// `TCR_EL1` layout. EL2 without E2H has one TTBR0 range under `TCR_EL2`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Context {
+struct Regime {
     sctlr: u64,
     tcr: u64,
     ttbr0: u64,
     ttbr1: u64,
+    split: bool,
+    /// Bit position of the physical-address size field: IPS (34:32) or PS (18:16).
+    ips_shift: u32,
+}
+impl Regime {
+    fn of(cpu: &Cpu) -> Self {
+        use super::cpu::{HCR_E2H, HCR_TGE};
+        let hcr = cpu.system.hcr_el2;
+        let el2_regime =
+            cpu.system.el == 2 || (cpu.system.el == 0 && hcr & HCR_TGE != 0 && hcr & HCR_E2H != 0);
+        if !el2_regime {
+            return Self {
+                sctlr: cpu.system.sctlr_el1,
+                tcr: cpu.system.tcr_el1,
+                ttbr0: cpu.system.ttbr0_el1,
+                ttbr1: cpu.system.ttbr1_el1,
+                split: true,
+                ips_shift: 32,
+            };
+        }
+        if hcr & HCR_E2H != 0 {
+            Self {
+                sctlr: cpu.system.sctlr_el2,
+                tcr: cpu.system.tcr_el2,
+                ttbr0: cpu.system.ttbr0_el2,
+                ttbr1: cpu.system.ttbr1_el2,
+                split: true,
+                ips_shift: 32,
+            }
+        } else {
+            Self {
+                sctlr: cpu.system.sctlr_el2,
+                tcr: cpu.system.tcr_el2,
+                ttbr0: cpu.system.ttbr0_el2,
+                ttbr1: 0,
+                split: false,
+                ips_shift: 16,
+            }
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Context {
+    regime: Regime,
     el: u8,
 }
 impl Context {
     fn of(cpu: &Cpu) -> Self {
         Self {
-            sctlr: cpu.system.sctlr_el1,
-            tcr: cpu.system.tcr_el1,
-            ttbr0: cpu.system.ttbr0_el1,
-            ttbr1: cpu.system.ttbr1_el1,
+            regime: Regime::of(cpu),
             el: cpu.system.el,
         }
     }
@@ -52,8 +95,6 @@ pub struct Tlb {
     pub entries: [Entry; 256],
     pub generation: u64,
     context: Option<Context>,
-    /// Some entry caches a translation fault.
-    has_faulted: bool,
 }
 impl Default for Tlb {
     fn default() -> Self {
@@ -61,7 +102,6 @@ impl Default for Tlb {
             entries: [Entry::default(); 256],
             generation: 1,
             context: None,
-            has_faulted: false,
         }
     }
 }
@@ -71,25 +111,8 @@ impl Tlb {
     }
     pub fn flush(&mut self) {
         self.generation = self.generation.wrapping_add(1);
-        self.has_faulted = false;
         if self.generation <= 1 {
             self.entries = [Entry::default(); 256];
-        }
-    }
-    /// Drop cached translation faults, keeping every valid translation (and so
-    /// the generation that code and data fast paths are validated against).
-    /// A context-synchronization event (ISB) makes earlier page-table writes
-    /// visible to the walker, which can turn a fault into a mapping. It does
-    /// not invalidate valid translations; only TLBI does.
-    pub fn purge_faults(&mut self) {
-        if !self.has_faulted {
-            return;
-        }
-        self.has_faulted = false;
-        for entry in &mut self.entries {
-            if entry.faulted {
-                *entry = Entry::default();
-            }
         }
     }
     fn slot(virtual_address: u64) -> usize {
@@ -106,10 +129,11 @@ impl Tlb {
     }
 }
 fn enabled(cpu: &Cpu) -> Result<bool, TranslateError> {
-    if cpu.system.sctlr_el1 & 1 == 0 {
+    let regime = Regime::of(cpu);
+    if regime.sctlr & 1 == 0 {
         return Ok(false);
     }
-    if cpu.system.tcr_el1 & 63 == 0 {
+    if regime.tcr & 63 == 0 {
         return Err(TranslateError::MalformedTables);
     }
     Ok(true)
@@ -118,7 +142,10 @@ pub fn physical_bits(cpu: &Cpu) -> Result<u8, TranslateError> {
     if !enabled(cpu)? {
         return Ok(64);
     }
-    Ok([32, 36, 40, 42, 48, 52, 56, 56][((cpu.system.tcr_el1 >> 32) & 7) as usize])
+    let regime = Regime::of(cpu);
+    // IPS (TCR_EL1 bits 34:32) or PS (TCR_EL2 bits 18:16).
+    let field = (regime.tcr >> regime.ips_shift) & 7;
+    Ok([32, 36, 40, 42, 48, 52, 56, 56][field as usize])
 }
 fn permitted(ap: u8, executable: bool, access: Access, el: u8) -> Result<(), TranslateError> {
     if (el == 0 && ap & 1 == 0)
@@ -140,8 +167,11 @@ pub fn translate<M: GuestMemory + ?Sized>(
     if !enabled(cpu)? {
         return Ok(virtual_address);
     }
-    let t1sz = ((cpu.system.tcr_el1 >> 16) & 63) as u32;
-    if t1sz == 0 {
+    let regime = Regime::of(cpu);
+    let t1sz = ((regime.tcr >> 16) & 63) as u32;
+    // TTBR1's region size only means something while EPD1 leaves its walk enabled.
+    let upper_walk = regime.split && regime.tcr & (1 << 23) == 0;
+    if upper_walk && t1sz == 0 {
         return Err(TranslateError::MalformedTables);
     }
     if ((virtual_address >> 55) & 1 != 0 && virtual_address >> 48 != 0xffff)
@@ -149,11 +179,11 @@ pub fn translate<M: GuestMemory + ?Sized>(
     {
         return Err(TranslateError::TranslationFault);
     }
-    let lower_bits = 64 - (cpu.system.tcr_el1 & 63) as u32;
+    let lower_bits = 64 - (regime.tcr & 63) as u32;
     let upper_bits = 64 - t1sz;
     let upper = if virtual_address >> lower_bits == 0 {
         false
-    } else if virtual_address >> upper_bits == u64::MAX >> upper_bits {
+    } else if upper_walk && virtual_address >> upper_bits == u64::MAX >> upper_bits {
         true
     } else {
         return Err(TranslateError::TranslationFault);
@@ -166,9 +196,6 @@ pub fn translate<M: GuestMemory + ?Sized>(
     let slot = Tlb::slot(virtual_address);
     let entry = &tlb.entries[slot];
     if entry.generation == tlb.generation && entry.virtual_address == page {
-        if entry.faulted {
-            return Err(TranslateError::TranslationFault);
-        }
         // A cached entry that denies the access is re-walked below: the
         // descriptor may have been upgraded since it was cached, which
         // hardware also resolves by retrying the walk.
@@ -176,22 +203,10 @@ pub fn translate<M: GuestMemory + ?Sized>(
             return Ok(entry.physical | (virtual_address & PAGE_MASK));
         }
     }
-    let found = match walk(cpu, memory, virtual_address, access, upper) {
-        Ok(found) => found,
-        Err(fault) => {
-            // Only access-independent failures may be cached as unmapped.
-            if fault != TranslateError::PermissionFault {
-                tlb.entries[slot] = Entry {
-                    virtual_address: page,
-                    generation: tlb.generation,
-                    faulted: true,
-                    ..Entry::default()
-                };
-                tlb.has_faulted = true;
-            }
-            return Err(fault);
-        }
-    };
+    // Faults are not cached. ARMv8 never caches an invalid descriptor, so a mapping
+    // installed later, without a TLBI or an ISB (as Linux's `ioremap` does), must be
+    // seen by the next access.
+    let found = walk(cpu, memory, virtual_address, access, upper)?;
     tlb.entries[slot] = Entry {
         virtual_address: page,
         physical: found.physical & !PAGE_MASK,
@@ -207,8 +222,9 @@ fn walk<M: GuestMemory + ?Sized>(
     access: Access,
     upper: bool,
 ) -> Result<Entry, TranslateError> {
-    let tcr = cpu.system.tcr_el1;
-    if (upper && tcr & (1 << 23) != 0) || (!upper && tcr & (1 << 7) != 0) {
+    let regime = Regime::of(cpu);
+    let tcr = regime.tcr;
+    if (upper && tcr & (1 << 23) != 0) || (!upper && regime.split && tcr & (1 << 7) != 0) {
         return Err(TranslateError::TranslationFault);
     }
     let granule = if upper {
@@ -220,11 +236,7 @@ fn walk<M: GuestMemory + ?Sized>(
         return Err(TranslateError::MalformedTables);
     }
     // ASID is in TTBR bits 63:48, never part of a physical table address.
-    let root = if upper {
-        cpu.system.ttbr1_el1
-    } else {
-        cpu.system.ttbr0_el1
-    };
+    let root = if upper { regime.ttbr1 } else { regime.ttbr0 };
     let va_bits = 64 - if upper { (tcr >> 16) & 63 } else { tcr & 63 };
     if va_bits > 48 || va_bits <= u64::from(granule) {
         return Err(TranslateError::MalformedTables);
@@ -264,9 +276,6 @@ fn walk<M: GuestMemory + ?Sized>(
         let descriptor = u64::from_le_bytes(word);
         let kind = descriptor & 3;
         if kind == 3 && level != 0 {
-            if descriptor & 0x3f0 != 0 {
-                return Err(TranslateError::MalformedTables);
-            }
             no_user |= descriptor & (1 << 61) != 0;
             read_only |= descriptor & (1 << 62) != 0;
             pxn_table |= descriptor & (1 << 59) != 0;
@@ -495,7 +504,7 @@ mod tests {
         assert_eq!(memory.reads.get(), reads, "same page must not walk again");
     }
     #[test]
-    fn invalid_descriptors_and_malformed_tables_fail_closed() {
+    fn invalid_descriptors_fail_closed() {
         let cpu = cpu();
         let mut memory = Memory::new();
         let mut tlb = Tlb::new();
@@ -509,12 +518,24 @@ mod tests {
             translate(&mut tlb, &cpu, &mut memory, 0, Access::Read),
             Err(TranslateError::TranslationFault)
         );
-        assert_eq!(memory.reads.get(), count);
-        tlb.flush();
-        memory.put(0, 0x1013);
+        // A fault is not cached: the repeated access walks the tables again.
+        assert!(memory.reads.get() > count);
+    }
+    #[test]
+    fn table_descriptor_bits_eleven_to_two_are_ignored() {
+        // Table descriptors ignore bits 11:2 (ARM ARM D8.3.1). Set them on every table on the
+        // walk for address 0: the page at 0x4000_0000 must still resolve.
+        let cpu = cpu();
+        let mut memory = Memory::new();
+        let mut tlb = Tlb::new();
+        memory.chain(0, 0, 12, 4, 0, 0x4000_0403);
+        for table in [0usize, 0x1000, 0x2000] {
+            let descriptor = memory.get(table);
+            memory.put(table as u64, descriptor | 0x3f0);
+        }
         assert_eq!(
             translate(&mut tlb, &cpu, &mut memory, 0, Access::Read),
-            Err(TranslateError::MalformedTables)
+            Ok(0x4000_0000)
         );
     }
     #[test]
@@ -727,6 +748,61 @@ mod tests {
         assert_eq!(
             translate(&mut tlb, &cpu, &mut memory, 0, Access::Read),
             Err(TranslateError::PermissionFault)
+        );
+    }
+    #[test]
+    fn el2_walks_only_ttbr0_el2_under_tcr_el2_and_has_no_upper_range() {
+        let mut cpu = Cpu::default();
+        cpu.system.el = 2;
+        cpu.system.sctlr_el2 = 1;
+        // T0SZ = 16 (48-bit VAs), TG0 = 4 KiB, PS = 40 bits.
+        cpu.system.tcr_el2 = 16 | (2 << 16);
+        cpu.system.ttbr0_el2 = 0;
+        // The EL1&0 regime is disabled: EL2 translates from its own registers.
+        cpu.system.sctlr_el1 = 0;
+        let mut memory = Memory::new();
+        memory.chain(0, 0, 12, 4, 0, 0x4000_0443);
+        let mut tlb = Tlb::new();
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, 0, Access::Read),
+            Ok(0x4000_0000)
+        );
+        assert_eq!(physical_bits(&cpu), Ok(40));
+        // Bit 55 set with an all-ones upper half: a TTBR1 address, which EL2 lacks.
+        assert_eq!(
+            translate(
+                &mut tlb,
+                &cpu,
+                &mut memory,
+                0xffff_8000_0000_0000,
+                Access::Read
+            ),
+            Err(TranslateError::TranslationFault)
+        );
+    }
+    #[test]
+    fn epd1_disables_the_upper_walk_so_its_t1sz_is_never_checked() {
+        // The tinted-boot firmware's TCR_EL1: T0SZ 25 (a 39-bit lower range), EPD1 set,
+        // and T1SZ 0, which is only meaningful while the TTBR1 walk is enabled.
+        let mut cpu = cpu();
+        cpu.system.tcr_el1 = 25 | (1 << 23) | (2 << 30) | (4 << 32);
+        let mut memory = Memory::new();
+        let mut tlb = Tlb::new();
+        // A 1 GiB block at 0x4000_0000 in the TTBR0 root table, which sits at 0.
+        memory.chain(0, 0x4000_0000, 12, 3, 2, 0x4000_0401);
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, 0x4000_0000, Access::Execute),
+            Ok(0x4000_0000)
+        );
+        assert_eq!(
+            translate(
+                &mut tlb,
+                &cpu,
+                &mut memory,
+                0xffff_8000_0000_0000,
+                Access::Read
+            ),
+            Err(TranslateError::TranslationFault)
         );
     }
 }

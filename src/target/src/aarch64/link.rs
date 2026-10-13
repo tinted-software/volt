@@ -1,16 +1,18 @@
-//! AArch64 static/JIT linker: concatenate pre-compiled functions, resolve
-//! intra-module calls, lay out data globals, and carry `global_addr`
-//! relocations forward.
+//! AArch64 static/JIT linker: compile a [`volt_ir::module::Module`],
+//! concatenate its functions, resolve intra-module calls, lay out data
+//! globals, and carry `global_addr` relocations forward.
 //!
-//! [`Module`] takes pre-compiled [`Vec<u32>`] function bodies. Compile a
-//! `volt_ir::function::Function` through [`super::isel::compile_function`]
-//! first, retaining relocations for object emission or native module mapping.
+//! Each function goes through [`super::isel::compile_function`]; the
+//! relocations it retains drive linking here and, for object emission or native
+//! module mapping, the unresolved ones are carried in [`Linked`].
 
-use alloc::string::{String, ToString as _};
+use alloc::string::String;
 use alloc::vec::Vec;
 
+use volt_ir::module::{DataKind, DataReloc, Module};
+
 use super::encode;
-use super::isel::{Reloc, RelocKind};
+use super::isel::{self, ModelCaps, Reloc, RelocKind};
 
 /// Linker failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,112 +38,6 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// The section a data global lands in: read-only, writable, or zero-initialized.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DataKind {
-    Rodata,
-    Data,
-    Bss,
-}
-
-/// An internal relocation within a data object. At byte offset `off` within
-/// the object, the linker must write a pointer-sized absolute runtime address
-/// of `symbol` once the module is mapped.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DataReloc {
-    pub off: usize,
-    pub symbol: String,
-}
-
-/// A named data global placed in the linked output. For `.bss`, `bytes` is
-/// empty and `size` gives the zero-initialized length; otherwise
-/// `size == bytes.len` as `u64`.
-#[derive(Clone, Debug)]
-pub struct Data {
-    pub name: String,
-    pub bytes: Vec<u8>,
-    pub kind: DataKind,
-    pub size: u64,
-    pub relocs: Vec<DataReloc>,
-}
-
-/// A set of named functions and data globals to link together. The first added
-/// function is the entry point at offset 0 of the linked image.
-#[derive(Clone, Debug, Default)]
-pub struct Module {
-    pub functions: Vec<(String, Vec<u32>)>,
-    pub data: Vec<Data>,
-}
-
-impl Module {
-    pub fn new() -> Module {
-        Module::default()
-    }
-
-    pub fn add_function(&mut self, name: &str, code: Vec<u32>) {
-        self.functions.push((name.to_string(), code));
-    }
-
-    /// Add a named read-only data blob (a global constant) into `.rodata`.
-    pub fn add_data(&mut self, name: &str, bytes: Vec<u8>) {
-        let size = bytes.len() as u64;
-        self.data.push(Data {
-            name: name.to_string(),
-            bytes,
-            kind: DataKind::Rodata,
-            size,
-            relocs: Vec::new(),
-        });
-    }
-
-    /// Add a named read-only data blob carrying internal relocations.
-    pub fn add_data_relocs(&mut self, name: &str, bytes: Vec<u8>, relocs: Vec<DataReloc>) {
-        let size = bytes.len() as u64;
-        self.data.push(Data {
-            name: name.to_string(),
-            bytes,
-            kind: DataKind::Rodata,
-            size,
-            relocs,
-        });
-    }
-
-    /// Add a named writable data global into `.data`.
-    pub fn add_writable(&mut self, name: &str, bytes: Vec<u8>) {
-        let size = bytes.len() as u64;
-        self.data.push(Data {
-            name: name.to_string(),
-            bytes,
-            kind: DataKind::Data,
-            size,
-            relocs: Vec::new(),
-        });
-    }
-
-    /// Add a named writable data global carrying internal relocations.
-    pub fn add_writable_relocs(&mut self, name: &str, bytes: Vec<u8>, relocs: Vec<DataReloc>) {
-        let size = bytes.len() as u64;
-        self.data.push(Data {
-            name: name.to_string(),
-            bytes,
-            kind: DataKind::Data,
-            size,
-            relocs,
-        });
-    }
-
-    /// Add a named zero-initialized data global of `size` bytes into `.bss`.
-    pub fn add_bss(&mut self, name: &str, size: u64) {
-        self.data.push(Data {
-            name: name.to_string(),
-            bytes: Vec::new(),
-            kind: DataKind::Bss,
-            size,
-            relocs: Vec::new(),
-        });
-    }
-}
-
 /// A function's byte offset within the linked image.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Symbol {
@@ -157,6 +53,8 @@ pub struct DataSym {
     pub kind: DataKind,
     pub off: usize,
     pub size: usize,
+    /// The global's requested alignment (`0` = natural), as in [`volt_ir::module::Global::align`].
+    pub align: u32,
     pub bytes: Vec<u8>,
     pub relocs: Vec<DataReloc>,
 }
@@ -180,14 +78,6 @@ impl Linked {
             .find(|s| s.name == name)
             .map(|s| s.offset)
     }
-}
-
-/// A data object's natural alignment: the next power of two up to `size`,
-/// capped at 8. Covers scalars and pointers up to a 64-bit word.
-pub fn align_of_data(size: u64) -> usize {
-    let size = size.max(1);
-    let pow = size.next_power_of_two();
-    pow.min(8) as usize
 }
 
 fn align_forward(off: usize, align: usize) -> usize {
@@ -228,36 +118,42 @@ pub fn apply_global_reloc(code: &mut [u32], r: &Reloc, site_addr: usize, target_
     }
 }
 
-/// Concatenate the module's functions, resolve each intra-module `call`
-/// relocation to a PC-relative `bl`, lay out data globals into per-section
-/// `DataSym`s, and carry every `global_addr` relocation forward unresolved.
+/// Compile every function of `module` with `caps`, concatenate the code,
+/// resolve each intra-module `call` relocation to a PC-relative `bl`, lay out
+/// data globals into per-section `DataSym`s, and carry every `global_addr`
+/// relocation forward unresolved.
 ///
-/// `relocs` are supplied alongside the module: `relocs[i]` holds the isel
-/// relocations for `module.functions[i]`.
-pub fn compile_module(module: &Module, relocs: &[Vec<Reloc>]) -> Result<Linked, Error> {
-    let n = module.functions.len();
+/// The first function sits at offset 0 of the image. Symbols the module does
+/// not define are an error for calls ([`Error::UndefinedSymbol`]) but are left
+/// unresolved for `global_addr` relocations and data relocations.
+pub fn compile_module(module: &Module, caps: &ModelCaps) -> Result<Linked, Error> {
+    let compiled = module
+        .functions
+        .iter()
+        .map(|def| isel::compile_function(&def.function, caps).map_err(|_| Error::Unsupported))
+        .collect::<Result<Vec<_>, _>>()?;
+    let n = compiled.len();
     let mut word_off = Vec::with_capacity(n);
     let mut total = 0usize;
-    for (_, code) in module.functions.iter() {
+    for part in &compiled {
         word_off.push(total);
-        total += code.len();
+        total += part.code.len();
     }
     let mut code: Vec<u32> = Vec::with_capacity(total);
-    for (_, words) in module.functions.iter() {
-        code.extend_from_slice(words);
+    for part in &compiled {
+        code.extend_from_slice(&part.code);
     }
     let mut global_relocs: Vec<Reloc> = Vec::new();
-    for (i, rs) in relocs.iter().enumerate() {
-        for r in rs {
+    for (i, part) in compiled.iter().enumerate() {
+        for r in &part.relocs {
             let at = word_off[i] + r.offset;
             match r.kind {
                 RelocKind::Call => {
                     let target_word = module
                         .functions
                         .iter()
-                        .enumerate()
-                        .find(|(_, (name, _))| *name == r.symbol)
-                        .map(|(j, _)| word_off[j])
+                        .position(|def| def.name == r.symbol)
+                        .map(|j| word_off[j])
                         .ok_or(Error::UndefinedSymbol)?;
                     let byte_off = (target_word as i64 - at as i64) * 4;
                     if !(-(128 << 20)..=(128 << 20) - 4).contains(&byte_off) {
@@ -280,54 +176,32 @@ pub fn compile_module(module: &Module, relocs: &[Vec<Reloc>]) -> Result<Linked, 
         .functions
         .iter()
         .enumerate()
-        .map(|(i, (name, _))| Symbol {
-            name: name.clone(),
+        .map(|(i, def)| Symbol {
+            name: def.name.clone(),
             offset: word_off[i] * 4,
         })
         .collect();
-    let mut data_syms: Vec<DataSym> = Vec::with_capacity(module.data.len());
+    let mut data_syms: Vec<DataSym> = Vec::with_capacity(module.globals.len());
     let (mut rodata_off, mut data_off, mut bss_off) = (0usize, 0usize, 0usize);
-    for d in module.data.iter() {
-        let a = align_of_data(d.size);
-        let size = d.size as usize;
-        match d.kind {
-            DataKind::Rodata => {
-                rodata_off = align_forward(rodata_off, a);
-                data_syms.push(DataSym {
-                    name: d.name.clone(),
-                    kind: d.kind,
-                    off: rodata_off,
-                    size,
-                    bytes: d.bytes.clone(),
-                    relocs: d.relocs.clone(),
-                });
-                rodata_off += size;
-            }
-            DataKind::Data => {
-                data_off = align_forward(data_off, a);
-                data_syms.push(DataSym {
-                    name: d.name.clone(),
-                    kind: d.kind,
-                    off: data_off,
-                    size,
-                    bytes: d.bytes.clone(),
-                    relocs: d.relocs.clone(),
-                });
-                data_off += size;
-            }
-            DataKind::Bss => {
-                bss_off = align_forward(bss_off, a);
-                data_syms.push(DataSym {
-                    name: d.name.clone(),
-                    kind: d.kind,
-                    off: bss_off,
-                    size,
-                    bytes: Vec::new(),
-                    relocs: Vec::new(),
-                });
-                bss_off += size;
-            }
-        }
+    for g in module.globals.iter() {
+        let a = g.effective_align();
+        let size = g.size as usize;
+        let (cursor, bytes, relocs) = match g.kind {
+            DataKind::Rodata => (&mut rodata_off, g.bytes.clone(), g.relocs.clone()),
+            DataKind::Data => (&mut data_off, g.bytes.clone(), g.relocs.clone()),
+            DataKind::Bss => (&mut bss_off, Vec::new(), Vec::new()),
+        };
+        *cursor = align_forward(*cursor, a);
+        data_syms.push(DataSym {
+            name: g.name.clone(),
+            kind: g.kind,
+            off: *cursor,
+            size,
+            align: g.align,
+            bytes,
+            relocs,
+        });
+        *cursor += size;
     }
     Ok(Linked {
         code,
@@ -339,16 +213,121 @@ pub fn compile_module(module: &Module, relocs: &[Vec<Reloc>]) -> Result<Linked, 
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString as _;
     use alloc::vec;
+    use volt_ir::function::{Call, Function, GlobalAddr, Opcode, Ret, RetPiece, Terminator};
 
     use super::*;
 
+    fn function_returning(value: i64) -> Function {
+        let mut f = Function::new();
+        let ty = f.types.parse_type("i64").unwrap();
+        let block = f.append_block();
+        let v = f.append_inst(block, ty, Opcode::Iconst(value));
+        f.set_terminator(block, Terminator::Ret(Ret::one(v)));
+        f
+    }
+
+    fn function_calling(callee: &str) -> Function {
+        let mut f = Function::new();
+        let ty = f.types.parse_type("i64").unwrap();
+        let block = f.append_block();
+        let symbol = f.intern_symbol(callee);
+        let args = f.intern_values(&[]);
+        let result = f.append_inst(
+            block,
+            ty,
+            Opcode::Call(Call {
+                symbol,
+                args,
+                is_variadic: false,
+                num_fixed: 0,
+                ret_dest: None,
+                ret_regs: 0,
+                ret_pieces: [RetPiece::default(); 4],
+                sret: false,
+            }),
+        );
+        f.set_terminator(block, Terminator::Ret(Ret::one(result)));
+        f
+    }
+
+    fn function_taking_address_of(symbol: &str) -> Function {
+        let mut f = Function::new();
+        let ty = f.types.parse_type("ptr").unwrap();
+        let block = f.append_block();
+        let symbol = f.intern_symbol(symbol);
+        let v = f.append_inst(
+            block,
+            ty,
+            Opcode::GlobalAddr(GlobalAddr {
+                symbol,
+                via_got: false,
+            }),
+        );
+        f.set_terminator(block, Terminator::Ret(Ret::one(v)));
+        f
+    }
+
     #[test]
-    fn data_alignment_covers_scalars() {
-        assert_eq!(align_of_data(1), 1);
-        assert_eq!(align_of_data(3), 4);
-        assert_eq!(align_of_data(8), 8);
-        assert_eq!(align_of_data(100), 8);
+    fn globals_are_laid_out_per_section_with_alignment() {
+        let mut m = Module::new();
+        m.add_data("ro1", vec![1, 2, 3]);
+        m.add_data("ro2", vec![0; 8]);
+        m.add_writable("w1", vec![9]);
+        m.add_writable("w2", vec![0; 4]);
+        m.add_bss("b1", 3);
+        m.add_bss("b2", 64);
+        m.globals[5].align = 64;
+        let linked = compile_module(&m, &ModelCaps::default()).unwrap();
+        let place = |name: &str| {
+            let d = linked.data.iter().find(|d| d.name == name).unwrap();
+            (d.kind, d.off, d.size)
+        };
+        assert_eq!(place("ro1"), (DataKind::Rodata, 0, 3));
+        // `ro2` is 8 bytes: aligned to 8 after the 3-byte `ro1`.
+        assert_eq!(place("ro2"), (DataKind::Rodata, 8, 8));
+        assert_eq!(place("w1"), (DataKind::Data, 0, 1));
+        assert_eq!(place("w2"), (DataKind::Data, 4, 4));
+        assert_eq!(place("b1"), (DataKind::Bss, 0, 3));
+        // An explicit alignment overrides the natural (<= 8) one.
+        assert_eq!(place("b2"), (DataKind::Bss, 64, 64));
+        assert!(
+            linked
+                .data
+                .iter()
+                .find(|d| d.name == "b2")
+                .unwrap()
+                .bytes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn global_addr_relocations_carry_forward_unresolved() {
+        let mut m = Module::new();
+        m.add_function("first", function_returning(0));
+        m.add_function("addr", function_taking_address_of("table"));
+        m.add_writable_relocs(
+            "table",
+            vec![0; 8],
+            vec![DataReloc {
+                offset: 0,
+                symbol: "first".to_string(),
+            }],
+        );
+        let linked = compile_module(&m, &ModelCaps::default()).unwrap();
+        let start_word = linked.address_of("addr").unwrap() / 4;
+        let kinds: Vec<_> = linked
+            .relocs
+            .iter()
+            .map(|r| (r.kind, r.symbol.as_str()))
+            .collect();
+        assert!(kinds.contains(&(RelocKind::AdrpPg, "table")));
+        assert!(kinds.contains(&(RelocKind::AddPgOff, "table")));
+        // Carried-forward offsets are word indices into the whole image.
+        assert!(linked.relocs.iter().all(|r| r.offset >= start_word));
+        assert_eq!(linked.data[0].relocs[0].symbol, "first");
     }
 
     #[test]
@@ -369,15 +348,30 @@ mod tests {
     #[test]
     fn compile_module_resolves_call() {
         let mut m = Module::new();
-        m.add_function("callee", vec![0xD65F_03C0]);
-        m.add_function("caller", vec![encode::bl(0)]);
-        let relocs = vec![Vec::new(), vec![Reloc::call(0, "callee")]];
-        let linked = compile_module(&m, &relocs).unwrap();
+        m.add_function("callee", function_returning(42));
+        m.add_function("caller", function_calling("callee"));
+        let linked = compile_module(&m, &ModelCaps::default()).unwrap();
+        let caller = linked.address_of("caller").unwrap();
         assert_eq!(linked.address_of("callee"), Some(0));
-        assert_eq!(linked.address_of("caller"), Some(4));
-        // caller word 1 branches back one word: byte offset -4.
-        assert_eq!(linked.code[1], encode::bl(-4));
+        assert!(caller > 0 && caller % 4 == 0);
         assert!(linked.relocs.is_empty());
+        // The caller contains exactly one `bl`, which branches back to word 0.
+        let bls: Vec<usize> = (caller / 4..linked.code.len())
+            .filter(|&i| linked.code[i] >> 26 == 0b100101)
+            .collect();
+        assert_eq!(bls.len(), 1);
+        let at = bls[0];
+        assert_eq!(linked.code[at], encode::bl(-((at * 4) as i32)));
+    }
+
+    #[test]
+    fn undefined_call_target_is_an_error() {
+        let mut m = Module::new();
+        m.add_function("caller", function_calling("nowhere"));
+        assert_eq!(
+            compile_module(&m, &ModelCaps::default()).unwrap_err(),
+            Error::UndefinedSymbol
+        );
     }
 
     #[test]

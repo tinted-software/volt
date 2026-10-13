@@ -401,11 +401,15 @@ impl D<'_> {
                 if op == 0xa8 { "al" } else { self.rv(0) },
                 self.imm(if op == 0xa8 { 1 } else { 4 })?
             ),
-            _ if (op <= 0x3b && op & 7 <= 3) || matches!(op, 0x84 | 0x85 | 0x88 | 0x89 | 0x8a) => {
+            _ if (op <= 0x3b && op & 7 <= 3)
+                || matches!(op, 0x84 | 0x85 | 0x86 | 0x87 | 0x88 | 0x89 | 0x8a) =>
+            {
                 let o = self.modrm()?;
                 let byte = op & 1 == 0;
                 let name = if op >= 0x88 {
                     "mov"
+                } else if op >= 0x86 {
+                    "xchg"
                 } else if op >= 0x84 {
                     "test"
                 } else {
@@ -425,7 +429,7 @@ impl D<'_> {
                         self.rv(o.rm)
                     },
                 );
-                if op & 2 != 0 {
+                if op & 2 != 0 && !matches!(op, 0x86 | 0x87) {
                     format!("{name} {reg}, {rm}")
                 } else {
                     format!("{name} {rm}, {reg}")
@@ -812,6 +816,27 @@ mod tests {
         assert_eq!(
             format(&[0x48, 0xb8, 1]),
             "0000: .byte 0x48\n0001: .byte 0xb8\n0002: .byte 0x01\n"
+        );
+    }
+    #[test]
+    fn xchg_roundtrip_in_every_width() {
+        // Byte sequences checked against llvm-mc.
+        let mut e = Encoder::default();
+        e.xchg(R11, 8, R10, 64);
+        assert_eq!(e.code, [0x4d, 0x87, 0x93, 8, 0, 0, 0]);
+        e.xchg(R11, 8, R10, 32);
+        e.xchg(R11, 8, R10, 16);
+        e.xchg(R11, 8, R10, 8);
+        e.xchg(RCX, 0, RAX, 8);
+        e.xchg(RCX, 0, RSI, 8);
+        assert_eq!(
+            format(&e.code),
+            "0000: xchg qword ptr [r11 + 8], r10\n\
+             0007: xchg dword ptr [r11 + 8], r10d\n\
+             000e: xchg word ptr [r11 + 8], r10w\n\
+             0016: xchg byte ptr [r11 + 8], r10b\n\
+             001d: xchg byte ptr [rcx], al\n\
+             0024: xchg byte ptr [rcx], sil\n"
         );
     }
     #[test]

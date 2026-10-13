@@ -15,6 +15,9 @@ use crate::memory::GuestMemory;
 const MH_MAGIC_64: u32 = 0xfeed_facf;
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const MH_EXECUTE: u32 = 2;
+/// A kernel collection: one top-level header whose load commands list every segment of
+/// every component, with `LC_FILESET_ENTRY` naming each component's own Mach-O header.
+const MH_FILESET: u32 = 12;
 const LC_UNIXTHREAD: u32 = 0x5;
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_MAIN: u32 = 0x8000_0028;
@@ -51,6 +54,16 @@ pub struct Segment {
     pub vmsize: u64,
     pub fileoff: u64,
     pub filesize: u64,
+    /// `segname`, NUL-padded.
+    pub name: [u8; 16],
+}
+
+impl Segment {
+    /// The segment name without its NUL padding (`__TEXT`).
+    pub fn name(&self) -> &[u8] {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(16);
+        &self.name[..end]
+    }
 }
 
 /// What the loader needs from a Mach-O kernel.
@@ -65,6 +78,12 @@ pub struct Kernel {
 
 pub fn is_macho(image: &[u8]) -> bool {
     image.len() >= 4 && u32::from_le_bytes(image[..4].try_into().unwrap()) == MH_MAGIC_64
+}
+
+/// Whether `image` is a kernel collection (`MH_FILESET`), which enters at its reset
+/// trampoline rather than at `_start`.
+pub fn is_fileset(image: &[u8]) -> bool {
+    image.len() >= 16 && u32::from_le_bytes(image[12..16].try_into().unwrap()) == MH_FILESET
 }
 
 fn bad(reason: &'static str) -> Error {
@@ -85,8 +104,8 @@ pub fn parse(image: &[u8]) -> Result<Kernel, Error> {
     if word(4) != CPU_TYPE_ARM64 {
         return Err(bad("not an arm64 Mach-O"));
     }
-    if word(12) != MH_EXECUTE {
-        return Err(bad("not an executable Mach-O"));
+    if word(12) != MH_EXECUTE && word(12) != MH_FILESET {
+        return Err(bad("not an executable or fileset Mach-O"));
     }
     let commands_end = HEADER_SIZE
         .checked_add(word(20) as usize)
@@ -114,6 +133,7 @@ pub fn parse(image: &[u8]) -> Result<Kernel, Error> {
                     vmsize: double(at + 32),
                     fileoff: double(at + 40),
                     filesize: double(at + 48),
+                    name: image[at + 8..at + 24].try_into().unwrap(),
                 };
                 let in_file = segment
                     .fileoff
@@ -206,6 +226,20 @@ pub fn prepare_boot(
     ram_base: u64,
     ram_size: u64,
 ) -> Result<Layout, Error> {
+    let tree = super::afdt::build(ram_base, ram_size, cmdline);
+    prepare_boot_with_tree(memory, image, cmdline, &tree, ram_base, ram_size)
+}
+
+/// [`prepare_boot`] with the device tree the caller supplies, such as the platform's
+/// own ADT for the board.
+pub fn prepare_boot_with_tree(
+    memory: &mut impl GuestMemory,
+    image: &[u8],
+    cmdline: &str,
+    tree: &[u8],
+    ram_base: u64,
+    ram_size: u64,
+) -> Result<Layout, Error> {
     let kernel = parse(image)?;
     let ram_end = ram_base.checked_add(ram_size).ok_or(Error::NoRoom)?;
     // The device tree reserves the last of RAM for the panic log (`chosen/pram`),
@@ -235,7 +269,6 @@ pub fn prepare_boot(
     }
 
     let device_tree = align(kernel_end, PAGE)?;
-    let tree = super::afdt::build(ram_base, ram_size, cmdline);
     let args_at = align(
         device_tree
             .checked_add(tree.len() as u64)
@@ -272,7 +305,7 @@ pub fn prepare_boot(
             .write(physical(segment.vmaddr)?, data)
             .map_err(Error::Memory)?;
     }
-    memory.write(device_tree, &tree).map_err(Error::Memory)?;
+    memory.write(device_tree, tree).map_err(Error::Memory)?;
     memory.write(args_at, &args).map_err(Error::Memory)?;
     Ok(Layout {
         entry,
@@ -442,5 +475,16 @@ mod tests {
             prepare_boot(&mut memory, &good, &long, RAM, 64 << 20),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn a_fileset_kernel_parses_like_an_executable_with_the_same_segments() {
+        let executable = image(Entry::Main(0x800));
+        let mut fileset = executable.clone();
+        fileset[12..16].copy_from_slice(&MH_FILESET.to_le_bytes());
+        assert_eq!(parse(&fileset).unwrap(), parse(&executable).unwrap());
+        let mut other = executable;
+        other[12..16].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(parse(&other), Err(Error::BadMachO(_))));
     }
 }

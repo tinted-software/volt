@@ -274,8 +274,8 @@ fn reloc_flags(reloc_type: RelocType) -> object::RelocationFlags {
 /// are emitted as undefined extern symbols.
 pub fn write_module_object(linked: &super::link::Linked) -> Vec<u8> {
     use super::isel::RelocKind;
-    use super::link::DataKind;
     use alloc::collections::BTreeMap;
+    use volt_ir::module::DataKind;
 
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut id_of_name: BTreeMap<&str, u32> = BTreeMap::new();
@@ -298,15 +298,17 @@ pub fn write_module_object(linked: &super::link::Linked) -> Vec<u8> {
     for d in linked.data.iter() {
         let section = match d.kind {
             DataKind::Rodata => {
+                rodata_bytes.resize(d.off, 0);
                 rodata_bytes.extend_from_slice(&d.bytes);
                 SectionKind::Rodata
             }
             DataKind::Data => {
+                data_bytes.resize(d.off, 0);
                 data_bytes.extend_from_slice(&d.bytes);
                 SectionKind::Data
             }
             DataKind::Bss => {
-                bss_size += d.size as u64;
+                bss_size = (d.off + d.size) as u64;
                 SectionKind::Bss
             }
         };
@@ -370,7 +372,7 @@ pub fn write_module_object(linked: &super::link::Linked) -> Vec<u8> {
         for r in d.relocs.iter() {
             data_relocs.push(DataRelocEntry {
                 section,
-                offset: (d.off + r.off) as u64,
+                offset: (d.off + r.offset) as u64,
                 symbol: id_of_name[r.symbol.as_str()],
                 addend: 0,
             });
@@ -391,9 +393,12 @@ pub fn write_module_object(linked: &super::link::Linked) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aarch64::link::{DataReloc, Linked};
+    use crate::aarch64::isel::ModelCaps;
+    use crate::aarch64::link::{Linked, compile_module};
     use alloc::vec;
-    use object::read::{Object as _, ObjectSymbol as _};
+    use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
+    use volt_ir::function::{Function, Opcode, Ret, Terminator};
+    use volt_ir::module::{DataReloc, Module};
 
     #[test]
     fn elf_round_trip_aarch64() {
@@ -474,9 +479,47 @@ mod tests {
         assert_eq!(obj.architecture(), object::Architecture::Aarch64);
         assert!(obj.sections().count() >= 2);
         assert!(obj.symbols().count() >= 2, "defined + extern symbols");
-        let _ = DataReloc {
-            off: 0,
-            symbol: String::new(),
-        };
+    }
+
+    #[test]
+    fn elf_from_an_ir_module_with_globals() {
+        let mut f = Function::new();
+        let ty = f.types.parse_type("i64").unwrap();
+        let block = f.append_block();
+        let v = f.append_inst(block, ty, Opcode::Iconst(5));
+        f.set_terminator(block, Terminator::Ret(Ret::one(v)));
+        let mut m = Module::new();
+        m.add_function("five", f);
+        m.add_data("ro", vec![1, 2, 3, 4]);
+        m.add_data("ro8", vec![0; 8]);
+        m.add_writable_relocs(
+            "table",
+            vec![0; 16],
+            vec![DataReloc {
+                offset: 8,
+                symbol: "five".to_string(),
+            }],
+        );
+        m.add_bss("scratch", 32);
+        let linked = compile_module(&m, &ModelCaps::default()).unwrap();
+        let bytes = write_module_object(&linked);
+        let obj = object::read::File::parse(&bytes[..]).expect("module ELF parses");
+        assert_eq!(obj.architecture(), object::Architecture::Aarch64);
+        let defined: Vec<String> = obj
+            .symbols()
+            .filter(|s| s.is_definition())
+            .filter_map(|s| s.name().ok().map(|n| n.to_string()))
+            .collect();
+        for want in ["five", "ro", "table", "scratch"] {
+            assert!(defined.iter().any(|n| n == want), "symbol {want} defined");
+        }
+        let data = obj.section_by_name(".data").expect(".data section");
+        assert_eq!(data.data().unwrap().len(), 16);
+        // `ro8` is placed at offset 8, so `ro` is padded to it.
+        let rodata = obj.section_by_name(".data.rel.ro").expect("rodata section");
+        assert_eq!(rodata.data().unwrap().len(), 16);
+        let relocs: Vec<_> = data.relocations().collect();
+        assert_eq!(relocs.len(), 1);
+        assert_eq!(relocs[0].0, 8, "ABS64 slot offset within .data");
     }
 }

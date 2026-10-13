@@ -1,0 +1,18 @@
+[package]
+name = "volt-lift-aarch64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+volt-ir.workspace = true
+volt-isa-aarch64.workspace = true
+
+[dev-dependencies]
+volt-target = { path = "../../target", default-features = false, features = ["aarch64"] }
+
+[lints]
+workspace = true

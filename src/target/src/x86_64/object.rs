@@ -4,7 +4,6 @@
 use super::{
     Error,
     isel::{self, RelocKind},
-    link::{DataKind, Module},
 };
 use alloc::{format, vec::Vec};
 use object::write::{Object, Relocation, Symbol, SymbolSection};
@@ -12,6 +11,7 @@ use object::{
     Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags, SymbolKind,
     SymbolScope,
 };
+use volt_ir::module::{DataKind, Module};
 pub const R_X86_64_64: u32 = 1;
 pub const R_X86_64_PC32: u32 = 2;
 pub const R_X86_64_PLT32: u32 = 4;
@@ -20,7 +20,8 @@ pub fn write_module(module: &Module) -> Result<Vec<u8>, Error> {
     let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
     let mut symbols = Vec::new();
     let mut pending = Vec::new();
-    for (name, f) in &module.functions {
+    for def in &module.functions {
+        let (name, f) = (&def.name, &def.function);
         let compiled = isel::compile_object(f)?;
         let section = obj.add_section(
             Vec::new(),
@@ -58,7 +59,7 @@ pub fn write_module(module: &Module) -> Result<Vec<u8>, Error> {
             ));
         }
     }
-    for data in &module.data {
+    for data in &module.globals {
         let (class, kind) = match data.kind {
             DataKind::Rodata => ("rodata", SectionKind::ReadOnlyData),
             DataKind::Data => ("data", SectionKind::Data),
@@ -69,10 +70,11 @@ pub fn write_module(module: &Module) -> Result<Vec<u8>, Error> {
             format!(".{class}.{}", data.name.trim_start_matches('.')).into_bytes(),
             kind,
         );
+        let align = data.effective_align().max(8) as u64;
         if data.kind == DataKind::Bss {
-            obj.append_section_bss(sec, data.size, 8);
+            obj.append_section_bss(sec, data.size, align);
         } else {
-            obj.append_section_data(sec, &data.bytes, 8);
+            obj.append_section_data(sec, &data.bytes, align);
         }
         let id = obj.add_symbol(Symbol {
             name: data.name.as_bytes().to_vec(),
@@ -90,13 +92,13 @@ pub fn write_module(module: &Module) -> Result<Vec<u8>, Error> {
         });
         symbols.push((data.name.clone(), id));
         for r in &data.relocs {
-            if r.off
+            if r.offset
                 .checked_add(8)
                 .is_none_or(|end| end > data.size as usize)
             {
                 return Err(Error::InvalidFunction);
             }
-            pending.push((sec, r.off as u64, r.symbol.clone(), R_X86_64_64, 0));
+            pending.push((sec, r.offset as u64, r.symbol.clone(), R_X86_64_64, 0));
         }
     }
     for (section, offset, name, r_type, addend) in pending {
@@ -139,7 +141,7 @@ mod tests {
     #[test]
     fn elf_function_section_and_symbol() {
         let mut f = Function::new();
-        let t = f.types.parse_type("u64").unwrap();
+        let t = f.types.parse_type("i64").unwrap();
         let b = f.append_block();
         let v = f.append_inst(b, t, Opcode::Iconst(42));
         f.set_terminator(b, Terminator::Ret(Ret::one(v)));
@@ -209,5 +211,55 @@ mod tests {
             elf.symbols()
                 .any(|s| s.name().unwrap() == "external_function" && s.is_undefined())
         );
+    }
+    #[test]
+    fn elf_emits_globals_with_data_relocations() {
+        use volt_ir::module::DataReloc;
+        let mut f = Function::new();
+        let t = f.types.parse_type("i64").unwrap();
+        let b = f.append_block();
+        let v = f.append_inst(b, t, Opcode::Iconst(7));
+        f.set_terminator(b, Terminator::Ret(Ret::one(v)));
+        let mut module = Module::new();
+        module.add_function("seven", f);
+        module.add_data("ro", alloc::vec![1, 2, 3, 4]);
+        module.add_writable_relocs(
+            "table",
+            alloc::vec![0; 16],
+            alloc::vec![DataReloc {
+                offset: 8,
+                symbol: "seven".into(),
+            }],
+        );
+        module.add_bss("scratch", 64);
+        let bytes = write_module(&module).unwrap();
+        let elf = object::File::parse(bytes.as_slice()).unwrap();
+        assert_eq!(
+            elf.section_by_name(".rodata.ro").unwrap().data().unwrap(),
+            &[1, 2, 3, 4]
+        );
+        assert_eq!(elf.section_by_name(".bss.scratch").unwrap().size(), 64);
+        let table = elf.section_by_name(".data.table").unwrap();
+        assert_eq!(table.size(), 16);
+        let relocations: Vec<_> = table.relocations().collect();
+        assert_eq!(relocations.len(), 1);
+        assert_eq!(relocations[0].0, 8);
+        assert_eq!(
+            relocations[0].1.flags(),
+            RelocationFlags::Elf {
+                r_type: object::elf::RelocationType(R_X86_64_64)
+            }
+        );
+        // A relocation slot that does not fit is rejected.
+        let mut bad = Module::new();
+        bad.add_data_relocs(
+            "short",
+            alloc::vec![0; 4],
+            alloc::vec![DataReloc {
+                offset: 0,
+                symbol: "seven".into(),
+            }],
+        );
+        assert!(matches!(write_module(&bad), Err(Error::InvalidFunction)));
     }
 }

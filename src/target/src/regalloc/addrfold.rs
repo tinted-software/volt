@@ -211,10 +211,7 @@ mod tests {
     use volt_ir::types::{IntDesc, TypeKind};
 
     fn i32_ty(func: &mut Function) -> volt_ir::types::Type {
-        func.types.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }))
+        func.types.intern(TypeKind::Int(IntDesc { bits: 32 }))
     }
 
     fn fold_in_range<F: Func>(func: &F, mem_inst: Inst) -> Option<i64> {
@@ -251,7 +248,7 @@ mod tests {
             i32t,
             Opcode::Load(volt_ir::function::Load {
                 ptr: p,
-                volatile: false,
+                mem: volt_ir::function::MemFlags::new(),
             }),
         );
         func.set_terminator(b, Terminator::Ret(Ret::one(load)));
@@ -280,7 +277,7 @@ mod tests {
             i32t,
             Opcode::Load(volt_ir::function::Load {
                 ptr: base,
-                volatile: false,
+                mem: volt_ir::function::MemFlags::new(),
             }),
         );
         func.set_terminator(b, Terminator::Ret(Ret::one(load)));
@@ -312,7 +309,7 @@ mod tests {
             i32t,
             Opcode::Load(volt_ir::function::Load {
                 ptr: p,
-                volatile: false,
+                mem: volt_ir::function::MemFlags::new(),
             }),
         );
         func.set_terminator(b, Terminator::Ret(Ret::one(load)));
@@ -344,7 +341,7 @@ mod tests {
             i32t,
             Opcode::Load(volt_ir::function::Load {
                 ptr: p,
-                volatile: false,
+                mem: volt_ir::function::MemFlags::new(),
             }),
         );
         let _ = load;

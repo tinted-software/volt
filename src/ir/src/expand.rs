@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 
 use super::function::AttrTarget;
 use super::function::{
-    BinOp, Block, CmpOp, Function, Inst, LowFloatConvert, MatMul, MatMulType, NvFp4Convert, Opcode,
-    Value,
+    BinOp, Block, CmpOp, ConvertKind, Function, Inst, LowFloatConvert, MatMul, MatMulType,
+    MemFlags, NvFp4Convert, Opcode, Value,
 };
 use super::low_float::Format as LowFloatFormat;
 use super::nvfp4::ScaleApplication;
@@ -138,19 +138,22 @@ pub fn expand_vector_lanes_except(
 // --- NumericBuilder ----------------------------------------------------------
 
 struct NumericBuilder {
-    u8_t: Type,
-    u32_t: Type,
+    i8_t: Type,
+    i32_t: Type,
     f32_t: Type,
     bool_t: Type,
     out: Vec<Inst>,
 }
 
 /// The bounded operations a scalar expansion may emit.
+///
+/// Every integer here is a plain 32-bit bit pattern read as UNSIGNED: widening zero-extends,
+/// right shifts are logical and magnitude compares are `Ult`/`Ugt`/....
 impl NumericBuilder {
     fn common(_func: &mut Function, ct: &CommonTypes) -> Self {
         Self {
-            u8_t: ct.u8_t,
-            u32_t: ct.u32_t,
+            i8_t: ct.i8_t,
+            i32_t: ct.i32_t,
             f32_t: ct.f32_t,
             bool_t: ct.bool_t,
             out: Vec::new(),
@@ -164,13 +167,13 @@ impl NumericBuilder {
     }
 
     fn constant(&mut self, func: &mut Function, value: u32) -> Value {
-        self.emit(func, self.u32_t, Opcode::Iconst(value as i64))
+        self.emit(func, self.i32_t, Opcode::Iconst(value as i64))
     }
 
     fn binary(&mut self, func: &mut Function, op: BinOp, lhs: Value, rhs: Value) -> Value {
         self.emit(
             func,
-            self.u32_t,
+            self.i32_t,
             Opcode::Arith(super::function::Arith { op, lhs, rhs }),
         )
     }
@@ -197,7 +200,7 @@ impl NumericBuilder {
     fn select(&mut self, func: &mut Function, cond: Value, then_v: Value, else_v: Value) -> Value {
         self.emit(
             func,
-            self.u32_t,
+            self.i32_t,
             Opcode::Select(super::function::Select {
                 cond,
                 then: then_v,
@@ -206,12 +209,29 @@ impl NumericBuilder {
         )
     }
 
-    fn convert(&mut self, func: &mut Function, ty: Type, value: Value) -> Value {
+    fn convert(&mut self, func: &mut Function, ty: Type, kind: ConvertKind, value: Value) -> Value {
         self.emit(
             func,
             ty,
-            Opcode::Convert(super::function::Convert { value }),
+            Opcode::Convert(super::function::Convert { value, kind }),
         )
+    }
+
+    /// `value` as the i32 holding its bits zero-extended: a narrower int (or bool) is widened
+    /// with `Zext`, a wider one narrowed with `Trunc`, and an i32 is used as it is.
+    fn as_i32(&mut self, func: &mut Function, value: Value) -> Value {
+        let bits = match func.types.type_kind(func.value_type(value)) {
+            TypeKind::Int(d) => u32::from(d.bits),
+            TypeKind::Bool => 1,
+            _ => return value,
+        };
+        match bits.cmp(&32) {
+            core::cmp::Ordering::Less => self.convert(func, self.i32_t, ConvertKind::Zext, value),
+            core::cmp::Ordering::Equal => value,
+            core::cmp::Ordering::Greater => {
+                self.convert(func, self.i32_t, ConvertKind::Trunc, value)
+            }
+        }
     }
 
     fn reinterpret(&mut self, func: &mut Function, ty: Type, value: Value) -> Value {
@@ -249,7 +269,7 @@ impl NumericBuilder {
         let discarded = self.binary(func, BinOp::BitAnd, value, mask);
         let shift_minus_one = self.binary(func, BinOp::Sub, shift, one);
         let halfway = self.binary(func, BinOp::Shl, one, shift_minus_one);
-        let greater = self.compare(func, CmpOp::Gt, discarded, halfway);
+        let greater = self.compare(func, CmpOp::Ugt, discarded, halfway);
         let equal = self.compare(func, CmpOp::Eq, discarded, halfway);
         let odd_bits = self.binary(func, BinOp::BitAnd, retained, one);
         let zero = self.constant(func, 0);
@@ -265,30 +285,30 @@ impl NumericBuilder {
 
 /// Types used by the scalar builder passes, interned once per pass run.
 struct CommonTypes {
-    u8_t: Type,
-    u16_t: Type,
-    u32_t: Type,
+    i8_t: Type,
+    i16_t: Type,
+    i32_t: Type,
     f32_t: Type,
     bool_t: Type,
 }
 
 fn intern_common(func: &mut Function) -> CommonTypes {
-    let u8_t = func.types.intern(int_ty_kind(8, false));
-    let u16_t = func.types.intern(int_ty_kind(16, false));
-    let u32_t = func.types.intern(int_ty_kind(32, false));
+    let i8_t = func.types.intern(int_ty_kind(8));
+    let i16_t = func.types.intern(int_ty_kind(16));
+    let i32_t = func.types.intern(int_ty_kind(32));
     let f32_t = func.types.intern(TypeKind::Float(FloatKind::F32));
     let bool_t = func.types.intern(TypeKind::Bool);
     CommonTypes {
-        u8_t,
-        u16_t,
-        u32_t,
+        i8_t,
+        i16_t,
+        i32_t,
         f32_t,
         bool_t,
     }
 }
 
-fn int_ty_kind(bits: u16, signed: bool) -> TypeKind {
-    TypeKind::Int(IntDesc { signed, bits })
+fn int_ty_kind(bits: u16) -> TypeKind {
+    TypeKind::Int(IntDesc { bits })
 }
 /// Replace all low-float storage conversions with target-independent integer
 /// operations. Returns whether anything changed.
@@ -352,7 +372,7 @@ pub fn expand_low_float(func: &mut Function) -> bool {
                         continue;
                     };
                     let expanded =
-                        encode_low_float(func, &mut builder, &conversion, inst, ct.u16_t, ct.u8_t);
+                        encode_low_float(func, &mut builder, &conversion, inst, ct.i16_t, ct.i8_t);
                     func.replace_all_uses(old_result, expanded);
                     func.retarget_attrs(AttrTarget::Value(old_result), AttrTarget::Value(expanded));
                     out.append(&mut builder.out);
@@ -366,7 +386,7 @@ pub fn expand_low_float(func: &mut Function) -> bool {
 }
 
 fn decode_low_float(func: &mut Function, b: &mut NumericBuilder, conv: &LowFloatConvert) -> Value {
-    let payload = b.convert(func, b.u32_t, conv.value);
+    let payload = b.as_i32(func, conv.value);
     let bits = match conv.format {
         LowFloatFormat::Bf16 => b.shifted(func, BinOp::Shl, payload, 16),
         LowFloatFormat::F8E4M3 => decode_e4m3(func, b, payload),
@@ -466,10 +486,10 @@ fn encode_low_float(
     b: &mut NumericBuilder,
     conv: &LowFloatConvert,
     old_inst: Inst,
-    u16_t: Type,
-    u8_t: Type,
+    i16_t: Type,
+    i8_t: Type,
 ) -> Value {
-    let bits = b.reinterpret(func, b.u32_t, conv.value);
+    let bits = b.reinterpret(func, b.i32_t, conv.value);
     let defining = func.defining_inst(bits).unwrap();
     func.retarget_attrs(AttrTarget::Inst(old_inst), AttrTarget::Inst(defining));
     let payload = match conv.format {
@@ -478,11 +498,11 @@ fn encode_low_float(
         LowFloatFormat::F8E5M2 => encode_fp8(func, b, bits, false),
     };
     let narrow_ty = if conv.format == LowFloatFormat::Bf16 {
-        u16_t
+        i16_t
     } else {
-        u8_t
+        i8_t
     };
-    b.convert(func, narrow_ty, payload)
+    b.convert(func, narrow_ty, ConvertKind::Trunc, payload)
 }
 
 fn encode_bf16(func: &mut Function, b: &mut NumericBuilder, bits: Value) -> Value {
@@ -516,11 +536,11 @@ fn encode_fp8(func: &mut Function, b: &mut NumericBuilder, bits: Value, e4m3: bo
     let bias_v = b.constant(func, shift_bias);
     let original_shift = b.binary(func, BinOp::Sub, bias_v, source_exponent);
     let hoist17 = b.constant(func, 24);
-    let shift_too_large = b.compare(func, CmpOp::Gt, original_shift, hoist17);
+    let shift_too_large = b.compare(func, CmpOp::Ugt, original_shift, hoist17);
     let hoist18 = b.constant(func, 24);
     let bounded_shift = b.select(func, shift_too_large, hoist18, original_shift);
     let hoist1 = b.constant(func, threshold);
-    let subnormal_path = b.compare(func, CmpOp::Lt, source_exponent, hoist1);
+    let subnormal_path = b.compare(func, CmpOp::Ult, source_exponent, hoist1);
     let hoist19 = b.constant(func, 24);
     let safe_shift = b.select(func, subnormal_path, bounded_shift, hoist19);
     let subnormal_rounded = b.round_right(func, significand, safe_shift);
@@ -549,7 +569,7 @@ fn encode_fp8(func: &mut Function, b: &mut NumericBuilder, bits: Value, e4m3: bo
     let finite_magnitude = b.select(func, subnormal_path, subnormal, normal);
     let max_finite: u32 = if e4m3 { 0x7e } else { 0x7b };
     let hoist4 = b.constant(func, max_finite);
-    let too_large = b.compare(func, CmpOp::Gt, finite_magnitude, hoist4);
+    let too_large = b.compare(func, CmpOp::Ugt, finite_magnitude, hoist4);
     let hoist22 = b.constant(func, max_finite);
     let saturated = b.select(func, too_large, hoist22, finite_magnitude);
     let finite = b.binary(func, BinOp::BitOr, sign, saturated);
@@ -686,7 +706,7 @@ fn dequantize_nvfp4(
     b: &mut NumericBuilder,
     conv: &NvFp4Convert,
 ) -> NvFp4Expansion {
-    let carrier = b.convert(func, b.u32_t, conv.value);
+    let carrier = b.as_i32(func, conv.value);
     let nibble = b.masked(func, carrier, 0x0f);
     let sign_part = b.masked(func, nibble, 0x08);
     let sign = b.shifted(func, BinOp::Shl, sign_part, 28);
@@ -711,7 +731,7 @@ fn dequantize_nvfp4(
     let value_bits = b.binary(func, BinOp::BitOr, sign, magnitude);
     let value = b.reinterpret(func, b.f32_t, value_bits);
 
-    let block_payload = b.convert(func, b.u32_t, conv.block_scale);
+    let block_payload = b.as_i32(func, conv.block_scale);
     let block_bits = decode_e4m3(func, b, block_payload);
     let block_scale = b.reinterpret(func, b.f32_t, block_bits);
     let local = b.float_binary(
@@ -730,7 +750,7 @@ fn dequantize_nvfp4(
 
     // This bit round trip blocks a backend from fusing the final scale with an
     // original consumer.
-    let scaled_bits = b.reinterpret(func, b.u32_t, scaled);
+    let scaled_bits = b.reinterpret(func, b.i32_t, scaled);
     let result = b.reinterpret(func, b.f32_t, scaled_bits);
     NvFp4Expansion {
         result,
@@ -743,7 +763,7 @@ fn quantize_nvfp4(
     b: &mut NumericBuilder,
     conv: &NvFp4Convert,
 ) -> NvFp4Expansion {
-    let block_payload = b.convert(func, b.u32_t, conv.block_scale);
+    let block_payload = b.as_i32(func, conv.block_scale);
     let block_bits = decode_e4m3(func, b, block_payload);
     let block_scale = b.reinterpret(func, b.f32_t, block_bits);
     let global_unscaled = b.float_binary(
@@ -758,7 +778,7 @@ fn quantize_nvfp4(
         global_unscaled,
         block_scale,
     );
-    let bits = b.reinterpret(func, b.u32_t, local_unscaled);
+    let bits = b.reinterpret(func, b.i32_t, local_unscaled);
     let semantic_inst = func.defining_inst(bits).unwrap();
 
     let shifted_bits = b.shifted(func, BinOp::Shr, bits, 28);
@@ -766,13 +786,13 @@ fn quantize_nvfp4(
     let magnitude = b.masked(func, bits, 0x7fff_ffff);
     let mut payload = b.constant(func, 0x07);
     for (relation, threshold_bits, threshold_payload) in [
-        (CmpOp::Le, 0x40a0_0000u32, 0x06u32),
-        (CmpOp::Lt, 0x4060_0000, 0x05),
-        (CmpOp::Le, 0x4020_0000, 0x04),
-        (CmpOp::Lt, 0x3fe0_0000, 0x03),
-        (CmpOp::Le, 0x3fa0_0000, 0x02),
-        (CmpOp::Lt, 0x3f40_0000, 0x01),
-        (CmpOp::Le, 0x3e80_0000, 0x00),
+        (CmpOp::Ule, 0x40a0_0000u32, 0x06u32),
+        (CmpOp::Ult, 0x4060_0000, 0x05),
+        (CmpOp::Ule, 0x4020_0000, 0x04),
+        (CmpOp::Ult, 0x3fe0_0000, 0x03),
+        (CmpOp::Ule, 0x3fa0_0000, 0x02),
+        (CmpOp::Ult, 0x3f40_0000, 0x01),
+        (CmpOp::Ule, 0x3e80_0000, 0x00),
     ] {
         let hoist29 = b.constant(func, threshold_bits);
         let cond = b.compare(func, relation, magnitude, hoist29);
@@ -781,10 +801,10 @@ fn quantize_nvfp4(
     }
     let signed_payload = b.binary(func, BinOp::BitOr, sign, payload);
     let hoist5 = b.constant(func, 0x7f80_0000);
-    let is_nan = b.compare(func, CmpOp::Gt, magnitude, hoist5);
+    let is_nan = b.compare(func, CmpOp::Ugt, magnitude, hoist5);
     let hoist31 = b.constant(func, 0x07);
     let canonical = b.select(func, is_nan, hoist31, signed_payload);
-    let result = b.convert(func, b.u8_t, canonical);
+    let result = b.convert(func, b.i8_t, ConvertKind::Trunc, canonical);
     NvFp4Expansion {
         result,
         semantic_inst,
@@ -813,7 +833,7 @@ fn normalize_f32(func: &mut Function, b: &mut NumericBuilder, magnitude: Value) 
     let mut exponent = exponent;
     for shift in [16u32, 8, 4, 2, 1] {
         let threshold_v = b.constant(func, 0x0100_0000u32 >> shift);
-        let needs_shift = b.compare(func, CmpOp::Lt, significand, threshold_v);
+        let needs_shift = b.compare(func, CmpOp::Ult, significand, threshold_v);
         let shifted_sig = b.shifted(func, BinOp::Shl, significand, shift);
         significand = b.select(func, needs_shift, shifted_sig, significand);
         let hoist7 = b.constant(func, shift as i64 as u32);
@@ -851,7 +871,7 @@ fn round_division_quotient(
     let discarded = b.binary(func, BinOp::BitAnd, quotient, mask);
     let shift_minus_one = b.binary(func, BinOp::Sub, shift, one);
     let halfway = b.binary(func, BinOp::Shl, one, shift_minus_one);
-    let discarded_gt = b.compare(func, CmpOp::Gt, discarded, halfway);
+    let discarded_gt = b.compare(func, CmpOp::Ugt, discarded, halfway);
     let above_half = bool_as_u32(func, b, discarded_gt);
     let discarded_eq = b.compare(func, CmpOp::Eq, discarded, halfway);
     let at_half = bool_as_u32(func, b, discarded_eq);
@@ -876,8 +896,8 @@ fn expand_f32_division(
     numerator: Value,
     denominator: Value,
 ) -> Value {
-    let numerator_bits = b.reinterpret(func, b.u32_t, numerator);
-    let denominator_bits = b.reinterpret(func, b.u32_t, denominator);
+    let numerator_bits = b.reinterpret(func, b.i32_t, numerator);
+    let denominator_bits = b.reinterpret(func, b.i32_t, denominator);
     let numerator_magnitude = b.masked(func, numerator_bits, 0x7fff_ffff);
     let denominator_magnitude = b.masked(func, denominator_bits, 0x7fff_ffff);
     let signs = b.binary(func, BinOp::BitXor, numerator_bits, denominator_bits);
@@ -887,7 +907,7 @@ fn expand_f32_division(
 
     let ratio_lt = b.compare(
         func,
-        CmpOp::Lt,
+        CmpOp::Ult,
         normalized_numerator.significand,
         normalized_denominator.significand,
     );
@@ -915,7 +935,7 @@ fn expand_f32_division(
     for step in 0..27 {
         let bit = b.compare(
             func,
-            CmpOp::Ge,
+            CmpOp::Uge,
             remainder,
             normalized_denominator.significand,
         );
@@ -932,12 +952,12 @@ fn expand_f32_division(
     }
 
     let hh1 = b.constant(func, 256);
-    let exp_le = b.compare(func, CmpOp::Le, result_exponent, hh1);
+    let exp_le = b.compare(func, CmpOp::Ule, result_exponent, hh1);
     let is_tiny = bool_as_u32(func, b, exp_le);
     let hh2 = b.constant(func, 260);
     let raw_tiny_shift = b.binary(func, BinOp::Sub, hh2, result_exponent);
     let hh3 = b.constant(func, 31);
-    let shift_gt = b.compare(func, CmpOp::Gt, raw_tiny_shift, hh3);
+    let shift_gt = b.compare(func, CmpOp::Ugt, raw_tiny_shift, hh3);
     let shift_too_large = bool_as_u32(func, b, shift_gt);
     let shift_large_set = flag_set(func, b, shift_too_large);
     let hh4 = b.constant(func, 31);
@@ -948,7 +968,7 @@ fn expand_f32_division(
     let rounded = round_division_quotient(func, b, quotient, remainder, rounding_shift);
 
     let hh6 = b.constant(func, 0x0100_0000);
-    let carry_ge = b.compare(func, CmpOp::Ge, rounded, hh6);
+    let carry_ge = b.compare(func, CmpOp::Uge, rounded, hh6);
     let rounded_carry = bool_as_u32(func, b, carry_ge);
     let carry_set = flag_set(func, b, rounded_carry);
     let halved = b.shifted(func, BinOp::Shr, rounded, 1);
@@ -962,10 +982,10 @@ fn expand_f32_division(
     let tiny_set2 = flag_set(func, b, is_tiny);
     let finite_bits = b.select(func, tiny_set2, rounded, normal_bits);
     let hh8 = b.constant(func, 511);
-    let overflow_before = b.compare(func, CmpOp::Ge, result_exponent, hh8);
+    let overflow_before = b.compare(func, CmpOp::Uge, result_exponent, hh8);
     let overflow_before = bool_as_u32(func, b, overflow_before);
     let hh9 = b.constant(func, 255);
-    let overflow_after = b.compare(func, CmpOp::Ge, normal_exponent, hh9);
+    let overflow_after = b.compare(func, CmpOp::Uge, normal_exponent, hh9);
     let overflow_after = bool_as_u32(func, b, overflow_after);
     let tiny_set3 = flag_set(func, b, is_tiny);
     let hh10 = b.constant(func, 0);
@@ -988,10 +1008,10 @@ fn expand_f32_division(
     let den_inf_eq = b.equal_constant(func, denominator_magnitude, 0x7f80_0000);
     let denominator_infinity = bool_as_u32(func, b, den_inf_eq);
     let hh13 = b.constant(func, 0x7f80_0000);
-    let num_nan_gt = b.compare(func, CmpOp::Gt, numerator_magnitude, hh13);
+    let num_nan_gt = b.compare(func, CmpOp::Ugt, numerator_magnitude, hh13);
     let numerator_nan = bool_as_u32(func, b, num_nan_gt);
     let hh14 = b.constant(func, 0x7f80_0000);
-    let den_nan_gt = b.compare(func, CmpOp::Gt, denominator_magnitude, hh14);
+    let den_nan_gt = b.compare(func, CmpOp::Ugt, denominator_magnitude, hh14);
     let denominator_nan = bool_as_u32(func, b, den_nan_gt);
     let di_set = flag_set(func, b, denominator_infinity);
     let hh15 = b.constant(func, 0);
@@ -1105,10 +1125,10 @@ pub fn expand_f32_div(func: &mut Function) -> bool {
 // --- Mulh --------------------------------------------------------------------
 
 fn is_mulh(func: &Function, inst: Inst) -> bool {
-    matches!(func.opcode(inst), Opcode::Arith(a) if a.op == BinOp::Mulh)
+    matches!(func.opcode(inst), Opcode::Arith(a) if matches!(a.op, BinOp::UMulh | BinOp::SMulh))
 }
 
-/// Expand the high half of a full-width product into half-width limbs.
+/// Expand the high half of a full-width product (`UMulh` and `SMulh`) into half-width limbs.
 /// Returns whether anything changed.
 pub fn expand_mulh(func: &mut Function) -> bool {
     let mut changed = false;
@@ -1139,7 +1159,7 @@ pub fn expand_mulh(func: &mut Function) -> bool {
                 continue;
             };
             let ty = func.value_type(result);
-            let high = emit_mulh_limbs(func, &mut out, a.lhs, a.rhs, ty);
+            let high = emit_mulh_limbs(func, &mut out, a.lhs, a.rhs, ty, a.op == BinOp::SMulh);
             func.replace_all_uses(result, high);
         }
         func.set_block_insts(block, &out);
@@ -1147,20 +1167,21 @@ pub fn expand_mulh(func: &mut Function) -> bool {
     changed
 }
 
-/// Emit the limb sequence for `high half of (lhs * rhs)` at type `ty`,
-/// appending each instruction to `out`, and return the high-half value.
+/// Emit the limb sequence for the high half of `lhs * rhs` at type `ty`, read as unsigned
+/// or (`signed`) as two's complement signed, appending each instruction to `out`, and return
+/// the high-half value.
 fn emit_mulh_limbs(
     func: &mut Function,
     out: &mut Vec<Inst>,
     lhs: Value,
     rhs: Value,
     ty: Type,
+    signed: bool,
 ) -> Value {
-    let info = match func.types.type_kind(ty) {
-        TypeKind::Int(i) => *i,
+    let w = match func.types.type_kind(ty) {
+        TypeKind::Int(i) => i.bits,
         _ => unreachable!("mulh is integer-only"),
     };
-    let w = info.bits;
     let h = (w / 2) as i64;
     let mask_h: i64 = (1i64 << (w / 2)) - 1;
 
@@ -1198,13 +1219,15 @@ fn emit_mulh_limbs(
     let s0 = b.op(BinOp::Add, hihi, lohi_hi);
     let s1 = b.op(BinOp::Add, s0, hilo_hi);
     let unsigned_high = b.op(BinOp::Add, s1, cross_hi);
-    if !info.signed {
+    if !signed {
         return unsigned_high;
     }
 
+    // Signed correction: subtract each operand where the other is negative (an arithmetic
+    // shift by `w - 1` is all ones for a negative operand, zero otherwise).
     let wm1 = b.konst((w - 1) as i64);
-    let amask = b.op(BinOp::Shr, lhs, wm1);
-    let bmask = b.op(BinOp::Shr, rhs, wm1);
+    let amask = b.op(BinOp::Sar, lhs, wm1);
+    let bmask = b.op(BinOp::Sar, rhs, wm1);
     let ca = b.op(BinOp::BitAnd, amask, rhs);
     let cb = b.op(BinOp::BitAnd, bmask, lhs);
     let c0 = b.op(BinOp::Sub, unsigned_high, ca);
@@ -1240,7 +1263,11 @@ struct Shape {
     b_elem: Type,
     acc: Type,
     elem_bytes: i64,
-    convert: bool,
+    /// How a loaded element of A / B widens to the accumulator type; `None` when it already
+    /// has it. An int8 element is loaded as the raw byte (zero-extended, signless), so its
+    /// signedness is the choice of `Sext` or `Zext` here.
+    a_widen: Option<ConvertKind>,
+    b_widen: Option<ConvertKind>,
     acc_is_float: bool,
 }
 
@@ -1249,14 +1276,15 @@ const C_ELEM_BYTES: i64 = 4;
 
 fn shape_of(func: &mut Function, mm: &MatMul) -> Shape {
     let f32_t = func.types.intern(TypeKind::Float(FloatKind::F32));
-    let i32_t = func.types.intern(int_ty_kind(32, true));
+    let i32_t = func.types.intern(int_ty_kind(32));
     match mm.dtype {
         MatMulType::Fp32 => Shape {
             a_elem: f32_t,
             b_elem: f32_t,
             acc: f32_t,
             elem_bytes: 4,
-            convert: false,
+            a_widen: None,
+            b_widen: None,
             acc_is_float: true,
         },
         MatMulType::Int8 | MatMulType::Uint8 => {
@@ -1268,12 +1296,20 @@ fn shape_of(func: &mut Function, mm: &MatMul) -> Shape {
                 Some(s) => (s.a_unsigned, s.b_unsigned),
                 None => (default_unsigned, default_unsigned),
             };
+            let widen = |unsigned: bool| {
+                Some(if unsigned {
+                    ConvertKind::Zext
+                } else {
+                    ConvertKind::Sext
+                })
+            };
             Shape {
-                a_elem: func.types.intern(int_ty_kind(8, !a_unsigned)),
-                b_elem: func.types.intern(int_ty_kind(8, !b_unsigned)),
+                a_elem: func.types.intern(int_ty_kind(8)),
+                b_elem: func.types.intern(int_ty_kind(8)),
                 acc: i32_t,
                 elem_bytes: 1,
-                convert: true,
+                a_widen: widen(a_unsigned),
+                b_widen: widen(b_unsigned),
                 acc_is_float: false,
             }
         }
@@ -1284,7 +1320,8 @@ fn shape_of(func: &mut Function, mm: &MatMul) -> Shape {
             b_elem: func.types.intern(TypeKind::Float(FloatKind::F16)),
             acc: func.types.intern(TypeKind::Float(FloatKind::F32)),
             elem_bytes: 2,
-            convert: true,
+            a_widen: Some(ConvertKind::FpResize),
+            b_widen: Some(ConvertKind::FpResize),
             acc_is_float: true,
         },
     }
@@ -1367,7 +1404,7 @@ fn expand_matmul_site(func: &mut Function, site: &Site) {
 
     let ptr_t = func.types.ptr_global();
     let bool_t = func.types.intern(TypeKind::Bool);
-    let i32_t = func.types.intern(int_ty_kind(32, true));
+    let i32_t = func.types.intern(int_ty_kind(32));
 
     // Snapshot the block's instruction list: `set_block_insts` clears the list
     // it would then read from, so the two halves must be copied out first.
@@ -1412,7 +1449,7 @@ fn expand_matmul_site(func: &mut Function, site: &Site) {
         nest.i_head,
         bool_t,
         Opcode::Icmp(super::function::Compare {
-            op: CmpOp::Lt,
+            op: CmpOp::Slt,
             lhs: i,
             rhs: m_bound,
         }),
@@ -1436,7 +1473,7 @@ fn expand_matmul_site(func: &mut Function, site: &Site) {
         nest.j_head,
         bool_t,
         Opcode::Icmp(super::function::Compare {
-            op: CmpOp::Lt,
+            op: CmpOp::Slt,
             lhs: j,
             rhs: n_bound,
         }),
@@ -1452,14 +1489,7 @@ fn expand_matmul_site(func: &mut Function, site: &Site) {
     // j-header also runs with `j == n`, where `c_elem` is one past the end of
     // the C row.
     let acc_init = if mm.accumulate {
-        func.append_inst(
-            nest.j_body,
-            shape.acc,
-            Opcode::Load(super::function::Load {
-                ptr: c_elem,
-                volatile: false,
-            }),
-        )
+        func.append_load(nest.j_body, shape.acc, c_elem, MemFlags::new())
     } else {
         acc_zero
     };
@@ -1474,7 +1504,7 @@ fn expand_matmul_site(func: &mut Function, site: &Site) {
         nest.p_head,
         bool_t,
         Opcode::Icmp(super::function::Compare {
-            op: CmpOp::Lt,
+            op: CmpOp::Slt,
             lhs: p,
             rhs: k_bound,
         }),
@@ -1486,39 +1516,15 @@ fn expand_matmul_site(func: &mut Function, site: &Site) {
         super::function::EdgeDesc::bare(nest.j_latch),
     );
 
-    let a_val = func.append_inst(
-        nest.p_body,
-        shape.a_elem,
-        Opcode::Load(super::function::Load {
-            ptr: a_elem,
-            volatile: false,
-        }),
-    );
-    let b_val = func.append_inst(
-        nest.p_body,
-        shape.b_elem,
-        Opcode::Load(super::function::Load {
-            ptr: b_elem,
-            volatile: false,
-        }),
-    );
-    let a_op = if shape.convert {
-        func.append_inst(
-            nest.p_body,
-            shape.acc,
-            Opcode::Convert(super::function::Convert { value: a_val }),
-        )
-    } else {
-        a_val
+    let a_val = func.append_load(nest.p_body, shape.a_elem, a_elem, MemFlags::new());
+    let b_val = func.append_load(nest.p_body, shape.b_elem, b_elem, MemFlags::new());
+    let a_op = match shape.a_widen {
+        Some(kind) => func.append_convert(nest.p_body, shape.acc, kind, a_val),
+        None => a_val,
     };
-    let b_op = if shape.convert {
-        func.append_inst(
-            nest.p_body,
-            shape.acc,
-            Opcode::Convert(super::function::Convert { value: b_val }),
-        )
-    } else {
-        b_val
+    let b_op = match shape.b_widen {
+        Some(kind) => func.append_convert(nest.p_body, shape.acc, kind, b_val),
+        None => b_val,
     };
     let product = func.append_inst(
         nest.p_body,

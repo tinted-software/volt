@@ -20,14 +20,14 @@ fn block(n: usize, seed: u32) -> Vec<u8> {
 fn main() {
     dispatch();
     {
-        use volt_emulator::aarch64::decode::decode;
+        use volt_emulator::aarch64::host::ends_block;
+        use volt_isa_aarch64::decode::decode;
         let b = block(63, 1);
         let n = b
             .chunks_exact(4)
             .take_while(|c| {
-                !decode(u32::from_le_bytes((*c).try_into().unwrap()))
-                    .unwrap()
-                    .terminates()
+                let word = u32::from_le_bytes((*c).try_into().unwrap());
+                !ends_block(&decode(word).unwrap(), false)
             })
             .count();
         println!("non-terminating prefix of 63-block: {n}");

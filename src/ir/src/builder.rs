@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use super::function::{BinOp, Block, CmpOp, EdgeDesc, Function, Value};
+use super::function::{BinOp, Block, CmpOp, ConvertKind, EdgeDesc, Function, MemFlags, Value};
 use super::types::Type;
 
 pub struct Builder<'a> {
@@ -44,6 +44,11 @@ impl<'a> Builder<'a> {
         )
     }
 
+    /// `convert <kind> <ty>, value`; see [`ConvertKind`] for the legal type pairs.
+    pub fn convert(&mut self, ty: Type, kind: ConvertKind, value: Value) -> Value {
+        self.func.append_convert(self.block, ty, kind, value)
+    }
+
     pub fn select(&mut self, cond: Value, then_value: Value, else_value: Value) -> Value {
         let ty = self.func.value_type(then_value);
         self.func.append_inst(
@@ -76,18 +81,36 @@ impl<'a> Builder<'a> {
     }
 
     pub fn load(&mut self, ty: Type, ptr: Value) -> Value {
-        self.func.append_inst(
-            self.block,
-            ty,
-            super::function::Opcode::Load(super::function::Load {
-                ptr,
-                volatile: false,
-            }),
-        )
+        self.load_mem(ty, ptr, MemFlags::new())
+    }
+
+    pub fn load_mem(&mut self, ty: Type, ptr: Value, mem: MemFlags) -> Value {
+        self.func.append_load(self.block, ty, ptr, mem)
     }
 
     pub fn store(&mut self, value: Value, ptr: Value) {
         self.func.append_store(self.block, value, ptr);
+    }
+
+    pub fn store_mem(&mut self, value: Value, ptr: Value, mem: MemFlags) {
+        self.func.append_store_mem(self.block, value, ptr, mem);
+    }
+
+    pub fn intrinsic(
+        &mut self,
+        ty: Type,
+        name: &str,
+        args: &[Value],
+        imm: i64,
+        side_effects: bool,
+    ) -> Value {
+        self.func
+            .append_intrinsic(self.block, ty, name, args, imm, side_effects)
+    }
+
+    pub fn intrinsic_void(&mut self, name: &str, args: &[Value], imm: i64, side_effects: bool) {
+        self.func
+            .append_intrinsic_void(self.block, name, args, imm, side_effects);
     }
 
     pub fn ret(&mut self, value: Option<Value>) {
@@ -122,10 +145,7 @@ mod tests {
     use super::*;
 
     fn i32t(f: &mut Function) -> Type {
-        f.types.intern(TypeKind::Int(IntDesc {
-            signed: true,
-            bits: 32,
-        }))
+        f.types.intern(TypeKind::Int(IntDesc { bits: 32 }))
     }
 
     #[test]
@@ -173,8 +193,27 @@ mod tests {
         let a = func.append_block_param(entry, i32_t);
         let b = func.append_block_param(entry, i32_t);
         let mut bld = Builder::new(&mut func, entry);
-        let c = bld.icmp(CmpOp::Gt, a, b);
+        let c = bld.icmp(CmpOp::Sgt, a, b);
         assert_eq!(bool_t, func.value_type(c));
+    }
+
+    #[test]
+    fn convert_takes_the_result_type_and_kind() {
+        let mut func = Function::new();
+        let i32_t = i32t(&mut func);
+        let i64_t = func.types.intern(TypeKind::Int(IntDesc { bits: 64 }));
+        let entry = func.append_block();
+        let a = func.append_block_param(entry, i32_t);
+        let mut bld = Builder::new(&mut func, entry);
+        let wide = bld.convert(i64_t, ConvertKind::Sext, a);
+        assert_eq!(i64_t, func.value_type(wide));
+        match func.opcode(func.defining_inst(wide).unwrap()) {
+            super::super::function::Opcode::Convert(c) => {
+                assert_eq!(a, c.value);
+                assert_eq!(ConvertKind::Sext, c.kind);
+            }
+            _ => panic!("expected convert"),
+        }
     }
 
     #[test]

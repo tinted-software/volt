@@ -4,34 +4,40 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use super::super::*;
+use super::interp::Interp;
 use crate::attribute::{AttrValue, Attribute, Custom};
-use crate::expand::{expand_low_float, expand_mulh, expand_nv_fp4};
+use crate::expand::{expand_f32_div, expand_low_float, expand_mulh, expand_nv_fp4};
 use crate::function::AttrTarget;
 use crate::function::Function;
 use crate::function::{Arith, Ret, Terminator, Unary, UnaryOp};
+use crate::low_float::{self, Format};
+use crate::nvfp4::{self, ScaleApplication};
 use crate::types::{IntDesc, Type, TypeKind};
+use crate::verify::{Profile, verify};
 
-fn unsigned_int(func: &mut Function, bits: u16) -> Type {
-    func.types.intern(TypeKind::Int(IntDesc {
-        signed: false,
-        bits,
-    }))
+fn int_ty(func: &mut Function, bits: u16) -> Type {
+    func.types.intern(TypeKind::Int(IntDesc { bits }))
+}
+
+fn assert_verifies(func: &Function) {
+    let diags = verify(func, Profile::High);
+    assert!(diags.ok(), "{:?}", diags.items());
 }
 
 fn f32_ty(func: &mut Function) -> Type {
     func.types.intern(TypeKind::Float(FloatKind::F32))
 }
 
-fn u8_ty(func: &mut Function) -> Type {
-    unsigned_int(func, 8)
+fn i8_ty(func: &mut Function) -> Type {
+    int_ty(func, 8)
 }
 
-fn u16_ty(func: &mut Function) -> Type {
-    unsigned_int(func, 16)
+fn i16_ty(func: &mut Function) -> Type {
+    int_ty(func, 16)
 }
 
-fn u32_ty(func: &mut Function) -> Type {
-    unsigned_int(func, 32)
+fn i32_ty(func: &mut Function) -> Type {
+    int_ty(func, 32)
 }
 
 fn custom_attr(key: &str) -> Attribute {
@@ -48,8 +54,8 @@ fn custom_attr(key: &str) -> Attribute {
 fn expand_low_float_no_op_without_trigger() {
     let mut func = Function::new();
     let block = func.append_block();
-    let u32t = u32_ty(&mut func);
-    let v = func.append_inst(block, u32t, Opcode::Iconst(41));
+    let i32t = i32_ty(&mut func);
+    let v = func.append_inst(block, i32t, Opcode::Iconst(41));
     let inst = func.defining_inst(v).unwrap();
     func.add_attr(AttrTarget::Value(v), custom_attr("unchanged"));
     func.set_terminator(block, Terminator::Ret(Ret::one(v)));
@@ -64,7 +70,7 @@ fn expand_low_float_no_op_without_trigger() {
 #[test]
 fn expand_low_float_rewrites_and_migrates_attrs() {
     let mut func = Function::new();
-    let payload_t = u16_ty(&mut func);
+    let payload_t = i16_ty(&mut func);
     let f32t = f32_ty(&mut func);
     let block = func.append_block();
     let payload = func.append_block_param(block, payload_t);
@@ -125,12 +131,12 @@ fn expand_low_float_rewrites_and_migrates_attrs() {
 fn expand_low_float_encode_fp8_moves_attrs_to_f32_boundary() {
     let mut func = Function::new();
     let f32t = f32_ty(&mut func);
-    let u8t = u8_ty(&mut func);
+    let i8t = i8_ty(&mut func);
     let block = func.append_block();
     let source = func.append_block_param(block, f32t);
     let encoded = func.append_inst(
         block,
-        u8t,
+        i8t,
         Opcode::EncodeLowFloat(crate::function::LowFloatConvert {
             value: source,
             format: crate::low_float::Format::F8E5M2,
@@ -171,11 +177,11 @@ fn expand_low_float_encode_fp8_moves_attrs_to_f32_boundary() {
 // --- NVFP4 -------------------------------------------------------------------
 
 fn nvfp4_fixture(func: &mut Function, dequant: bool) -> (Block, Value) {
-    let u8t = u8_ty(func);
+    let i8t = i8_ty(func);
     let f32t = f32_ty(func);
     let block = func.append_block();
-    let payload = func.append_block_param(block, u8t);
-    let block_scale = func.append_block_param(block, u8t);
+    let payload = func.append_block_param(block, i8t);
+    let block_scale = func.append_block_param(block, i8t);
     let value = func.append_block_param(block, f32t);
     let global_scale = func.append_block_param(block, f32t);
     let conv = crate::function::NvFp4Convert {
@@ -188,7 +194,7 @@ fn nvfp4_fixture(func: &mut Function, dequant: bool) -> (Block, Value) {
     let result = if dequant {
         func.append_inst(block, f32t, Opcode::DequantizeNvfp4(conv))
     } else {
-        func.append_inst(block, u8t, Opcode::QuantizeNvfp4(conv))
+        func.append_inst(block, i8t, Opcode::QuantizeNvfp4(conv))
     };
     func.set_terminator(block, Terminator::Ret(Ret::one(result)));
     (block, result)
@@ -198,8 +204,8 @@ fn nvfp4_fixture(func: &mut Function, dequant: bool) -> (Block, Value) {
 fn expand_nv_fp4_no_op_without_trigger() {
     let mut func = Function::new();
     let block = func.append_block();
-    let u32t = u32_ty(&mut func);
-    let v = func.append_inst(block, u32t, Opcode::Iconst(43));
+    let i32t = i32_ty(&mut func);
+    let v = func.append_inst(block, i32t, Opcode::Iconst(43));
     func.set_terminator(block, Terminator::Ret(Ret::one(v)));
     assert!(!expand_nv_fp4(&mut func));
     assert!(matches!(
@@ -318,45 +324,40 @@ fn expand_nv_fp4_migrates_attrs_to_semantic_boundary() {
 
 // --- Mulh --------------------------------------------------------------------
 
-fn mulh_const_fixture(func: &mut Function, bits: u16, signed: bool) -> (Block, Inst) {
-    let ty = func.types.intern(TypeKind::Int(IntDesc { signed, bits }));
+fn mulh_const_fixture(func: &mut Function, bits: u16, op: BinOp) -> (Block, Inst) {
+    let ty = int_ty(func, bits);
     let block = func.append_block();
     let a = func.append_inst(block, ty, Opcode::Iconst(0x1234_5678_9abcu64 as i64));
     let b = func.append_inst(block, ty, Opcode::Iconst(0xfeed_beefu64 as i64));
-    let r = func.append_inst(
-        block,
-        ty,
-        Opcode::Arith(Arith {
-            op: BinOp::Mulh,
-            lhs: a,
-            rhs: b,
-        }),
-    );
+    let r = func.append_inst(block, ty, Opcode::Arith(Arith { op, lhs: a, rhs: b }));
     func.set_terminator(block, Terminator::Ret(Ret::one(r)));
     (block, func.defining_inst(r).unwrap())
 }
 
 #[test]
 fn expand_mulh_no_mulh_survives_and_idempotent() {
-    let mut func = Function::new();
-    let (block, _) = mulh_const_fixture(&mut func, 64, true);
-    assert!(expand_mulh(&mut func));
-    assert!(!expand_mulh(&mut func));
-    for inst in func.block_insts(block).to_vec() {
-        assert!(!matches!(
-            func.opcode(inst),
-            Opcode::Arith(Arith {
-                op: BinOp::Mulh,
-                ..
-            })
-        ));
+    for op in [BinOp::UMulh, BinOp::SMulh] {
+        let mut func = Function::new();
+        let (block, _) = mulh_const_fixture(&mut func, 64, op);
+        assert!(expand_mulh(&mut func));
+        assert!(!expand_mulh(&mut func));
+        for inst in func.block_insts(block).to_vec() {
+            assert!(!matches!(
+                func.opcode(inst),
+                Opcode::Arith(Arith {
+                    op: BinOp::UMulh | BinOp::SMulh,
+                    ..
+                })
+            ));
+        }
+        assert_verifies(&func);
     }
 }
 
 #[test]
 fn expand_mulh_false_without_trigger() {
     let mut func = Function::new();
-    let ty = u32_ty(&mut func);
+    let ty = i32_ty(&mut func);
     let block = func.append_block();
     let a = func.append_inst(block, ty, Opcode::Iconst(3));
     let b = func.append_inst(block, ty, Opcode::Iconst(7));
@@ -373,124 +374,351 @@ fn expand_mulh_false_without_trigger() {
     assert!(!expand_mulh(&mut func));
 }
 
+/// The value `fn() { ret <lhs op rhs> }` returns, computed by the expanded limb math.
+fn expanded_mulh(bits: u16, op: BinOp, lhs: u64, rhs: u64) -> u64 {
+    let mut func = Function::new();
+    let ty = int_ty(&mut func, bits);
+    let block = func.append_block();
+    let a = func.append_inst(block, ty, Opcode::Iconst(lhs as i64));
+    let b = func.append_inst(block, ty, Opcode::Iconst(rhs as i64));
+    let r = func.append_inst(block, ty, Opcode::Arith(Arith { op, lhs: a, rhs: b }));
+    func.set_terminator(block, Terminator::Ret(Ret::one(r)));
+    assert!(expand_mulh(&mut func));
+    assert_verifies(&func);
+    Interp::new(Vec::new()).run(&func, &[])[0]
+}
+
 #[test]
 fn expand_mulh_limb_math_matches_oracle_signed() {
-    let mut func = Function::new();
-    let (block, _) = mulh_const_fixture(&mut func, 64, true);
-    assert!(expand_mulh(&mut func));
-    // Evaluate constant dataflow at declared width: high = (a*b as i128) >> 64
-    let ret_v = match func.terminator(block) {
-        Some(Terminator::Ret(r)) => r.values[0],
-        _ => panic!("ret"),
-    };
-    let got = eval_const(&func, ret_v);
     let a = 0x1234_5678_9abcu64 as i64;
     let b = 0xfeed_beefu64 as i64;
     let oracle = ((a as i128) * (b as i128)) >> 64;
-    assert_eq!(got, oracle as i64);
+    assert_eq!(
+        expanded_mulh(64, BinOp::SMulh, a as u64, b as u64),
+        oracle as u64
+    );
 }
 
 #[test]
 fn expand_mulh_limb_math_matches_oracle_unsigned() {
-    let mut func = Function::new();
-    let (block, _) = mulh_const_fixture(&mut func, 64, false);
-    assert!(expand_mulh(&mut func));
-    let ret_v = match func.terminator(block) {
-        Some(Terminator::Ret(r)) => r.values[0],
-        _ => panic!("ret"),
-    };
-    let got = eval_const(&func, ret_v) as u64;
     let a = 0x1234_5678_9abcu64;
     let b = 0xfeed_beefu64;
     let oracle = ((a as u128) * (b as u128)) >> 64;
-    assert_eq!(got, oracle as u64);
+    assert_eq!(expanded_mulh(64, BinOp::UMulh, a, b), oracle as u64);
 }
 
 #[test]
 fn expand_mulh_works_at_32_bit_width() {
+    let oracle = ((100_000i128) * (100_000i128)) >> 32;
+    assert_eq!(
+        expanded_mulh(32, BinOp::SMulh, 100_000, 100_000),
+        oracle as u64
+    );
+    assert_eq!(
+        expanded_mulh(32, BinOp::UMulh, 100_000, 100_000),
+        oracle as u64
+    );
+}
+
+#[test]
+fn expand_mulh_matches_the_oracle_at_every_width_for_both_signs() {
+    let samples: [u64; 9] = [
+        0,
+        1,
+        2,
+        0x7f,
+        0x80,
+        0xff,
+        0x8000_0001,
+        0x1234_5678_9abc_def0,
+        u64::MAX,
+    ];
+    for bits in [8u16, 16, 32, 64] {
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let signed = |x: u64| {
+            if bits == 64 {
+                x as i64
+            } else {
+                ((x << (64 - bits)) as i64) >> (64 - bits)
+            }
+        };
+        for &a in &samples {
+            for &b in &samples {
+                let (a, b) = (a & mask, b & mask);
+                let unsigned_want = ((u128::from(a) * u128::from(b)) >> bits) as u64 & mask;
+                let signed_want =
+                    ((i128::from(signed(a)) * i128::from(signed(b))) >> bits) as u64 & mask;
+                assert_eq!(
+                    expanded_mulh(bits, BinOp::UMulh, a, b),
+                    unsigned_want,
+                    "umulh i{bits} {a:#x} {b:#x}"
+                );
+                assert_eq!(
+                    expanded_mulh(bits, BinOp::SMulh, a, b),
+                    signed_want,
+                    "smulh i{bits} {a:#x} {b:#x}"
+                );
+            }
+        }
+    }
+}
+
+// --- Numerics of the scalar expansions ----------------------------------------
+
+/// Equal bit patterns, or both NaN (the expansions need not preserve a NaN payload).
+fn same_f32(got: u32, want: u32) -> bool {
+    got == want || (f32::from_bits(got).is_nan() && f32::from_bits(want).is_nan())
+}
+
+fn sample_floats() -> Vec<f32> {
+    let mut v = alloc::vec![
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        1.5,
+        -2.5,
+        0.1,
+        -0.1,
+        3.7,
+        1e-3,
+        1e-6,
+        1e-10,
+        0.001_953_125,
+        0.000_976_562_5,
+        6.0,
+        5.0,
+        0.75,
+        0.25,
+        448.0,
+        449.0,
+        464.0,
+        57344.0,
+        61440.0,
+        65504.0,
+        1e10,
+        -1e10,
+        f32::MAX,
+        f32::MIN_POSITIVE,
+        f32::from_bits(1),
+        f32::from_bits(0x007f_ffff),
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+    ];
+    let mut s = 0x1234_5678_9abc_def0u64;
+    for _ in 0..1500 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        v.push(f32::from_bits(s as u32));
+        // Values near 1 exercise the rounding paths of the narrow formats.
+        v.push(f32::from_bits(0x3f00_0000 + (s >> 40) as u32 % 0x0100_0000));
+    }
+    v
+}
+
+#[test]
+fn expanded_low_float_decode_matches_the_host_decoder() {
+    for format in [Format::Bf16, Format::F8E4M3, Format::F8E5M2] {
+        let mut func = Function::new();
+        let payload_t = int_ty(&mut func, format.payload_bits());
+        let f32t = f32_ty(&mut func);
+        let block = func.append_block();
+        let payload = func.append_block_param(block, payload_t);
+        let decoded = func.append_inst(
+            block,
+            f32t,
+            Opcode::DecodeLowFloat(crate::function::LowFloatConvert {
+                value: payload,
+                format,
+            }),
+        );
+        func.set_terminator(block, Terminator::Ret(Ret::one(decoded)));
+        assert!(expand_low_float(&mut func));
+        assert_verifies(&func);
+        let payloads: Vec<u16> = if format == Format::Bf16 {
+            alloc::vec![
+                0, 1, 0x3f80, 0x8000, 0x7f80, 0xff80, 0x7fc0, 0xc2f7, 0x0001, 0x007f, 0x8001,
+                0xffff
+            ]
+        } else {
+            (0..=255).collect()
+        };
+        for p in payloads {
+            let got = Interp::new(Vec::new()).run(&func, &[u64::from(p)])[0] as u32;
+            let want = low_float::decode(format, p).unwrap().to_bits();
+            assert!(
+                same_f32(got, want),
+                "{format:?} {p:#x}: {got:#x} != {want:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn expanded_low_float_encode_matches_the_host_encoder() {
+    for format in [Format::Bf16, Format::F8E4M3, Format::F8E5M2] {
+        let mut func = Function::new();
+        let payload_t = int_ty(&mut func, format.payload_bits());
+        let f32t = f32_ty(&mut func);
+        let block = func.append_block();
+        let value = func.append_block_param(block, f32t);
+        let encoded = func.append_inst(
+            block,
+            payload_t,
+            Opcode::EncodeLowFloat(crate::function::LowFloatConvert { value, format }),
+        );
+        func.set_terminator(block, Terminator::Ret(Ret::one(encoded)));
+        assert!(expand_low_float(&mut func));
+        assert_verifies(&func);
+        for v in sample_floats() {
+            let got = Interp::new(Vec::new()).run(&func, &[u64::from(v.to_bits())])[0];
+            let want = u64::from(low_float::encode(format, v));
+            assert_eq!(got, want, "{format:?} {v:e} ({:#x})", v.to_bits());
+        }
+    }
+}
+
+const APPLICATIONS: [ScaleApplication; 2] = [ScaleApplication::Multiply, ScaleApplication::Divide];
+
+fn nvfp4_function(
+    dequant: bool,
+    block_application: ScaleApplication,
+    global_application: ScaleApplication,
+) -> Function {
     let mut func = Function::new();
-    let ty = signed_int32(&mut func);
+    let i8t = i8_ty(&mut func);
+    let f32t = f32_ty(&mut func);
     let block = func.append_block();
-    let a = func.append_inst(block, ty, Opcode::Iconst(100_000));
-    let b = func.append_inst(block, ty, Opcode::Iconst(100_000));
-    let r = func.append_inst(
+    let payload = func.append_block_param(block, i8t);
+    let value = func.append_block_param(block, f32t);
+    let block_scale = func.append_block_param(block, i8t);
+    let global_scale = func.append_block_param(block, f32t);
+    let conv = crate::function::NvFp4Convert {
+        value: if dequant { payload } else { value },
+        block_scale,
+        global_scale,
+        block_application,
+        global_application,
+    };
+    let result = if dequant {
+        func.append_inst(block, f32t, Opcode::DequantizeNvfp4(conv))
+    } else {
+        func.append_inst(block, i8t, Opcode::QuantizeNvfp4(conv))
+    };
+    func.set_terminator(block, Terminator::Ret(Ret::one(result)));
+    func
+}
+
+#[test]
+fn expanded_nvfp4_dequantize_matches_the_host() {
+    for block_application in APPLICATIONS {
+        for global_application in APPLICATIONS {
+            let mut func = nvfp4_function(true, block_application, global_application);
+            assert!(expand_nv_fp4(&mut func));
+            assert_verifies(&func);
+            for payload in 0..16u8 {
+                for scale in [0x00u8, 0x01, 0x08, 0x38, 0x40, 0x7e, 0x7f, 0xb8, 0xff] {
+                    for global in [1.0f32, 0.5, 3.0, -2.0] {
+                        let got = Interp::new(Vec::new()).run(
+                            &func,
+                            &[
+                                u64::from(payload),
+                                0,
+                                u64::from(scale),
+                                u64::from(global.to_bits()),
+                            ],
+                        )[0] as u32;
+                        let want = nvfp4::dequantize(
+                            payload,
+                            scale,
+                            global,
+                            block_application,
+                            global_application,
+                        )
+                        .to_bits();
+                        assert!(
+                            same_f32(got, want),
+                            "{payload:#x} {scale:#x} {global}: {got:#x} != {want:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn expanded_nvfp4_quantize_matches_the_host() {
+    for block_application in APPLICATIONS {
+        for global_application in APPLICATIONS {
+            let mut func = nvfp4_function(false, block_application, global_application);
+            assert!(expand_nv_fp4(&mut func));
+            assert_verifies(&func);
+            for value in sample_floats().into_iter().take(400) {
+                for scale in [0x38u8, 0x40, 0x7e] {
+                    let got = Interp::new(Vec::new()).run(
+                        &func,
+                        &[
+                            0,
+                            u64::from(value.to_bits()),
+                            u64::from(scale),
+                            u64::from(2.0f32.to_bits()),
+                        ],
+                    )[0];
+                    let want = u64::from(nvfp4::quantize(
+                        value,
+                        scale,
+                        2.0,
+                        block_application,
+                        global_application,
+                    ));
+                    assert_eq!(got, want, "{value:e} {scale:#x}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn expanded_f32_division_matches_the_hardware() {
+    let mut func = Function::new();
+    let f32t = f32_ty(&mut func);
+    let block = func.append_block();
+    let a = func.append_block_param(block, f32t);
+    let b = func.append_block_param(block, f32t);
+    let q = func.append_inst(
         block,
-        ty,
+        f32t,
         Opcode::Arith(Arith {
-            op: BinOp::Mulh,
+            op: BinOp::Div,
             lhs: a,
             rhs: b,
         }),
     );
-    func.set_terminator(block, Terminator::Ret(Ret::one(r)));
-    assert!(expand_mulh(&mut func));
-    let ret_v = match func.terminator(block) {
-        Some(Terminator::Ret(r)) => r.values[0],
-        _ => panic!("ret"),
-    };
-    let got = eval_const(&func, ret_v);
-    let oracle = ((100_000i128) * (100_000i128)) >> 32;
-    assert_eq!(got, oracle as i64);
-}
-
-fn signed_int32(func: &mut Function) -> Type {
-    func.types.intern(TypeKind::Int(IntDesc {
-        signed: true,
-        bits: 32,
-    }))
-}
-
-/// Evaluate a constants-only dataflow at the result type's width.
-fn eval_const(func: &Function, v: Value) -> i64 {
-    let info = match func.types.type_kind(func.value_type(v)) {
-        TypeKind::Int(i) => *i,
-        _ => panic!("int expected"),
-    };
-    let wrap = |x: i64| -> i64 {
-        let bits = info.bits;
-        if bits >= 64 {
-            return x;
+    func.set_terminator(block, Terminator::Ret(Ret::one(q)));
+    assert!(expand_f32_div(&mut func));
+    assert!(!expand_f32_div(&mut func));
+    assert_verifies(&func);
+    for inst in func.block_insts(block).to_vec() {
+        assert!(!matches!(
+            func.opcode(inst),
+            Opcode::Arith(Arith { op: BinOp::Div, .. })
+        ));
+    }
+    let samples = sample_floats();
+    for (i, &x) in samples.iter().enumerate() {
+        for &y in samples.iter().skip(i % 7).step_by(23).take(60) {
+            let got = Interp::new(Vec::new())
+                .run(&func, &[u64::from(x.to_bits()), u64::from(y.to_bits())])[0]
+                as u32;
+            let want = (x / y).to_bits();
+            assert!(same_f32(got, want), "{x:e} / {y:e}: {got:#x} != {want:#x}");
         }
-        let mask: u64 = if bits >= 64 { !0 } else { (1u64 << bits) - 1 };
-        let low = (x as u64) & mask;
-        if info.signed {
-            let sign = 1u64 << (bits - 1);
-            if low & sign != 0 {
-                (low | !mask) as i64
-            } else {
-                low as i64
-            }
-        } else {
-            low as i64
-        }
-    };
-    let inst = func.defining_inst(v).unwrap();
-    match func.opcode(inst) {
-        Opcode::Iconst(c) => wrap(c),
-        Opcode::Arith(a) => {
-            let lhs = eval_const(func, a.lhs);
-            let rhs = eval_const(func, a.rhs);
-            let raw: i64 = match a.op {
-                BinOp::Add => lhs.wrapping_add(rhs),
-                BinOp::Sub => lhs.wrapping_sub(rhs),
-                BinOp::Mul => lhs.wrapping_mul(rhs),
-                BinOp::BitAnd => lhs & rhs,
-                BinOp::BitOr => lhs | rhs,
-                BinOp::Shr => lhs.wrapping_shr(rhs as u32),
-                BinOp::Shl => lhs.wrapping_shl(rhs as u32),
-                _ => panic!("unexpected op"),
-            };
-            wrap(raw)
-        }
-        Opcode::Select(sel) => {
-            let cond = eval_const(func, sel.cond);
-            if cond != 0 {
-                eval_const(func, sel.then)
-            } else {
-                eval_const(func, sel.else_)
-            }
-        }
-        Opcode::Convert(cv) => eval_const(func, cv.value),
-        _ => panic!("unexpected opcode"),
     }
 }

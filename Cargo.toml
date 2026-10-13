@@ -2,9 +2,12 @@
 resolver = "3"
 members = [
     "src/target",
+    "src/isa/aarch64",
+    "src/disasm",
     "src/ir",
     "src/emulator",
     "src/emulator/cli",
+    "src/lift/aarch64",
 ]
 
 [workspace.package]
@@ -14,8 +17,10 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 volt-ir = { path = "src/ir" }
+volt-isa-aarch64 = { path = "src/isa/aarch64" }
 volt-target = { path = "src/target" }
 volt-emulator = { path = "src/emulator" }
+volt-lift-aarch64 = { path = "src/lift/aarch64" }
 
 object = { version = "0.40.0", default-features = false, features = ["read_core", "write_core", "elf", "macho"] }
 libc = "0.2"

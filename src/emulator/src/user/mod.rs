@@ -10,11 +10,12 @@ pub mod syscalls;
 pub use memory::Space;
 
 use crate::aarch64::cpu::{Exclusive, Trap};
-use crate::aarch64::decode::{Instruction, SignExtend, SystemRegister, decode};
+use crate::aarch64::host::run as run_host;
 use crate::aarch64::{Cache, Cpu};
 use crate::memory::{GuestMemory, MemoryError};
 use std::ffi::OsString;
 use std::path::Path;
+use volt_isa_aarch64::decode::{Instruction, SignExtend, SystemRegister, decode};
 
 #[derive(Debug)]
 pub enum Error {
@@ -109,7 +110,7 @@ pub fn run(path: &Path, args: &[OsString], env: &[(OsString, OsString)]) -> Resu
                 Trap::SimdStruct => simd_struct(&mut space, &mut cpu)?,
                 Trap::Host => {
                     let word = cpu.value as u32;
-                    crate::aarch64::host::run(&mut cpu, word);
+                    run_host(&mut cpu, word);
                     cpu.trap = Trap::None;
                 }
                 Trap::Svc => {
@@ -155,13 +156,10 @@ fn fetch(
     if !user_instruction(&instruction) {
         return Err(crate::aarch64::compile::Error::InvalidUserInstruction);
     }
-    if matches!(instruction, Instruction::CacheOp) {
+    if let Instruction::CacheOp(sys) = &instruction {
         // The decoder groups EL0 and privileged cache operations together.
         // Only IC IVAU and DC CVAC/CVAU/CIVAC are permitted in userspace.
-        let op1 = (word >> 16) & 7;
-        let crm = (word >> 8) & 15;
-        let op2 = (word >> 5) & 7;
-        if op1 != 3 || op2 != 1 || !matches!(crm, 5 | 10 | 11 | 14) {
+        if sys.op1 != 3 || sys.op2 != 1 || !matches!(sys.crm, 5 | 10 | 11 | 14) {
             return Err(crate::aarch64::compile::Error::InvalidUserInstruction);
         }
     }
@@ -187,7 +185,7 @@ fn user_instruction(instruction: &Instruction) -> bool {
         },
         Instruction::Eret
         | Instruction::Psci
-        | Instruction::Tlbi
+        | Instruction::Tlbi(_)
         | Instruction::Wfi
         | Instruction::AddressTranslate(_) => false,
         _ => true,

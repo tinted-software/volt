@@ -451,6 +451,24 @@ pub fn ldrsh_off(rt: Reg, rn: Reg, off: u16) -> u32 {
     0x79C00000 | (((off as u32) >> 1) << 10) | (n(rn) << 5) | n(rt)
 }
 
+/// Load-acquire register: `size` is the access width in bytes (1, 2, 4 or 8); the value is
+/// zero-extended into `rt`. Addressing is a bare base register (`[rn]`) only.
+pub fn ldar(rt: Reg, rn: Reg, size: u8) -> u32 {
+    ordered_word(0x08DF_FC00, size) | (n(rn) << 5) | n(rt)
+}
+
+/// Store-release register: `size` is the access width in bytes (1, 2, 4 or 8).
+/// Addressing is a bare base register (`[rn]`) only.
+pub fn stlr(rt: Reg, rn: Reg, size: u8) -> u32 {
+    ordered_word(0x089F_FC00, size) | (n(rn) << 5) | n(rt)
+}
+
+/// `base` (the byte-sized form of an `LDAR`/`STLR`) with the size field for `size` bytes.
+fn ordered_word(base: u32, size: u8) -> u32 {
+    debug_assert!(matches!(size, 1 | 2 | 4 | 8), "ldar/stlr size {size}");
+    base | (size.trailing_zeros() << 30)
+}
+
 pub fn sdiv(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x1AC00C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd)
 }
@@ -939,7 +957,11 @@ mod tests {
         } else {
             (1u64 << size) - 1
         };
-        let rotated = ((run >> r) | (run << (size - r))) & mask;
+        let rotated = if r == 0 {
+            run
+        } else {
+            ((run >> r) | (run << (size - r))) & mask
+        };
         let mut value = 0u64;
         let mut at = 0;
         while at < if is64 { 64 } else { 32 } {
@@ -1232,6 +1254,19 @@ mod tests {
         assert_eq!(0xA9410440, ldp_off_x(Reg::X0, Reg::X1, Reg::X2, 16));
         assert_eq!(0x29010440, stp_off_w(Reg::X0, Reg::X1, Reg::X2, 8));
         assert_eq!(0x297F10A3, ldp_off_w(Reg::X3, Reg::X4, Reg::X5, -8));
+    }
+
+    #[test]
+    fn load_acquire_store_release_golden() {
+        // Checked against GNU as.
+        assert_eq!(0x88dffc20, ldar(Reg::X0, Reg::X1, 4));
+        assert_eq!(0xc8dffc62, ldar(Reg::X2, Reg::X3, 8));
+        assert_eq!(0x08dffca4, ldar(Reg::X4, Reg::X5, 1));
+        assert_eq!(0x48dffce6, ldar(Reg::X6, Reg::X7, 2));
+        assert_eq!(0x889ffc20, stlr(Reg::X0, Reg::X1, 4));
+        assert_eq!(0xc89ffc62, stlr(Reg::X2, Reg::X3, 8));
+        assert_eq!(0x089ffca4, stlr(Reg::X4, Reg::X5, 1));
+        assert_eq!(0x489ffce6, stlr(Reg::X6, Reg::X7, 2));
     }
 
     #[test]

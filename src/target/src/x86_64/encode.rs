@@ -70,28 +70,13 @@ impl Encoder {
         self.code.push(0xb8 | (dst & 7));
         self.bytes(&imm.to_le_bytes());
     }
-    pub fn load(&mut self, dst: Reg, base: Reg, off: i32, bits: u16, signed: bool) {
-        match (bits, signed) {
-            (1..=8, s) => self.mem(
-                None,
-                &[0x0f, if s { 0xbe } else { 0xb6 }],
-                dst,
-                base,
-                off,
-                true,
-                false,
-            ),
-            (9..=16, s) => self.mem(
-                None,
-                &[0x0f, if s { 0xbf } else { 0xb7 }],
-                dst,
-                base,
-                off,
-                true,
-                false,
-            ),
-            (17..=32, true) => self.mem(None, &[0x63], dst, base, off, true, false),
-            (17..=32, false) => self.mem(None, &[0x8b], dst, base, off, false, false),
+    /// Loads `bits` of memory into `dst`, zero-extending to 64 bits. Sign extension is an
+    /// explicit operation of the instruction selector, never part of a load.
+    pub fn load(&mut self, dst: Reg, base: Reg, off: i32, bits: u16) {
+        match bits {
+            1..=8 => self.mem(None, &[0x0f, 0xb6], dst, base, off, true, false),
+            9..=16 => self.mem(None, &[0x0f, 0xb7], dst, base, off, true, false),
+            17..=32 => self.mem(None, &[0x8b], dst, base, off, false, false),
             _ => self.mem(None, &[0x8b], dst, base, off, true, false),
         }
     }
@@ -103,6 +88,23 @@ impl Encoder {
                 None
             },
             &[if bits <= 8 { 0x88 } else { 0x89 }],
+            src,
+            base,
+            off,
+            bits > 32,
+            bits <= 8,
+        );
+    }
+    /// `xchg [base + off], src` of `bits` (8, 16, 32 or 64): swaps `src` with memory. With a
+    /// memory operand the exchange carries an implicit `lock`, so it is a full barrier.
+    pub fn xchg(&mut self, base: Reg, off: i32, src: Reg, bits: u16) {
+        self.mem(
+            if bits > 8 && bits <= 16 {
+                Some(0x66)
+            } else {
+                None
+            },
+            &[if bits <= 8 { 0x86 } else { 0x87 }],
             src,
             base,
             off,

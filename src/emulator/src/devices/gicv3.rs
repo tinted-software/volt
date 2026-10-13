@@ -50,6 +50,17 @@ pub struct Gicv3 {
     enabled: u32,
     pending: u32,
     priority: [u8; 32],
+    /// `ITLinesNumber` as the distributor reports it. Zero is a board with 32 INTIDs and no
+    /// shared interrupts; firmware that registers interrupts sized by `arm-gic` needs more.
+    it_lines: u8,
+}
+
+impl Gicv3 {
+    /// A distributor with `it_lines` interrupt lines (see the field).
+    pub fn with_it_lines(mut self, it_lines: u8) -> Self {
+        self.it_lines = it_lines;
+        self
+    }
 }
 
 impl Default for Gicv3 {
@@ -62,6 +73,7 @@ impl Default for Gicv3 {
             enabled: 0,
             pending: 0,
             priority: [0; 32],
+            it_lines: 0,
         }
     }
 }
@@ -82,8 +94,8 @@ impl Gicv3 {
         // All of these are 32-bit registers.
         let register = match offset & !3 {
             GICD_CTLR => u64::from(self.distributor_ctlr),
-            // `ITLinesNumber` 0 (32 INTIDs), one PE, 16 ID bits.
-            GICD_TYPER => 15 << 19,
+            // `ITLinesNumber` (`it_lines`) gives 32 * (it_lines + 1) INTIDs, one PE, 16 ID bits.
+            GICD_TYPER => (15 << 19) | u64::from(self.it_lines),
             PIDR2 => PIDR2_GICV3,
             _ => 0,
         };

@@ -19,12 +19,16 @@
 //! on a worker thread.
 
 use super::cache::{MAX_INSNS, SharedBlocks};
-use super::decode::{Instruction, decode};
+use super::host::ends_block;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use std::collections::HashSet;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
+use volt_isa_aarch64::{
+    decode::{Instruction, decode},
+    flow::Flow,
+};
 
 /// Reads guest-physical bytes without any vCPU state, for worker threads.
 pub trait CodeReader: Send + Sync {
@@ -66,20 +70,15 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 
 /// Where control can go after `last`, a block's final instruction at `last_pc`.
 /// Fixed targets only: an indirect branch or return has none to offer.
-fn successors(last: Instruction, last_pc: u64) -> ([u64; 2], usize) {
+fn successors(instruction: Instruction, last_pc: u64) -> ([u64; 2], usize) {
     let next = last_pc.wrapping_add(4);
-    let at = |offset: i64| last_pc.wrapping_add(offset as u64);
-    match last {
-        Instruction::B(offset) => ([at(offset), 0], 1),
-        Instruction::Call(call) if call.link => ([at(call.target), next], 2),
-        Instruction::Call(call) => ([at(call.target), 0], 1),
-        Instruction::BCond(branch) => ([at(branch.offset), next], 2),
-        Instruction::TestBranch(test) => ([at(test.offset), next], 2),
-        Instruction::Indirect(branch) if branch.link => ([next, 0], 1),
-        Instruction::Indirect(_) | Instruction::Eret => ([0, 0], 0),
-        // Every other block end, a trap or a cut at the instruction limit, resumes
-        // at the next instruction.
-        _ => ([next, 0], 1),
+    match instruction.flow(last_pc) {
+        Flow::Jump(target) => ([target, 0], 1),
+        Flow::CondJump(target) | Flow::Call(target) => ([target, next], 2),
+        Flow::JumpIndirect | Flow::Return => ([0, 0], 0),
+        // Every other block end, a call returning, a trap or a cut at the
+        // instruction limit, resumes at the next instruction.
+        Flow::Next | Flow::CallIndirect | Flow::Stop | Flow::Unrecognized => ([next, 0], 1),
     }
 }
 
@@ -187,7 +186,7 @@ impl Ahead {
             };
             last = Some((instruction, job.pc + count as u64));
             count += 4;
-            if instruction.terminates_with(shared.inline_memory())
+            if ends_block(&instruction, shared.inline_memory())
                 || n + 1 == MAX_INSNS
                 || (job.pc + count as u64) & 0xfff == 0
             {
@@ -259,7 +258,7 @@ mod tests {
 
     #[test]
     fn fixed_targets_follow_each_kind_of_block_end() {
-        use crate::aarch64::decode::{Call, Test, Width};
+        use volt_isa_aarch64::decode::{Call, Indirect, IndirectKind, Test, Width};
         let at = 0x1000;
         let test = Instruction::TestBranch(Test {
             rt: 0,
@@ -275,15 +274,21 @@ mod tests {
             (call(false), vec![0x1040]),
             (test, vec![0x0ff8, 0x1004]),
             (
-                Instruction::Indirect(crate::aarch64::decode::Indirect { rn: 1, link: false }),
+                Instruction::Indirect(Indirect {
+                    rn: 1,
+                    kind: IndirectKind::Jump,
+                }),
                 vec![],
             ),
             (
-                Instruction::Indirect(crate::aarch64::decode::Indirect { rn: 1, link: true }),
+                Instruction::Indirect(Indirect {
+                    rn: 1,
+                    kind: IndirectKind::Call,
+                }),
                 vec![0x1004],
             ),
             (Instruction::Eret, vec![]),
-            (Instruction::Svc, vec![0x1004]),
+            (Instruction::Svc(0), vec![0x1004]),
             (Instruction::Nop, vec![0x1004]),
         ];
         for (last, expected) in cases {
