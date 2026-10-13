@@ -110,6 +110,11 @@ pub fn build(ram_base: u64, ram_size: u64, cmdline: &str) -> Vec<u8> {
     build_smp(ram_base, ram_size, cmdline, 1, None, false)
 }
 
+/// Firmware discovers fw_cfg in the tree; direct kernel boots do not expose it.
+pub fn build_firmware(ram_base: u64, ram_size: u64) -> Vec<u8> {
+    build_tree(ram_base, ram_size, "", 1, None, false, true)
+}
+
 pub fn build_smp(
     ram_base: u64,
     ram_size: u64,
@@ -117,6 +122,18 @@ pub fn build_smp(
     cpus: u32,
     initrd: Option<(u64, u64)>,
     has_virtio: bool,
+) -> Vec<u8> {
+    build_tree(ram_base, ram_size, cmdline, cpus, initrd, has_virtio, false)
+}
+
+fn build_tree(
+    ram_base: u64,
+    ram_size: u64,
+    cmdline: &str,
+    cpus: u32,
+    initrd: Option<(u64, u64)>,
+    has_virtio: bool,
+    firmware: bool,
 ) -> Vec<u8> {
     let mut b = Builder::new();
     b.begin("");
@@ -166,9 +183,22 @@ pub fn build_smp(
     b.cells("#address-cells", &[2]);
     b.cells("#size-cells", &[2]);
     b.property("interrupt-controller", &[]);
-    b.string("compatible", "arm,cortex-a15-gic");
-    let mut registers = Vec::from(range(GICD_BASE, 0x1000));
-    registers.extend_from_slice(&range(GIC_CPU_BASE, 0x2000));
+    let registers = if firmware {
+        b.string("compatible", "arm,gic-v3");
+        b.cells("#redistributor-regions", &[1]);
+        b.property("ranges", &[]);
+        let mut registers = Vec::from(range(GICD_BASE, crate::devices::gicv3::DISTRIBUTOR_SIZE));
+        registers.extend_from_slice(&range(
+            super::afdt::GICR_BASE,
+            crate::devices::gicv3::REDISTRIBUTOR_SIZE,
+        ));
+        registers
+    } else {
+        b.string("compatible", "arm,cortex-a15-gic");
+        let mut registers = Vec::from(range(GICD_BASE, 0x1000));
+        registers.extend_from_slice(&range(GIC_CPU_BASE, 0x2000));
+        registers
+    };
     b.cells("reg", &registers);
     b.cells("phandle", &[2]);
     b.end();
@@ -179,6 +209,57 @@ pub fn build_smp(
     b.cells("clocks", &[1, 1]);
     b.string("clock-names", "uartclk\0apb_pclk");
     b.end();
+    if firmware {
+        b.begin("fw-cfg@9020000");
+        b.string("compatible", "qemu,fw-cfg-mmio");
+        b.cells(
+            "reg",
+            &range(crate::devices::fw_cfg::BASE, crate::devices::fw_cfg::LEN),
+        );
+        b.end();
+        b.begin("pl031@9010000");
+        b.string("compatible", "arm,pl031\0arm,primecell");
+        b.cells(
+            "reg",
+            &range(crate::devices::pl031::BASE, crate::devices::pl031::LEN),
+        );
+        b.cells("interrupts", &[0, 2, 4]);
+        b.cells("clocks", &[1]);
+        b.string("clock-names", "apb_pclk");
+        b.end();
+        b.begin("flash@0");
+        b.string("compatible", "cfi-flash");
+        b.cells("bank-width", &[4]);
+        let mut registers = Vec::from(range(0, crate::devices::nor_flash::LEN));
+        registers.extend_from_slice(&range(
+            crate::devices::nor_flash::BASE,
+            crate::devices::nor_flash::LEN,
+        ));
+        b.cells("reg", &registers);
+        b.end();
+        b.begin("pcie@10000000");
+        b.string("compatible", "pci-host-ecam-generic");
+        b.string("device_type", "pci");
+        b.cells("#address-cells", &[3]);
+        b.cells("#size-cells", &[2]);
+        b.cells("#interrupt-cells", &[1]);
+        b.cells("bus-range", &[0, 255]);
+        b.cells("linux,pci-domain", &[0]);
+        b.cells(
+            "reg",
+            &range(
+                crate::devices::pci::ECAM_BASE,
+                crate::devices::pci::ECAM_SIZE,
+            ),
+        );
+        // Memory BAR space, matching QEMU virt. This host has no port-I/O devices.
+        b.cells(
+            "ranges",
+            &[0x0200_0000, 0, 0x1000_0000, 0, 0x1000_0000, 0, 0x2eff_0000],
+        );
+        b.property("dma-coherent", &[]);
+        b.end();
+    }
     if has_virtio {
         b.begin("virtio@a000000");
         b.string("compatible", "virtio,mmio");
@@ -224,5 +305,34 @@ mod tests {
         assert!(tree.windows(19).any(|part| part == b"linux,initrd-start\0"));
         assert!(tree.windows(17).any(|part| part == b"linux,initrd-end\0"));
         assert!(tree.windows(12).any(|part| part == b"virtio,mmio\0"));
+    }
+
+    #[test]
+    fn firmware_tree_describes_only_firmware_devices_and_gicv3() {
+        let tree = build_firmware(0x4000_0000, 4 << 30);
+        for compatible in [
+            b"arm,gic-v3\0".as_slice(),
+            b"qemu,fw-cfg-mmio\0",
+            b"arm,pl031\0",
+            b"cfi-flash\0",
+            b"pci-host-ecam-generic\0",
+        ] {
+            assert!(
+                tree.windows(compatible.len())
+                    .any(|part| part == compatible)
+            );
+        }
+        assert!(!tree.windows(17).any(|part| part == b"arm,cortex-a15-gic\0"));
+        assert!(!tree.windows(12).any(|part| part == b"virtio,mmio\0"));
+        assert!(
+            tree.windows(4)
+                .any(|part| part == (crate::devices::fw_cfg::BASE as u32).to_be_bytes())
+        );
+        let kernel_tree = build(0x4000_0000, 128 << 20, "");
+        assert!(
+            !kernel_tree
+                .windows(16)
+                .any(|part| part == b"qemu,fw-cfg-mmio\0")
+        );
     }
 }

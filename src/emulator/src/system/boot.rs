@@ -208,7 +208,7 @@ pub fn prepare_firmware(
     ram_base: u64,
     ram_size: u64,
 ) -> Result<Layout, Error> {
-    let tree = super::fdt::build(ram_base, ram_size, "");
+    let tree = super::fdt::build_firmware(ram_base, ram_size);
     let end = ram_base.checked_add(ram_size).ok_or(Error::NoRoom)?;
     if ram_base
         .checked_add(tree.len() as u64)

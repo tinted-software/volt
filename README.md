@@ -61,6 +61,14 @@ The disk form supplies `root=/dev/vda rw` by default. `--cpus`, `--idle`,
 `--fast`, and `--spin` control the virtual CPU count and WFI policy. Use
 `volt-boot --help` for the complete generated interface.
 
+Firmware boots use QEMU `virt` firmware devices: GICv3, fw_cfg, PL031 RTC, PCI ECAM and
+two CFI NOR banks. The second flash bank stores volatile UEFI variables; no state persists
+between runs.
+
+```sh
+cargo run --release --bin volt-boot -- --bios /path/to/QEMU_EFI.fd --timeout 20
+```
+
 ## XNU boot
 
 `volt-boot` also boots an XNU kernel. A Mach-O image is detected by its magic, so no

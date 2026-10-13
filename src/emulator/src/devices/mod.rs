@@ -1,9 +1,12 @@
 pub mod aic;
 pub mod bus;
+pub mod fw_cfg;
 pub mod gicv2;
 pub mod gicv3;
+pub mod nor_flash;
 pub mod pci;
 pub mod pl011;
+pub mod pl031;
 pub mod pmgr;
 pub mod s5l_uart;
 pub mod virtio_blk;

@@ -44,15 +44,14 @@ pub trait DeviceIo {
     fn write_virtio(&mut self, offset: u64, size: u8, value: u64) {
         let _ = (offset, size, value);
     }
-    /// A device the board places anywhere in the address space (the M1 SoC's
-    /// interrupt controller and UART). `None` declines the access, which then goes
-    /// to the fixed windows below.
-    fn read_soc(&mut self, cpu_id: u32, address: u64, size: u8) -> Option<u64> {
+    /// A board-specific device (SoC peripherals or firmware devices). `None`
+    /// declines the access, which then goes to PCI and the fixed windows below.
+    fn read_board(&mut self, cpu_id: u32, address: u64, size: u8) -> Option<u64> {
         let _ = (cpu_id, address, size);
         None
     }
     /// Returns `false` when the board's devices do not claim the address.
-    fn write_soc(&mut self, cpu_id: u32, address: u64, size: u8, value: u64) -> bool {
+    fn write_board(&mut self, cpu_id: u32, address: u64, size: u8, value: u64) -> bool {
         let _ = (cpu_id, address, size, value);
         false
     }
@@ -1189,20 +1188,20 @@ impl<M: GuestMemory> Machine<M> {
                 let window = |base, length| {
                     fixed && physical >= base && end.is_some_and(|end| end <= base + length)
                 };
-                let soc = if load {
-                    devices.read_soc(self.cpu_id, physical, width).map(Some)
+                let board = if load {
+                    devices.read_board(self.cpu_id, physical, width).map(Some)
                 } else {
                     devices
-                        .write_soc(self.cpu_id, physical, width, value)
+                        .write_board(self.cpu_id, physical, width, value)
                         .then_some(None)
                 };
                 // Only accesses the board's own devices decline reach the PCI bus.
-                let pci = match (&soc, load) {
+                let pci = match (&board, load) {
                     (Some(_), _) => None,
                     (None, true) => devices.read_pci(physical, width).map(Some),
                     (None, false) => devices.write_pci(physical, width, value).then_some(None),
                 };
-                let read = if let Some(read) = soc {
+                let read = if let Some(read) = board {
                     read
                 } else if let Some(read) = pci {
                     read

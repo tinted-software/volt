@@ -284,6 +284,32 @@ impl Intc {
     }
 }
 
+/// Peripherals the firmware discovers in its device tree, separate from kernel boots.
+fn firmware_devices(ram_size: u64) -> crate::devices::Bus {
+    use crate::devices::{Bus, BusDevice, fw_cfg, nor_flash, pl031};
+    let mut bus = Bus::new();
+    bus.attach(BusDevice::new(
+        fw_cfg::BASE,
+        fw_cfg::LEN,
+        fw_cfg::FwCfg::new(ram_size),
+    ));
+    bus.attach(BusDevice::new(
+        nor_flash::BASE,
+        nor_flash::LEN,
+        nor_flash::NorFlash::new(),
+    ));
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32;
+    bus.attach(BusDevice::new(
+        pl031::BASE,
+        pl031::LEN,
+        pl031::Pl031::new(seconds),
+    ));
+    bus
+}
+
 /// The bus of one board. The fixed windows (QEMU `virt`'s UART, GIC and virtio) exist
 /// only on the virt board; on the M1 board `soc` answers instead, and the GIC accessors
 /// below are never reached with [`Intc::Apple`].
@@ -293,6 +319,7 @@ struct SystemDevices<'a, V> {
     virtio: Option<&'a mut V>,
     soc: Option<&'a mut m1::Soc>,
     pci: Option<&'a mut PciHost>,
+    firmware: Option<&'a mut crate::devices::Bus>,
 }
 
 impl<V: crate::devices::VirtioIo> machine::DeviceIo for SystemDevices<'_, V> {
@@ -359,13 +386,21 @@ impl<V: crate::devices::VirtioIo> machine::DeviceIo for SystemDevices<'_, V> {
             v.write(offset, size, value);
         }
     }
-    fn read_soc(&mut self, cpu_id: u32, address: u64, size: u8) -> Option<u64> {
-        self.soc.as_mut()?.read(cpu_id, address, size)
+    fn read_board(&mut self, cpu_id: u32, address: u64, size: u8) -> Option<u64> {
+        if let Some(soc) = self.soc.as_mut() {
+            soc.read(cpu_id, address, size)
+        } else {
+            self.firmware.as_mut()?.read(address, size)
+        }
     }
-    fn write_soc(&mut self, cpu_id: u32, address: u64, size: u8, value: u64) -> bool {
-        self.soc
-            .as_mut()
-            .is_some_and(|soc| soc.write(cpu_id, address, size, value))
+    fn write_board(&mut self, cpu_id: u32, address: u64, size: u8, value: u64) -> bool {
+        if let Some(soc) = self.soc.as_mut() {
+            soc.write(cpu_id, address, size, value)
+        } else {
+            self.firmware
+                .as_mut()
+                .is_some_and(|bus| bus.write(address, size, value))
+        }
     }
     fn read_pci(&mut self, address: u64, size: u8) -> Option<u64> {
         self.pci.as_mut()?.read(address, size)
@@ -596,6 +631,8 @@ fn boot_machine<B: crate::devices::BlockBackend + 'static>(
         ),
         (Payload::Firmware(_), disk) => (None, Some(firmware_pci(disk, shared_mem.clone()))),
     };
+    let mut firmware =
+        matches!(payload, Payload::Firmware(_)).then(|| firmware_devices(ram_size as u64));
     let mut machine = machine::Machine::new(shared_mem);
     if apple {
         m1::identify(&mut machine.cpu);
@@ -648,6 +685,7 @@ fn boot_machine<B: crate::devices::BlockBackend + 'static>(
             virtio: virtio.as_mut(),
             soc: soc.as_mut(),
             pci: pci.as_mut(),
+            firmware: firmware.as_mut(),
         };
         match machine.run_with_devices(&mut dev) {
             Ok(machine::Exit::Timer) => {
