@@ -8,9 +8,9 @@ host), mirroring the existing `../vulcan/libs/vulcan-target` seam. Ships:
 - **x86_64 JIT codegen** (`VoltTargetX86_64` + `volt-jit`): encoder, System V
   instruction selector, in-memory linker (rel32 call resolution), and W^X
   mapping (`ExecutableMemory`: mmap RW → mprotect R+X).
-- **A32 guest emulator** (`VoltEmulator` + `volt-emulate`): decodes and JIT-lifts
-  a small ARM-state integer subset to the host x86_64 JIT. Run the synthetic demo
-  with `swift run volt-emulate --demo`; unsupported instructions and SVC fail closed.
+- **Optional A32 guest emulator** (`VoltEmulator` + `volt-emulate`), enabled with
+  the `ARMv7Emulator` package trait: `swift run --traits ARMv7Emulator volt-emulate --demo`.
+  It JIT-lifts a small ARM-state subset; unsupported instructions and SVC fail closed.
 - **Allocator** (`VoltTarget/LinearScan.swift`): classic linear scan with
   splitting — furthest-ending victim keeps a register prefix, tail spills
   with one store; reloads implicit at use; call/div-spanning values forced to

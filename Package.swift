@@ -14,15 +14,32 @@ let package = Package(
         .executable(name: "volt-jit", targets: ["VoltJIT"]),
         .executable(name: "volt-emulate", targets: ["VoltEmulate"]),
     ],
+    traits: [
+        .trait(name: "ARMv7Emulator", description: "Enable the ARMv7 A32 emulator and its decoder dependency."),
+        .default(enabledTraits: []),
+    ],
     targets: [
         .target(name: "VoltIR", dependencies: []),
         .target(name: "VoltTarget", dependencies: ["VoltIR"]),
         .target(name: "VoltTargetAArch64", dependencies: ["VoltTarget", "VoltIR"]),
         .target(name: "VoltTargetARMv7", dependencies: ["VoltTarget"]),
         .target(name: "VoltTargetX86_64", dependencies: ["VoltTarget", "VoltIR"]),
-        .target(name: "VoltEmulator", dependencies: ["VoltIR", "VoltTarget", "VoltTargetARMv7", "VoltTargetX86_64"]),
-        .executableTarget(name: "VoltEmulate", dependencies: ["VoltEmulator"]),
+        .target(
+            name: "VoltEmulator",
+            dependencies: [
+                "VoltIR", "VoltTarget", "VoltTargetX86_64",
+                .target(name: "VoltTargetARMv7", condition: .when(traits: ["ARMv7Emulator"])),
+            ]),
+        .executableTarget(
+            name: "VoltEmulate",
+            dependencies: [.target(name: "VoltEmulator", condition: .when(traits: ["ARMv7Emulator"]))]),
         .executableTarget(name: "VoltJIT", dependencies: ["VoltTarget", "VoltTargetX86_64", "VoltIR"]),
-        .testTarget(name: "VoltTests", dependencies: ["VoltTargetAArch64", "VoltTargetARMv7", "VoltTargetX86_64", "VoltIR", "VoltEmulator"]),
+        .testTarget(
+            name: "VoltTests",
+            dependencies: [
+                "VoltTargetAArch64", "VoltTargetX86_64", "VoltIR",
+                .target(name: "VoltTargetARMv7", condition: .when(traits: ["ARMv7Emulator"])),
+                .target(name: "VoltEmulator", condition: .when(traits: ["ARMv7Emulator"])),
+            ]),
     ]
 )
