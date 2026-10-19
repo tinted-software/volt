@@ -1,11 +1,20 @@
 import Foundation
 
 public enum A32Instruction: Sendable, Equatable {
-  case movImmediate(rd: UInt8, value: UInt32)
-  case addImmediate(rd: UInt8, rn: UInt8, value: UInt32)
-  case addRegister(rd: UInt8, rn: UInt8, rm: UInt8)
-  case subImmediate(rd: UInt8, rn: UInt8, value: UInt32)
-  case subRegister(rd: UInt8, rn: UInt8, rm: UInt8)
+  case movImmediate(rd: UInt8, value: UInt32, s: Bool)
+  case movRegister(rd: UInt8, rm: UInt8, s: Bool)
+  case mvnImmediate(rd: UInt8, value: UInt32, s: Bool)
+  case mvnRegister(rd: UInt8, rm: UInt8, s: Bool)
+  case andImmediate(rd: UInt8, rn: UInt8, value: UInt32, s: Bool)
+  case andRegister(rd: UInt8, rn: UInt8, rm: UInt8, s: Bool)
+  case eorImmediate(rd: UInt8, rn: UInt8, value: UInt32, s: Bool)
+  case eorRegister(rd: UInt8, rn: UInt8, rm: UInt8, s: Bool)
+  case orrImmediate(rd: UInt8, rn: UInt8, value: UInt32, s: Bool)
+  case orrRegister(rd: UInt8, rn: UInt8, rm: UInt8, s: Bool)
+  case addImmediate(rd: UInt8, rn: UInt8, value: UInt32, s: Bool)
+  case addRegister(rd: UInt8, rn: UInt8, rm: UInt8, s: Bool)
+  case subImmediate(rd: UInt8, rn: UInt8, value: UInt32, s: Bool)
+  case subRegister(rd: UInt8, rn: UInt8, rm: UInt8, s: Bool)
   case bxLR
   case svc(immediate: UInt32)
 }
@@ -37,33 +46,40 @@ public enum ARMv7A32Decoder {
       instruction = .bxLR
     } else if w & 0x0F00_0000 == 0x0F00_0000 {
       instruction = .svc(immediate: w & 0x00FF_FFFF)
-    } else if w & 0x0FE0_0000 == 0x03A0_0000 {
-      let imm = w & 255
-      let rotate = Int((w >> 8) & 15) * 2
-      let value = rotate == 0 ? imm : (imm >> rotate) | (imm << (32 - rotate))
-      instruction = .movImmediate(rd: UInt8((w >> 12) & 15), value: value)
-    } else if w & 0x0C00_0000 == 0 && w & 0x0010_0000 == 0 && w & 0x0200_0000 != 0 {
+    } else if w & 0x0C00_0000 == 0 && w & 0x0200_0000 != 0 {
       let opcode = (w >> 21) & 15
+      let s = w & 0x0010_0000 != 0
       let rd = UInt8((w >> 12) & 15)
       let rn = UInt8((w >> 16) & 15)
       let imm8 = w & 255
       let rotate = Int((w >> 8) & 15) * 2
       let imm = rotate == 0 ? imm8 : (imm8 >> rotate) | (imm8 << (32 - rotate))
       switch opcode {
-      case 4: instruction = .addImmediate(rd: rd, rn: rn, value: imm)
-      case 2: instruction = .subImmediate(rd: rd, rn: rn, value: imm)
+      case 0: instruction = .andImmediate(rd: rd, rn: rn, value: imm, s: s)
+      case 1: instruction = .eorImmediate(rd: rd, rn: rn, value: imm, s: s)
+      case 2: instruction = .subImmediate(rd: rd, rn: rn, value: imm, s: s)
+      case 4: instruction = .addImmediate(rd: rd, rn: rn, value: imm, s: s)
+      case 12: instruction = .orrImmediate(rd: rd, rn: rn, value: imm, s: s)
+      case 13 where rn == 0: instruction = .movImmediate(rd: rd, value: imm, s: s)
+      case 15 where rn == 0: instruction = .mvnImmediate(rd: rd, value: imm, s: s)
       default: throw A32DecodeError.unsupported(pc: pc, word: w)
       }
-    } else if w & 0x0C00_0000 == 0 && w & 0x0010_0000 == 0 && w & 0x0200_0000 == 0
+    } else if w & 0x0C00_0000 == 0 && w & 0x0200_0000 == 0
       && w & 0x0000_0FF0 == 0
     {
       let opcode = (w >> 21) & 15
+      let s = w & 0x0010_0000 != 0
       let rd = UInt8((w >> 12) & 15)
       let rn = UInt8((w >> 16) & 15)
       let rm = UInt8(w & 15)
       switch opcode {
-      case 4: instruction = .addRegister(rd: rd, rn: rn, rm: rm)
-      case 2: instruction = .subRegister(rd: rd, rn: rn, rm: rm)
+      case 0: instruction = .andRegister(rd: rd, rn: rn, rm: rm, s: s)
+      case 1: instruction = .eorRegister(rd: rd, rn: rn, rm: rm, s: s)
+      case 2: instruction = .subRegister(rd: rd, rn: rn, rm: rm, s: s)
+      case 4: instruction = .addRegister(rd: rd, rn: rn, rm: rm, s: s)
+      case 12: instruction = .orrRegister(rd: rd, rn: rn, rm: rm, s: s)
+      case 13 where rn == 0: instruction = .movRegister(rd: rd, rm: rm, s: s)
+      case 15 where rn == 0: instruction = .mvnRegister(rd: rd, rm: rm, s: s)
       default: throw A32DecodeError.unsupported(pc: pc, word: w)
       }
     } else {

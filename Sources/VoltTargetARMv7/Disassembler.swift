@@ -87,17 +87,36 @@ public enum ARMv7Disassembler: Disassembler {
     return ".word \(hex(w, 8))"
   }
   private static func typedText(_ instruction: A32Instruction) -> String {
+    func suffix(_ s: Bool) -> String { s ? "s" : "" }
     switch instruction {
-    case .movImmediate(let rd, let value):
-      return "mov \(reg(UInt32(rd))), #\(hex(value, 0))"
-    case .addImmediate(let rd, let rn, let value):
-      return "add \(reg(UInt32(rd))), \(reg(UInt32(rn))), #\(hex(value, 0))"
-    case .addRegister(let rd, let rn, let rm):
-      return "add \(reg(UInt32(rd))), \(reg(UInt32(rn))), \(reg(UInt32(rm)))"
-    case .subImmediate(let rd, let rn, let value):
-      return "sub \(reg(UInt32(rd))), \(reg(UInt32(rn))), #\(hex(value, 0))"
-    case .subRegister(let rd, let rn, let rm):
-      return "sub \(reg(UInt32(rd))), \(reg(UInt32(rn))), \(reg(UInt32(rm)))"
+    case .movImmediate(let rd, let value, let s):
+      return "mov\(suffix(s)) \(reg(UInt32(rd))), #\(hex(value, 0))"
+    case .movRegister(let rd, let rm, let s):
+      return "mov\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rm)))"
+    case .mvnImmediate(let rd, let value, let s):
+      return "mvn\(suffix(s)) \(reg(UInt32(rd))), #\(hex(value, 0))"
+    case .mvnRegister(let rd, let rm, let s):
+      return "mvn\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rm)))"
+    case .andImmediate(let rd, let rn, let value, let s):
+      return "and\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rn))), #\(hex(value, 0))"
+    case .andRegister(let rd, let rn, let rm, let s):
+      return "and\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rn))), \(reg(UInt32(rm)))"
+    case .eorImmediate(let rd, let rn, let value, let s):
+      return "eor\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rn))), #\(hex(value, 0))"
+    case .eorRegister(let rd, let rn, let rm, let s):
+      return "eor\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rn))), \(reg(UInt32(rm)))"
+    case .orrImmediate(let rd, let rn, let value, let s):
+      return "orr\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rn))), #\(hex(value, 0))"
+    case .orrRegister(let rd, let rn, let rm, let s):
+      return "orr\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rn))), \(reg(UInt32(rm)))"
+    case .addImmediate(let rd, let rn, let value, let s):
+      return "add\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rn))), #\(hex(value, 0))"
+    case .addRegister(let rd, let rn, let rm, let s):
+      return "add\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rn))), \(reg(UInt32(rm)))"
+    case .subImmediate(let rd, let rn, let value, let s):
+      return "sub\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rn))), #\(hex(value, 0))"
+    case .subRegister(let rd, let rn, let rm, let s):
+      return "sub\(suffix(s)) \(reg(UInt32(rd))), \(reg(UInt32(rn))), \(reg(UInt32(rm)))"
     case .bxLR: return "bx lr"
     case .svc(let immediate): return "swi #\(hex(immediate, 0))"
     }

@@ -10,7 +10,9 @@ host), mirroring the existing `../vulcan/libs/vulcan-target` seam. Ships:
   mapping (`ExecutableMemory`: mmap RW → mprotect R+X).
 - **Optional A32 guest emulator** (`VoltEmulator` + `volt-emulate`), enabled with
   the `ARMv7Emulator` package trait: `swift run --traits ARMv7Emulator volt-emulate --demo`.
-  It JIT-lifts a small ARM-state subset; unsupported instructions and SVC fail closed.
+  It JIT-lifts non-flag-setting `MOV`/`MVN`/`AND`/`EOR`/`ORR`/`ADD`/`SUB` (immediate and
+  unshifted register forms) plus `BX LR`; all 32-bit arithmetic wraps, the remaining
+  instructions and `SVC` fail closed.
 - **Allocator** (`VoltTarget/LinearScan.swift`): classic linear scan with
   splitting — furthest-ending victim keeps a register prefix, tail spills
   with one store; reloads implicit at use; call/div-spanning values forced to
