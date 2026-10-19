@@ -310,20 +310,24 @@ struct ISelContext {
   mutating func emitInst(_ inst: Inst) throws {
     let op = function.opcode(inst)
     switch op {
+    case .ptrAdd(let p):
+      let baseType = function.valueType(of: p.base)
+      let result = resultOf(inst)
+      guard case .ptr = baseType.kind, function.valueType(of: result).kind == baseType.kind else {
+        throw CodegenError.invalidFunction("ptrAdd requires pointer base and pointer result")
+      }
+      try emitArithImm(op: .add, lhs: p.base, imm: p.byteOffset, dst: result)
+
     case .iconst(let imm):
       let v = resultOf(inst)
       let d = defReg(v, fallback: .rax)
       if imm >= Int64(Int32.min), imm <= Int64(Int32.max) {
         code += movImm(d, Int32(imm), true)
+      } else if d == .rax {
+        code += movImm64(d, UInt64(bitPattern: imm))
       } else {
-        // movImm64 needs the full 64-bit form; only rax is guaranteed
-        // scratch-safe here, so go through rax when d is a home reg.
-        if d == .rax {
-          code += movImm64(d, UInt64(bitPattern: imm))
-        } else {
-          code += movImm64(.rax, UInt64(bitPattern: imm))
-          code += movReg(d, .rax)
-        }
+        code += movImm64(.rax, UInt64(bitPattern: imm))
+        code += movReg(d, .rax)
       }
       commitReg(d, v)
 
@@ -378,16 +382,20 @@ struct ISelContext {
           ptr = scratch2
         }
       }
-      code += movToMem(ptr, 0, val)
+      if case .int(_, 32) = function.valueType(of: s.value).kind {
+        code += movToMem32(ptr, 0, val)
+      } else {
+        code += movToMem(ptr, 0, val)
+      }
 
     case .load(let l):
       let ptr = operandReg(l.ptr, scratch: scratch1)
       let v = resultOf(inst)
       let d = defReg(v, fallback: scratch1)
-      if d == ptr {
-        // `mov d, [d]`: the ModRM form reads [d] before writing d, so
-        // same-register base+dest is exact.
-        code += movFromMem(d, d, 0)
+      let is32: Bool
+      if case .int(_, 32) = function.valueType(of: v).kind { is32 = true } else { is32 = false }
+      if is32 {
+        code += movFromMem32(d, ptr, 0)
       } else {
         code += movFromMem(d, ptr, 0)
       }

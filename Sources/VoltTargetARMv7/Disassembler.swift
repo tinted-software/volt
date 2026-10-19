@@ -86,11 +86,30 @@ public enum ARMv7Disassembler: Disassembler {
     }
     return ".word \(hex(w, 8))"
   }
+  private static func typedText(_ instruction: A32Instruction) -> String {
+    switch instruction {
+    case .movImmediate(let rd, let value):
+      return "mov \(reg(UInt32(rd))), #\(hex(value, 0))"
+    case .addImmediate(let rd, let rn, let value):
+      return "add \(reg(UInt32(rd))), \(reg(UInt32(rn))), #\(hex(value, 0))"
+    case .addRegister(let rd, let rn, let rm):
+      return "add \(reg(UInt32(rd))), \(reg(UInt32(rn))), \(reg(UInt32(rm)))"
+    case .subImmediate(let rd, let rn, let value):
+      return "sub \(reg(UInt32(rd))), \(reg(UInt32(rn))), #\(hex(value, 0))"
+    case .subRegister(let rd, let rn, let rm):
+      return "sub \(reg(UInt32(rd))), \(reg(UInt32(rn))), \(reg(UInt32(rm)))"
+    case .bxLR: return "bx lr"
+    case .svc(let immediate): return "swi #\(hex(immediate, 0))"
+    }
+  }
   public static func disassembleOne(code: [UInt8], at offset: Int) -> (text: String, length: Int)? {
     guard offset >= 0, offset + 4 <= code.count else { return nil }
     let w =
       UInt32(code[offset]) | UInt32(code[offset + 1]) << 8 | UInt32(code[offset + 2]) << 16
       | UInt32(code[offset + 3]) << 24
+    if let typed = try? ARMv7A32Decoder.decode(code, at: offset) {
+      return (typedText(typed.instruction), 4)
+    }
     return (decode(w), 4)
   }
   public static func format(code: [UInt8]) -> String {

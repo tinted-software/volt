@@ -402,6 +402,7 @@ public func buildIntervals(
 /// Operand values read by an opcode (definitions excluded).
 func uses(of op: Opcode) -> [Value] {
   switch op {
+  case .ptrAdd(let p): return [p.base]
   case .arith(let a): return [a.lhs, a.rhs]
   case .arithImm(let a): return [a.lhs]
   case .cmp(let c): return [c.lhs, c.rhs]

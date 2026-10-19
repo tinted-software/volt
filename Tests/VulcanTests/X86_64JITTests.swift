@@ -466,3 +466,23 @@ struct SplitDominanceTests {
     #expect(f(1) == 19)  // 9*2 + 1
   }
 }
+
+@Test("pointer addition addresses a nonzero field offset")
+func pointerOffsetLoadStore() throws {
+  let fn = Function()
+  let i64 = fn.types.intern(.int(signedness: true, bits: 64))
+  let ptr = fn.types.ptrGlobal()
+  let entry = fn.appendBlock()
+  let base = fn.appendBlockParam(entry, ptr)
+  let b = Builder(function: fn, block: entry)
+  let field = b.ptrAdd(base, byteOffset: 8)
+  b.store(b.iconst(i64, 42), field)
+  b.ret(b.load(i64, field))
+  let j = try jitCompileModule(JITModule(functions: [NamedFunction(name: "field", function: fn)]))
+  typealias FieldFn = @convention(c) (UnsafeMutablePointer<Int64>) -> Int64
+  let f: FieldFn = j.entry(as: FieldFn.self, name: "field")!
+  var data: [Int64] = [0, 0]
+  let result = data.withUnsafeMutableBufferPointer { f($0.baseAddress!) }
+  #expect(result == 42)
+  #expect(data[1] == 42)
+}

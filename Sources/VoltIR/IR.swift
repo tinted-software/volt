@@ -206,7 +206,13 @@ public struct VaArg: Sendable, Hashable {
 public struct VaEnd: Sendable, Hashable { public var list: Value }
 
 //! The opcode carried by an `Inst`.
+public struct PtrAdd: Sendable, Hashable {
+  public var base: Value
+  public var byteOffset: Int64
+}
+
 public enum Opcode: Sendable, Hashable {
+  case ptrAdd(PtrAdd)
   case arith(Arith)
   case arithImm(ArithImm)
   case compare(CmpOp)

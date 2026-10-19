@@ -53,6 +53,13 @@ public final class Builder {
       .select(Select(cond: cond, then: thenValue, else: elseValue)))
   }
 
+  /// Add a signed byte offset to a pointer, preserving its pointer type.
+  @discardableResult
+  public func ptrAdd(_ base: Value, byteOffset: Int64) -> Value {
+    let type = function.valueType(of: base)
+    return function.appendInst(block, type, .ptrAdd(PtrAdd(base: base, byteOffset: byteOffset)))
+  }
+
   /// Load a value of type `ty` from `ptr`.
   @discardableResult
   public func load(_ ty: Type, _ ptr: Value) -> Value {
