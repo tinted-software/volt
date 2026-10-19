@@ -55,7 +55,10 @@ public func allocateFunction(_ function: Function) throws -> ScanResult {
   let clobbers = clobberPositions(function)
   let built = buildIntervals(function: function, clobberPositions: clobbers)
   let pool = Array(0..<poolRegs.count)
-  return linearScan(ScanRequest(pool: pool, intervals: built.intervals, slotBase: 0))
+  let dom = dominance(successors: built.successors, entry: function.blocks[0])
+  return linearScan(
+    ScanRequest(pool: pool, intervals: built.intervals, slotBase: 0, uses: built.uses),
+    posBlock: positionBlocks(built.positions), dominates: dom, uses: built.uses)
 }
 
 /// Instruction positions (in `buildIntervals` numbering) that clobber
@@ -152,7 +155,14 @@ struct ISelContext {
     let clobbers = clobberPositions(function)
     let built = buildIntervals(function: function, clobberPositions: clobbers)
     let pool = Array(0..<poolRegs.count)
-    scan = linearScan(ScanRequest(pool: pool, intervals: built.intervals, slotBase: 0))
+    // Dominance oracle for split stores: a store in block S covers a slot
+    // read in block U only when S dominates U. Undominated values demote to
+    // plain slots (def writes memory directly, no store fires).
+    let dom = dominance(successors: built.successors, entry: function.blocks[0])
+    let posBlock = positionBlocks(built.positions)
+    scan = linearScan(
+      ScanRequest(pool: pool, intervals: built.intervals, slotBase: 0, uses: built.uses),
+      posBlock: posBlock, dominates: dom, uses: built.uses)
     instPos = built.instPos
     termPos = built.termPos
     spillSlots = scan.spillCount

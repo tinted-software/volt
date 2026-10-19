@@ -8,8 +8,17 @@ import VoltIR
 //! each use. Segments span blocks freely, so no resolution pass is needed;
 //! stores only fire inside a block (block-row newcomers and start-ties spill
 //! whole). Values that must survive a clobber point (a call, `div`/`rem`) are
-//! forced to slots by the backend's `mustSpill`. Next increment: holes and
-//! inactive lists so spill tails can re-home into freed registers.
+//! forced to slots by the backend's `mustSpill`.
+//!
+//! Soundness across control flow: a split store fires on one path, so a value
+//! whose uses sit in blocks the store's block does not dominate is demoted to
+//! a plain slot (def writes memory directly, no store fires). The backend
+//! passes a dominance oracle plus a position->block map; without them the
+//! scan keeps the old behavior. Holes and inactive lists (spill tails
+//! re-homing into freed registers) are a later increment: they need
+//! store/reload action ordering in emission, which implicit reloads cannot
+//! carry — attempted once and reverted (region pieces took fresh registers
+//! with no move, miscompiling even `x+x`).
 //!
 //! The scan is generic over the pool: the backend supplies the allocatable
 //! register indices (as `Int`s it later maps to its `Reg` type), the live
@@ -47,10 +56,17 @@ public struct ScanRequest: Sendable {
   public var intervals: [LiveInterval]
   /// First spill-slot index available to the scan (backend scratch below).
   public var slotBase: Int
-  public init(pool: [Int], intervals: [LiveInterval], slotBase: Int = 0) {
+  /// Every operand position per value (from `buildIntervals`). Feeds the
+  /// dominance check: uses at/after a split decide whether the store's block
+  /// dominates every read.
+  public var uses: [Value: [Int]]
+  public init(
+    pool: [Int], intervals: [LiveInterval], slotBase: Int = 0, uses: [Value: [Int]] = [:]
+  ) {
     self.pool = pool
     self.intervals = intervals
     self.slotBase = slotBase
+    self.uses = uses
   }
 }
 
@@ -129,7 +145,50 @@ public struct SplitStore: Sendable, Hashable {
 /// block-row start (params) spills whole with no victim split — so stores
 /// only ever fire inside a block before a same-block instruction, never on a
 /// control-flow edge. Forced spills (`mustSpill`) take slots directly.
-public func linearScan(_ request: ScanRequest) -> ScanResult {
+///
+/// Soundness across control flow: a split store is a real instruction on one
+/// path. When a value's interval spans blocks, the store may not dominate a
+/// slot-segment read on another path (e.g. the store fires in a loop body or
+/// a taken arm while a skip path reads the same value later). The scan takes
+/// an optional dominance oracle `(storeBlock, useBlock)` so it can demote
+/// those values to plain slots (no store needed — the def writes memory
+/// directly). Blocks come from `posBlock`, which maps an instruction position
+/// to its block; pass both nil to keep the old behavior.
+public func linearScan(
+  _ request: ScanRequest, posBlock: [Int: Block]? = nil,
+  dominates: ((_ store: Block, _ use: Block) -> Bool)? = nil,
+  uses: [Value: [Int]]? = nil
+) -> ScanResult {
+  // Cheap path: without an oracle there is nothing to demote.
+  if posBlock == nil || dominates == nil || uses == nil {
+    return scanCore(request)
+  }
+  var req = request
+  // At most one demotion round per value: each round forces one more value to
+  // a slot, and slotted values never split, so this terminates.
+  for _ in 0...request.intervals.count {
+    let result = scanCore(req)
+    guard
+      let (storePos, value) = firstUndominatedStore(
+        result, posBlock: posBlock!, dominates: dominates!, uses: uses!)
+    else { return result }
+    // Demote: the value's whole interval goes to a slot. Re-mark its
+    // interval mustSpill and rescan; the def commits straight to memory.
+    req.intervals = req.intervals.map {
+      $0.value == value
+        ? LiveInterval(value: $0.value, start: $0.start, end: $0.end, mustSpill: true) : $0
+    }
+    _ = storePos
+  }
+  return scanCore(req)
+}
+
+/// The scan itself: start order, expire-before-start, split furthest-ending
+/// victim at the newcomer's start. Works on whole intervals (no holes): a
+/// value holds one home per segment, segments only split under pressure, and
+/// holes/re-homing are a later increment needing store/reload action ordering
+/// in emission. No dominance reasoning here.
+func scanCore(_ request: ScanRequest) -> ScanResult {
   let ordered = request.intervals.sorted {
     if $0.start != $1.start { return $0.start < $1.start }
     return $0.end < $1.end
@@ -193,22 +252,109 @@ public func linearScan(_ request: ScanRequest) -> ScanResult {
     inRegisters: inRegisters)
 }
 
-/// Build block-order intervals for every value in `function`: position = a
-/// per-block row (param row, one slot per instruction, one terminator slot).
-/// `defPos`/`usePos` number those rows. `mustSpill` marks values whose interval
-/// covers a clobber position (the backend passes those positions in).
+/// First store with a use the store does not dominate: some use of `value`
+/// at or after the split point sits in a block the store's block does not
+/// dominate (the store fires on one path while another path reads the slot
+/// before any store). Returns the store position and value for demotion.
+func firstUndominatedStore(
+  _ result: ScanResult, posBlock: [Int: Block],
+  dominates: (Block, Block) -> Bool, uses: [Value: [Int]]
+) -> (Int, Value)? {
+  for st in result.stores {
+    guard let storeBlock = posBlock[st.at] else { continue }
+    for u in uses[st.value] ?? [] where u >= st.at {
+      guard let useBlock = posBlock[u] else { continue }
+      if !dominates(storeBlock, useBlock) { return (st.at, st.value) }
+    }
+  }
+  return nil
+}
+
+/// Dominance over the successor map: `dom(s, u)` is true when every path
+/// from the entry block to `u` passes through `s`. Iterative dataflow over
+/// the predecessor map (entry dominates itself). Small and boring; the
+/// backend queries it once per slot segment, not per instruction.
+public func dominance(successors: [Block: [Block]], entry: Block) -> (Block, Block) -> Bool {
+  var preds: [Block: [Block]] = [:]
+  for (b, ss) in successors {
+    for s in ss { preds[s, default: []].append(b) }
+    if preds[b] == nil { preds[b] = [] }
+  }
+  if preds[entry] == nil { preds[entry] = [] }
+  // dom(entry) = {entry}; dom(other) = all blocks; iterate to fixpoint.
+  var all: Set<Block> = Set(preds.keys)
+  all.insert(entry)
+  var dom: [Block: Set<Block>] = [:]
+  for b in all { dom[b] = b == entry ? [entry] : all }
+  var changed = true
+  while changed {
+    changed = false
+    for b in all where b != entry {
+      let ps = preds[b] ?? []
+      var next: Set<Block> = ps.first.flatMap { dom[$0] } ?? []
+      for p in ps.dropFirst() { next.formIntersection(dom[p] ?? []) }
+      next.insert(b)
+      if next != dom[b] {
+        dom[b] = next
+        changed = true
+      }
+    }
+  }
+  return { s, u in dom[u]?.contains(s) ?? (s == u) }
+}
+
+/// Position -> block map from the builder's ranges: every numbered position
+/// (param rows, instructions, terminator slots) belongs to exactly one block.
+public func positionBlocks(_ positions: [Block: Range<Int>]) -> [Int: Block] {
+  var out: [Int: Block] = [:]
+  for (b, r) in positions { for p in r { out[p] = b } }
+  return out
+}
+
+/// Block layout plus intervals from one numbering pass. Member names match
+/// the old 5-tuple (`intervals`, `positions`, `instPos`, `termPos`,
+/// `successors`) so call sites read unchanged; `uses` adds every operand
+/// position per value for the dominance check.
+public struct BuiltIntervals: Sendable {
+  public var intervals: [LiveInterval]
+  public var positions: [Block: Range<Int>]
+  public var instPos: [Inst: Int]
+  public var termPos: [Block: Int]
+  public var successors: [Block: [Block]]
+  public var uses: [Value: [Int]]
+  public init(
+    intervals: [LiveInterval], positions: [Block: Range<Int>], instPos: [Inst: Int],
+    termPos: [Block: Int], successors: [Block: [Block]], uses: [Value: [Int]]
+  ) {
+    self.intervals = intervals
+    self.positions = positions
+    self.instPos = instPos
+    self.termPos = termPos
+    self.successors = successors
+    self.uses = uses
+  }
+}
+
 public func buildIntervals(
   function: Function,
   clobberPositions: Set<Int> = []
-) -> (
-  intervals: [LiveInterval],
-  positions: [Block: Range<Int>],
-  instPos: [Inst: Int],
-  termPos: [Block: Int]
-) {
+) -> BuiltIntervals {
+  var successors: [Block: [Block]] = [:]
+  for b in function.blocks {
+    if let t = function.terminator(of: b) {
+      switch t {
+      case .jump(let j): successors[b] = [j.target]
+      case .condBr(let c): successors[b] = [c.then, c.else]
+      default: successors[b] = []
+      }
+    } else {
+      successors[b] = []
+    }
+  }
   // Number every row first so def/use lookup is O(1).
   var defPos: [Value: Int] = [:]
   var lastUse: [Value: Int] = [:]
+  var usePos: [Value: [Int]] = [:]
   var blockRange: [Block: Range<Int>] = [:]
   var instPos: [Inst: Int] = [:]
   var termPos: [Block: Int] = [:]
@@ -224,6 +370,7 @@ public func buildIntervals(
       instPos[i] = pos
       for u in uses(of: function.opcode(i)) {
         lastUse[u] = pos
+        usePos[u, default: []].append(pos)
       }
       if let v = function.resultValue(of: i) {
         defPos[v] = pos
@@ -233,7 +380,10 @@ public func buildIntervals(
     }
     if let t = function.terminator(of: b) {
       termPos[b] = pos
-      for u in uses(of: t) { lastUse[u] = pos }
+      for u in uses(of: t) {
+        lastUse[u] = pos
+        usePos[u, default: []].append(pos)
+      }
       pos += 1  // terminator slot
     }
     blockRange[b] = base..<pos
@@ -244,7 +394,9 @@ public func buildIntervals(
     let spansClobber = clobberPositions.contains { $0 > d && $0 <= e }
     intervals.append(LiveInterval(value: v, start: d, end: e, mustSpill: spansClobber))
   }
-  return (intervals, blockRange, instPos, termPos)
+  return BuiltIntervals(
+    intervals: intervals, positions: blockRange, instPos: instPos, termPos: termPos,
+    successors: successors, uses: usePos)
 }
 
 /// Operand values read by an opcode (definitions excluded).

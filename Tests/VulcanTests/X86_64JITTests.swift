@@ -432,3 +432,37 @@ struct SplitTests {
     #expect(scan.segments.values.allSatisfy { $0.count == 1 })
   }
 }
+
+@Suite("split-store dominance")
+struct SplitDominanceTests {
+  @Test("split store inside a skipped body still reaches the use")
+  func skippedBodySplitStore() throws {
+    // Layout order: entry, body, skip, done. The body runs 9-deep pressure
+    // that splits x's interval; the skip arm jumps straight to done with x.
+    // x's store fires in the body, but the skip path must still read x's
+    // register value at done. If the scan puts done's read on a slot segment
+    // whose store only fires on the body path, f(0) miscompiles.
+    let (fn, i64, bool) = buildTestContext()
+    let entry = fn.appendBlock()
+    let x = fn.appendBlockParam(entry, i64)
+    let body = fn.appendBlock()
+    let skip = fn.appendBlock()
+    let done = fn.appendBlock()
+    let d = fn.appendBlockParam(done, i64)
+    let b = Builder(function: fn, block: entry)
+    let c = b.icmp(.eq, x, b.iconst(i64, 0), boolTy: bool)
+    b.condBr(c, then: skip, [], else: body, [])
+    let bb = Builder(function: fn, block: body)
+    var lane: [Value] = []
+    for _ in 0..<9 { lane.append(bb.arith(.add, x, x)) }
+    var acc = bb.iconst(i64, 0)
+    for v in lane { acc = bb.arith(.add, acc, v) }
+    bb.jump(done, [bb.arith(.add, acc, x)])
+    Builder(function: fn, block: skip).jump(done, [x])
+    Builder(function: fn, block: done).ret(d)
+    let j = try jitCompileModule(JITModule(functions: [NamedFunction(name: "f", function: fn)]))
+    let f: JitFn1 = j.entry(as: JitFn1.self, name: "f")!
+    #expect(f(0) == 0)  // skipped path: x untouched
+    #expect(f(1) == 19)  // 9*2 + 1
+  }
+}
