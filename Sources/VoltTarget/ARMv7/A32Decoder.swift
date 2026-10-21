@@ -24,6 +24,8 @@ public struct A32DecodedInstruction: Sendable, Equatable {
   public let pc: UInt32
   public let word: UInt32
   public let instruction: A32Instruction
+  /// Carry-out from the immediate shifter, when one is encoded and nonzero.
+  public let shifterCarry: Bool?
 }
 
 public enum A32DecodeError: Error, Sendable, Equatable {
@@ -86,8 +88,30 @@ public enum ARMv7A32Decoder {
     } else {
       throw A32DecodeError.unsupported(pc: pc, word: w)
     }
-    return A32DecodedInstruction(pc: pc, word: w, instruction: instruction)
+    let immediateShifterCarry: Bool? = {
+      guard w & 0x0C00_0000 == 0, w & 0x0200_0000 != 0 else { return nil }
+      let rotate = Int((w >> 8) & 15) * 2
+      guard rotate != 0 else { return nil }
+      let imm8 = w & 0xFF
+      let imm = (imm8 >> rotate) | (imm8 << (32 - rotate))
+      return imm & 0x8000_0000 != 0
+    }()
+    let writesPC: Bool
+    switch instruction {
+    case .movImmediate(let rd, _, _), .mvnImmediate(let rd, _, _): writesPC = rd == 15
+    case .movRegister(let rd, let rm, _), .mvnRegister(let rd, let rm, _): writesPC = rd == 15 || rm == 15
+    case .andImmediate(let rd, let rn, _, _), .eorImmediate(let rd, let rn, _, _),
+      .orrImmediate(let rd, let rn, _, _): writesPC = rd == 15 || rn == 15
+    case .andRegister(let rd, let rn, let rm, _), .eorRegister(let rd, let rn, let rm, _),
+      .orrRegister(let rd, let rn, let rm, _): writesPC = rd == 15 || rn == 15 || rm == 15
+    case .addImmediate(let rd, let rn, _, _), .subImmediate(let rd, let rn, _, _):
+      writesPC = rd == 15 || rn == 15
+    case .addRegister(let rd, let rn, let rm, _), .subRegister(let rd, let rn, let rm, _):
+      writesPC = rd == 15 || rn == 15 || rm == 15
+    case .bxLR, .svc: writesPC = false
+    }
+    guard !writesPC else { throw A32DecodeError.unsupported(pc: pc, word: w) }
+    return A32DecodedInstruction(pc: pc, word: w, instruction: instruction, shifterCarry: immediateShifterCarry)
   }
 }
-
 #endif

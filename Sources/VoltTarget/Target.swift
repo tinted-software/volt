@@ -199,6 +199,7 @@ public final class ExecutableMemory {
   public init(byteCount: Int) throws {
     guard byteCount > 0 else { throw JITMemoryError.empty }
     let page = systemPageSize()
+    guard byteCount <= Int.max - (page - 1) else { throw JITMemoryError.outOfBounds }
     let mapped = (byteCount + page - 1) & ~(page - 1)
     let prot = PROT_READ | PROT_WRITE
     let flags = MAP_PRIVATE | MAP_ANONYMOUS
@@ -213,12 +214,18 @@ public final class ExecutableMemory {
   /// Write `bytes` at `offset`. Traps in debug builds after `protectExecutable`.
   public func write(_ bytes: [UInt8], at offset: Int = 0) throws {
     precondition(offset >= 0, "negative write offset")
-    guard offset + bytes.count <= byteCount else { throw JITMemoryError.outOfBounds }
+    guard offset <= byteCount, bytes.count <= byteCount - offset else {
+      throw JITMemoryError.outOfBounds
+    }
     guard !bytes.isEmpty else { return }
     precondition(!isExecutable, "writing to finalized executable buffer")
     bytes.withUnsafeBufferPointer { src in
       (base + offset).copyMemory(from: src.baseAddress!, byteCount: bytes.count)
     }
+  }
+
+  deinit {
+    _ = munmap(base, mappedSize)
   }
 
   /// Flip the mapping to read+execute and synchronize the instruction cache.
@@ -232,7 +239,11 @@ public final class ExecutableMemory {
   }
   /// A typed callable pointer at `offset` (e.g. `@convention(c) (Int64) -> Int64`).
   /// Reinterprets the address itself — it does NOT load a pointer from code.
+  /// The offset must identify a byte inside this mapping; the returned callable
+  /// pointer must not outlive this `ExecutableMemory` instance.
   public func entry<T>(as type: T.Type, offset: Int = 0) -> T {
+    precondition(offset >= 0 && offset < byteCount, "entry offset outside executable mapping")
+    precondition(isExecutable, "mapping must be executable before obtaining an entry")
     return unsafeBitCast(base + offset, to: T.self)
   }
 }

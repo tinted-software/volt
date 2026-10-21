@@ -49,7 +49,15 @@ public enum ARMv7Disassembler: Disassembler {
       let rn = (w >> 16) & 15
       let rd = (w >> 12) & 15
       let imm = w & 0xFFF
-      let offset = w & 0x0200_0000 != 0 ? "\(reg(w & 15)), lsl #\((w >> 7) & 31)" : "#\(imm)"
+      let offset: String
+      if w & 0x0200_0000 == 0 {
+        offset = "#\(imm)"
+      } else {
+        let shift = (w >> 5) & 3
+        let amount = (w >> 7) & 31
+        let shiftNames = ["lsl", "lsr", "asr", "ror"]
+        offset = "\(reg(w & 15)), \(shiftNames[Int(shift)]) #\(amount)"
+      }
       let sign = up ? "" : "-"
       let address =
         pre
@@ -73,10 +81,21 @@ public enum ARMv7Disassembler: Disassembler {
         let value = (w & 255).rotatedRight(by: Int(((w >> 8) & 15) * 2))
         op2 = "#\(hex(value, 0))"
       } else {
-        op2 =
-          reg(w & 15)
-          + ((w >> 4) & 1 != 0
-            ? ", " + ["lsl", "lsr", "asr", "ror"][Int((w >> 5) & 3)] + " #\((w >> 7) & 31)" : "")
+        let rm = reg(w & 15)
+        let shiftType = Int((w >> 5) & 3)
+        if w & 0x10 == 0 {
+          let amount = (w >> 7) & 31
+          if amount == 0 && shiftType == 0 {
+            op2 = rm
+          } else if amount == 0 && shiftType == 3 {
+            op2 = rm + ", rrx"
+          } else {
+            let effectiveAmount = amount == 0 ? 32 : amount
+            op2 = rm + ", " + ["lsl", "lsr", "asr", "ror"][shiftType] + " #\(effectiveAmount)"
+          }
+        } else {
+          op2 = rm + ", " + ["lsl", "lsr", "asr", "ror"][shiftType] + " " + reg((w >> 8) & 15)
+        }
       }
       if opcode >= 8 && opcode <= 11 { return "\(name)\(suffix) \(reg(rn)), \(op2)" }
       if opcode == 13 || opcode == 15 {
@@ -162,5 +181,4 @@ extension UInt32 {
     count == 0 ? self : (self >> count) | (self << (32 - count))
   }
 }
-
 #endif

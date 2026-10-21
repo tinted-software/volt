@@ -209,8 +209,8 @@ public func shiftImm(_ digit: ShiftDigit, _ dst: Reg, _ count: UInt8, _ w: Bool)
 public func shiftCl(_ digit: UInt8, _ dst: Reg, _ w: Bool) -> [UInt8] {
   let mrm: UInt8 = 0xC0 | (digit << 3) | (dst.rawValue & 7)
   var out: [UInt8] = []
-  if w || dst.rawValue >= 8 {
-    out.append(0x48 | (dst.rawValue >= 8 ? 1 : 0))
+  if let rex = rexOne(dst.rawValue >= 8, w) {
+    out.append(rex)
   }
   out += [0xD3, mrm]
   return out
@@ -450,5 +450,4 @@ public func popReg(_ r: Reg) -> [UInt8] {
 
 /// `ret` (near return).
 public func x86Ret() -> [UInt8] { [0xC3] }
-
 #endif

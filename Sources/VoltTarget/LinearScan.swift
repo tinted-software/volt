@@ -388,11 +388,77 @@ public func buildIntervals(
     }
     blockRange[b] = base..<pos
   }
+  // Compute block liveness to a fixed point. Linear use positions alone miss
+  // values carried through blocks with no local use, notably loop invariants
+  // whose textual last use precedes the loop body in layout order.
+  var blockUse: [Block: Set<Value>] = [:]
+  var blockDef: [Block: Set<Value>] = [:]
+  for b in function.blocks {
+    var defined = Set(function.params(of: b))
+    var used = Set<Value>()
+    func recordUses(_ values: [Value]) {
+      for value in values where !defined.contains(value) { used.insert(value) }
+    }
+    for i in function.instructions(in: b) {
+      recordUses(uses(of: function.opcode(i)))
+      if let value = function.resultValue(of: i) { defined.insert(value) }
+    }
+    if let term = function.terminator(of: b) { recordUses(uses(of: term)) }
+    blockUse[b] = used
+    blockDef[b] = defined
+  }
+  var liveIn = Dictionary(uniqueKeysWithValues: function.blocks.map { ($0, Set<Value>()) })
+  var liveOut = liveIn
+  var changed = true
+  while changed {
+    changed = false
+    for b in function.blocks.reversed() {
+      var out = Set<Value>()
+      for succ in successors[b] ?? [] {
+        let params = function.params(of: succ)
+        let successorLive = liveIn[succ] ?? []
+        out.formUnion(successorLive.subtracting(params))
+        let edgeArgs: [[Value]]
+        guard let term = function.terminator(of: b) else { continue }
+        switch term {
+        case .jump(let jump) where jump.target == succ: edgeArgs = [jump.args]
+        case .condBr(let branch):
+          var args: [[Value]] = []
+          if branch.then == succ { args.append(branch.thenArgs) }
+          if branch.else == succ { args.append(branch.elseArgs) }
+          edgeArgs = args
+        default: edgeArgs = []
+        }
+        for args in edgeArgs where args.count == params.count {
+          // Conservatively keep every incoming argument live across this edge;
+          // dead block parameters will be removed by a future IR simplifier.
+          for (_, arg) in zip(params, args) { out.insert(arg) }
+        }
+      }
+      let incoming = (blockUse[b] ?? []).union(out.subtracting(blockDef[b] ?? []))
+      if out != liveOut[b] || incoming != liveIn[b] {
+        liveOut[b] = out
+        liveIn[b] = incoming
+        changed = true
+      }
+    }
+  }
+
+  var extendedStart = defPos
+  var extendedEnd = lastUse
+  for b in function.blocks {
+    guard let range = blockRange[b], let term = termPos[b] else { continue }
+    for value in (liveIn[b] ?? []).union(liveOut[b] ?? []) where defPos[value] != nil {
+      extendedStart[value] = min(extendedStart[value] ?? range.lowerBound, range.lowerBound)
+      extendedEnd[value] = max(extendedEnd[value] ?? term, term)
+    }
+  }
   var intervals: [LiveInterval] = []
   for (v, d) in defPos {
-    let e = lastUse[v] ?? d
-    let spansClobber = clobberPositions.contains { $0 > d && $0 <= e }
-    intervals.append(LiveInterval(value: v, start: d, end: e, mustSpill: spansClobber))
+    let start = extendedStart[v] ?? d
+    let e = extendedEnd[v] ?? d
+    let spansClobber = clobberPositions.contains { $0 > start && $0 <= e }
+    intervals.append(LiveInterval(value: v, start: start, end: e, mustSpill: spansClobber))
   }
   return BuiltIntervals(
     intervals: intervals, positions: blockRange, instPos: instPos, termPos: termPos,

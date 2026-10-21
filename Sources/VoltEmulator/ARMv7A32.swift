@@ -1,6 +1,7 @@
 #if ARMv7Emulator
   import VoltIR
   import VoltTarget
+  import VoltTarget
 
   /// Guest-visible A32 state with sixteen 32-bit registers and CPSR.
   public struct ARMv7A32State {
@@ -79,7 +80,7 @@
         b.store(b.arith(.bitOr, kept, flags), cpsrPtr)
       }
       // Logical S-form: N/Z from the result, C/V preserved.
-      func storeNZ(result: Value) {
+      func storeNZ(result: Value, shifterCarry: Bool? = nil) {
         let cpsrPtr = b.ptrAdd(state, byteOffset: cpsrOffset)
         let old = b.load(i32, cpsrPtr)
         let zero = b.iconst(i32, 0)
@@ -88,7 +89,14 @@
         let zBit = b.select(b.icmp(.eq, result, zero, boolTy: boolTy), one, zero)
         let nz = b.arith(.bitOr, b.arithImm(.shl, nBit, 31), b.arithImm(.shl, zBit, 30))
         let nzMasked = b.arithImm(.bitAnd, nz, Int64(0xC000_0000))
-        let cv = b.arithImm(.bitAnd, old, Int64(0x3000_0000))
+        let preservedCV = b.arithImm(.bitAnd, old, Int64(0x3000_0000))
+        let cv: Value
+        if let shifterCarry {
+          let carryBit = b.iconst(i32, shifterCarry ? Int64(0x2000_0000) : 0)
+          cv = b.arith(.bitOr, b.arithImm(.bitAnd, preservedCV, Int64(0x1000_0000)), carryBit)
+        } else {
+          cv = preservedCV
+        }
         let low = b.arithImm(.bitAnd, old, Int64(0x0FFF_FFFF))
         b.store(b.arith(.bitOr, low, b.arith(.bitOr, cv, nzMasked)), cpsrPtr)
       }
@@ -127,9 +135,9 @@
         let v = b.arith(.bitAnd, axb, axr)
         return b.arithImm(.bitAnd, b.arithImm(.shr, v, 31), 1)
       }
-      // ISel lowers i32 arithmetic as 64-bit ops, so clear the high half:
-      // shl 32 then logical shr 32 keeps the low 32 bits.
-      func mask32(_ v: Value) -> Value { b.arithImm(.shr, b.arithImm(.shl, v, 32), 32) }
+      // The x86_64 selector lowers u32 arithmetic at 32-bit width, which
+      // zero-extends results directly into the 64-bit register.
+      func mask32(_ v: Value) -> Value { v }
       func emitAdd(rd: UInt8, a: Value, bb: Value, s: Bool) {
         let r = mask32(b.arith(.add, a, bb))
         b.store(r, b.ptrAdd(state, byteOffset: Int64(rd) * 4))
@@ -148,34 +156,35 @@
             overflow: overflowSub(a: a, bb: bb, r: r))
         }
       }
-      func emitLogic(rd: UInt8, r: Value, s: Bool) {
+      func emitLogic(rd: UInt8, r: Value, s: Bool, shifterCarry: Bool? = nil) {
         let r = mask32(r)
         b.store(r, b.ptrAdd(state, byteOffset: Int64(rd) * 4))
-        if s { storeNZ(result: r) }
+        if s { storeNZ(result: r, shifterCarry: shifterCarry) }
       }
       for d in decoded {
         let regOffset: (UInt8) -> Int64 = { Int64($0) * 4 }
         func loadReg(_ r: UInt8) -> Value { b.load(i32, b.ptrAdd(state, byteOffset: regOffset(r))) }
         switch d.instruction {
         case .movImmediate(let rd, let value, let s):
-          emitLogic(rd: rd, r: b.iconst(i32, Int64(value)), s: s)
+          emitLogic(rd: rd, r: b.iconst(i32, Int64(value)), s: s, shifterCarry: d.shifterCarry)
         case .movRegister(let rd, let rm, let s):
           emitLogic(rd: rd, r: loadReg(rm), s: s)
         case .mvnImmediate(let rd, let value, let s):
           emitLogic(
-            rd: rd, r: b.arithImm(.bitXor, b.iconst(i32, Int64(value)), Int64(0xFFFF_FFFF)), s: s)
+            rd: rd, r: b.arithImm(.bitXor, b.iconst(i32, Int64(value)), Int64(0xFFFF_FFFF)), s: s,
+            shifterCarry: d.shifterCarry)
         case .mvnRegister(let rd, let rm, let s):
           emitLogic(rd: rd, r: b.arithImm(.bitXor, loadReg(rm), Int64(0xFFFF_FFFF)), s: s)
         case .andImmediate(let rd, let rn, let value, let s):
-          emitLogic(rd: rd, r: b.arithImm(.bitAnd, loadReg(rn), Int64(value)), s: s)
+          emitLogic(rd: rd, r: b.arithImm(.bitAnd, loadReg(rn), Int64(value)), s: s, shifterCarry: d.shifterCarry)
         case .andRegister(let rd, let rn, let rm, let s):
           emitLogic(rd: rd, r: b.arith(.bitAnd, loadReg(rn), loadReg(rm)), s: s)
         case .eorImmediate(let rd, let rn, let value, let s):
-          emitLogic(rd: rd, r: b.arithImm(.bitXor, loadReg(rn), Int64(value)), s: s)
+          emitLogic(rd: rd, r: b.arithImm(.bitXor, loadReg(rn), Int64(value)), s: s, shifterCarry: d.shifterCarry)
         case .eorRegister(let rd, let rn, let rm, let s):
           emitLogic(rd: rd, r: b.arith(.bitXor, loadReg(rn), loadReg(rm)), s: s)
         case .orrImmediate(let rd, let rn, let value, let s):
-          emitLogic(rd: rd, r: b.arithImm(.bitOr, loadReg(rn), Int64(value)), s: s)
+          emitLogic(rd: rd, r: b.arithImm(.bitOr, loadReg(rn), Int64(value)), s: s, shifterCarry: d.shifterCarry)
         case .orrRegister(let rd, let rn, let rm, let s):
           emitLogic(rd: rd, r: b.arith(.bitOr, loadReg(rn), loadReg(rm)), s: s)
         case .addImmediate(let rd, let rn, let value, let s):

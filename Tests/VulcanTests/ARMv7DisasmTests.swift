@@ -1,5 +1,4 @@
 #if ARMv7
-#if ARMv7
   import Testing
   import VoltTarget
 
@@ -17,8 +16,7 @@
         ARMv7Disassembler.disassembleOne(code: [0xFF, 0xFF, 0xFF, 0xFF], at: 0)?.text
           == ".word 0xffffffff")
       #expect(ARMv7Disassembler.disassembleOne(code: [1, 2, 3], at: 0) == nil)
+      #expect(ARMv7Disassembler.disassembleOne(code: [0x81, 0x00, 0xA0, 0xE1], at: 0)?.text == "mov r0, r1, lsl #1")
     }
   }
-#endif
-
 #endif

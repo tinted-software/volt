@@ -22,7 +22,6 @@ do {
 } catch {
   print("jit failed: \(error)")
 }
-
 #else
 import Foundation
 print("volt-jit requires the X86_64 package trait")

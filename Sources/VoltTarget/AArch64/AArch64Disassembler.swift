@@ -580,6 +580,13 @@ func decodeWord(_ w: UInt32) -> String {
 
   // Bitfield move (SBFM/UBFM/BFM) with the usual aliases.
   if w & 0x1F80_0000 == 0x1300_0000, (w >> 29) & 3 != 3 {
+    let width: UInt32 = sf(w) ? 64 : 32
+    let n = (w >> 22) & 1
+    let immr = (w >> 16) & 0x3F
+    let imms = (w >> 10) & 0x3F
+    guard n == (sf(w) ? 1 : 0), immr < width, imms < width else {
+      return ".word 0x\(hex(UInt64(w), width: 8))"
+    }
     return bitfield(w)
   }
 
@@ -655,7 +662,7 @@ public enum AArch64Disassembler: Disassembler {
   /// Decode one instruction at `code[offset]` (little-endian word); nil when truncated.
   /// Unknown encodings return a `.word` directive, never nil.
   public static func disassembleOne(code: [UInt8], at offset: Int) -> (text: String, length: Int)? {
-    guard offset + 4 <= code.count else { return nil }
+    guard offset >= 0, offset <= code.count, code.count - offset >= 4 else { return nil }
     return (decodeWord(readWordLE(code, offset)), 4)
   }
 
@@ -728,5 +735,4 @@ public enum AArch64Disassembler: Disassembler {
     return out
   }
 }
-
 #endif

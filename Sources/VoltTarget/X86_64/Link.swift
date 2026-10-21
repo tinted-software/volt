@@ -97,5 +97,4 @@ public final class JittedModule {
 public func jitCompileModule(_ module: JITModule, names: [String]? = nil) throws -> JittedModule {
   try JittedModule(linked: compileModule(module, names: names))
 }
-
 #endif

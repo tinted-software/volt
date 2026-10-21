@@ -35,12 +35,14 @@ let poolRegs: [Reg] = [.r15, .r14, .r13, .r12, .rbx, .r9, .r8, .rsi, .rdi]
 let calleeSavedRegs: Set<Reg> = [.rbx, .r12, .r13, .r14, .r15]
 
 /// Lower `function` to machine code plus its call relocations.
-/// - Precondition: every block ends in a terminator; block params are i64-width
-///   integers (the v1 ABI carries all values as 64-bit slots).
+/// - Precondition: every block ends in a terminator. Supports signed i64 and
+///   unsigned u32 values, bool conditions, and pointers; unsupported IR types
+///   or mismatched operands fail closed.
 public func compileFunction(_ function: Function) throws -> CompiledCode {
   guard function.blockCount() > 0 else {
     throw CodegenError.invalidFunction("no blocks")
   }
+  try validateSupportedTypes(function)
   var ctx = ISelContext(function: function)
   try ctx.run()
   return CompiledCode(bytes: ctx.code, relocs: ctx.relocs)
@@ -52,6 +54,7 @@ public func allocateFunction(_ function: Function) throws -> ScanResult {
   guard function.blockCount() > 0 else {
     throw CodegenError.invalidFunction("no blocks")
   }
+  try validateSupportedTypes(function)
   let clobbers = clobberPositions(function)
   let built = buildIntervals(function: function, clobberPositions: clobbers)
   let pool = Array(0..<poolRegs.count)
@@ -61,8 +64,76 @@ public func allocateFunction(_ function: Function) throws -> ScanResult {
     posBlock: positionBlocks(built.positions), dominates: dom, uses: built.uses)
 }
 
-/// Instruction positions (in `buildIntervals` numbering) that clobber
-/// caller-saved registers: calls clobber them all; `div`/`rem` need rax/rdx.
+/// Fail closed on IR widths and types whose machine semantics are not lowered.
+/// The backend supports signed i64 and unsigned i32 values, plus bool and ptr.
+func validateSupportedTypes(_ function: Function) throws {
+  for type in function.valueTypes {
+    switch type.kind {
+    case .bool, .ptr: break
+    case .int(let signed, let bits) where (signed && bits == 64) || (!signed && bits == 32): break
+    default:
+      throw CodegenError.unsupported("x86_64 integer subset requires i64, u32, bool, or ptr; got \(type)")
+    }
+  }
+  func require(_ condition: Bool, _ message: String) throws {
+    if !condition { throw CodegenError.invalidFunction(message) }
+  }
+  for block in function.blocks {
+    guard let term = function.terminator(of: block) else {
+      throw CodegenError.invalidFunction("block \(block.raw) has no terminator")
+    }
+    if case .ret(let ret) = term, ret.values.count > 1 {
+      throw CodegenError.unsupported("multiple return values")
+    }
+    func checkEdge(_ target: Block, _ args: [Value]) throws {
+      guard target.raw < UInt32(function.blockCount()) else {
+        throw CodegenError.invalidFunction("branch target out of range")
+      }
+      let params = function.params(of: target)
+      try require(args.count == params.count, "block argument arity mismatch")
+      for (arg, param) in zip(args, params) {
+        try require(function.valueType(of: arg) == function.valueType(of: param), "block argument type mismatch")
+      }
+    }
+    switch term {
+    case .jump(let jump): try checkEdge(jump.target, jump.args)
+    case .condBr(let branch):
+      try require(function.valueType(of: branch.cond).kind == .bool, "branch condition must be bool")
+      try checkEdge(branch.then, branch.thenArgs)
+      try checkEdge(branch.else, branch.elseArgs)
+    default: break
+    }
+    for inst in function.instructions(in: block) {
+      let result = function.resultValue(of: inst).map { function.valueType(of: $0) }
+      let op = function.opcode(inst)
+      switch op {
+      case .arith(let a):
+        try require(function.valueType(of: a.lhs) == function.valueType(of: a.rhs) && result == function.valueType(of: a.lhs), "arithmetic type mismatch")
+      case .arithImm(let a):
+        try require(result == function.valueType(of: a.lhs), "immediate arithmetic type mismatch")
+      case .cmp(let c):
+        try require(function.valueType(of: c.lhs) == function.valueType(of: c.rhs) && result?.kind == .bool, "comparison type mismatch")
+      case .select(let s):
+        try require(function.valueType(of: s.cond).kind == .bool && function.valueType(of: s.then) == function.valueType(of: s.else) && result == function.valueType(of: s.then), "select type mismatch")
+      case .ptrAdd(let p):
+        try require(function.valueType(of: p.base) == result && { if case .ptr = function.valueType(of: p.base).kind { return true }; return false }(), "ptrAdd requires matching pointer types")
+      case .load(let l):
+        try require({ if case .ptr = function.valueType(of: l.ptr).kind { return true }; return false }() && result != nil, "load requires a pointer")
+      case .store(let s):
+        try require({ if case .ptr = function.valueType(of: s.ptr).kind { return true }; return false }(), "store requires a pointer")
+      default: break
+      }
+    }
+  }
+}
+
+func is64Bit(_ function: Function, _ value: Value) -> Bool {
+  switch function.valueType(of: value).kind {
+  case .int(_, 32): return false
+  default: return true
+  }
+}
+
 func clobberPositions(_ function: Function) -> Set<Int> {
   var out = Set<Int>()
   var pos = 0
@@ -321,7 +392,13 @@ struct ISelContext {
     case .iconst(let imm):
       let v = resultOf(inst)
       let d = defReg(v, fallback: .rax)
-      if imm >= Int64(Int32.min), imm <= Int64(Int32.max) {
+      let is64 = is64Bit(function, v)
+      if !is64 {
+        guard imm >= 0, imm <= Int64(UInt32.max) else {
+          throw CodegenError.invalidFunction("u32 constant out of range")
+        }
+        code += movImm(d, Int32(bitPattern: UInt32(truncatingIfNeeded: imm)), false)
+      } else if imm >= Int64(Int32.min), imm <= Int64(Int32.max) {
         code += movImm(d, Int32(imm), true)
       } else if d == .rax {
         code += movImm64(d, UInt64(bitPattern: imm))
@@ -359,8 +436,10 @@ struct ISelContext {
         }
       }
       code += testRR(.rax, .rax, true)
-      code += cmovcc(t, e, .e)  // if cond==0, dst = else
-      commitReg(t, resultOf(inst))
+      let d = defReg(resultOf(inst), fallback: .rax)
+      if d != t { code += movReg(d, t) }
+      code += cmovcc(d, e, .e)  // if cond==0, dst = else
+      commitReg(d, resultOf(inst))
 
     case .call(let c):
       try emitCall(symbolIndex: c.symbol, args: c.args, dst: resultOfOrNil(inst))
@@ -444,24 +523,31 @@ struct ISelContext {
       if a != .rax { code += movReg(.rax, a) }
       let b = operandReg(rhs, scratch: .rcx)
       if b != .rcx { code += movReg(.rcx, b) }
-      code += cqo()
-      code += idiv(.rcx, true)
+      let wide = is64Bit(function, lhs)
+      if wide {
+        code += cqo()
+        code += idiv(.rcx, true)
+      } else {
+        code += movImm(.rdx, 0, false)
+        code += divu(.rcx, false)
+      }
       // quotient in rax, remainder in rdx.
       commitReg(op == .div ? .rax : .rdx, dst)
     case .mul:
       let (d, l, r) = prepareBinary(lhs: lhs, rhs: rhs, dst: dst)
       if d != l { code += movReg(d, l) }
-      code += imulRR(d, r, true)
+      code += imulRR(d, r, is64Bit(function, dst))
       commitReg(d, dst)
     case .add, .sub, .bitAnd, .bitOr, .bitXor:
       let (d, l, r) = prepareBinary(lhs: lhs, rhs: rhs, dst: dst)
       if d != l { code += movReg(d, l) }
+      let wide = is64Bit(function, dst)
       switch op {
-      case .add: code += addRR(d, r, true)
-      case .sub: code += subRR(d, r, true)
-      case .bitAnd: code += andRR(d, r, true)
-      case .bitOr: code += orRR(d, r, true)
-      default: code += xorRR(d, r, true)
+      case .add: code += addRR(d, r, wide)
+      case .sub: code += subRR(d, r, wide)
+      case .bitAnd: code += andRR(d, r, wide)
+      case .bitOr: code += orRR(d, r, wide)
+      default: code += xorRR(d, r, wide)
       }
       commitReg(d, dst)
     case .shl, .shr:
@@ -471,7 +557,7 @@ struct ISelContext {
       if k != .rcx { code += movReg(.rcx, k) }
       let d = defReg(dst, fallback: scratch1)
       if d != l { code += movReg(d, l) }
-      code += shiftCl(op == .shl ? 4 : 5, d, true)
+      code += shiftCl(op == .shl ? 4 : 5, d, is64Bit(function, dst))
       commitReg(d, dst)
     case .mulH:
       throw CodegenError.unsupported("mulh")
@@ -482,34 +568,39 @@ struct ISelContext {
     let l = operandReg(lhs, scratch: scratch1)
     let d = defReg(dst, fallback: scratch1)
     if d != l { code += movReg(d, l) }
-    guard imm >= Int64(Int32.min), imm <= Int64(Int32.max) else {
+    let wide = is64Bit(function, dst)
+    guard wide ? (imm >= Int64(Int32.min) && imm <= Int64(Int32.max)) : (imm >= 0 && imm <= Int64(UInt32.max)) else {
       // Wide immediate: materialize in scratch2, fall back to reg-reg.
-      code += movImm64(scratch2, UInt64(bitPattern: imm))
+      if wide {
+        code += movImm64(scratch2, UInt64(bitPattern: imm))
+      } else {
+        code += movImm(scratch2, Int32(bitPattern: UInt32(truncatingIfNeeded: imm)), false)
+      }
       switch op {
-      case .add: code += addRR(d, scratch2, true)
-      case .sub: code += subRR(d, scratch2, true)
-      case .bitAnd: code += andRR(d, scratch2, true)
-      case .bitOr: code += orRR(d, scratch2, true)
-      case .bitXor: code += xorRR(d, scratch2, true)
-      case .mul: code += imulRR(d, scratch2, true)
+      case .add: code += addRR(d, scratch2, wide)
+      case .sub: code += subRR(d, scratch2, wide)
+      case .bitAnd: code += andRR(d, scratch2, wide)
+      case .bitOr: code += orRR(d, scratch2, wide)
+      case .bitXor: code += xorRR(d, scratch2, wide)
+      case .mul: code += imulRR(d, scratch2, wide)
       default:
         throw CodegenError.unsupported("arith-imm \(op)")
       }
       commitReg(d, dst)
       return
     }
-    let i32imm = Int32(imm)
+    let i32imm = Int32(bitPattern: UInt32(truncatingIfNeeded: imm))
     switch op {
-    case .add: code += aluImm(.add, d, i32imm, true)
-    case .sub: code += aluImm(.sub, d, i32imm, true)
-    case .bitAnd: code += aluImm(.and, d, i32imm, true)
-    case .bitOr: code += aluImm(.orr, d, i32imm, true)
-    case .bitXor: code += aluImm(.xor, d, i32imm, true)
-    case .mul: code += imulImm(d, d, i32imm, true)
-    case .shl where imm >= 0 && imm < 64:
-      code += shiftImm(.shl, d, UInt8(imm), true)
-    case .shr where imm >= 0 && imm < 64:
-      code += shiftImm(.shr, d, UInt8(imm), true)
+    case .add: code += aluImm(.add, d, i32imm, wide)
+    case .sub: code += aluImm(.sub, d, i32imm, wide)
+    case .bitAnd: code += aluImm(.and, d, i32imm, wide)
+    case .bitOr: code += aluImm(.orr, d, i32imm, wide)
+    case .bitXor: code += aluImm(.xor, d, i32imm, wide)
+    case .mul: code += imulImm(d, d, i32imm, wide)
+    case .shl where imm >= 0 && imm < (wide ? 64 : 32):
+      code += shiftImm(.shl, d, UInt8(imm), wide)
+    case .shr where imm >= 0 && imm < (wide ? 64 : 32):
+      code += shiftImm(.shr, d, UInt8(imm), wide)
     default:
       throw CodegenError.unsupported("arith-imm \(op)")
     }
@@ -521,15 +612,18 @@ struct ISelContext {
     // so no routing is needed even when both operands share a register.
     let l = operandReg(lhs, scratch: scratch1)
     let r = operandReg(rhs, scratch: scratch2)
-    code += cmpRR(l, r, true)
+    let wide = is64Bit(function, lhs)
+    code += cmpRR(l, r, wide)
+    let unsigned: Bool
+    if case .int(let signed, _) = function.valueType(of: lhs).kind { unsigned = !signed } else { unsigned = false }
     let cond: Cond
     switch op {
     case .eq: cond = .e
     case .ne: cond = .ne
-    case .lt: cond = .l
-    case .le: cond = .le
-    case .gt: cond = .g
-    case .ge: cond = .ge
+    case .lt: cond = unsigned ? .b : .l
+    case .le: cond = unsigned ? .be : .le
+    case .gt: cond = unsigned ? .a : .g
+    case .ge: cond = unsigned ? .ae : .ge
     }
     code += setcc(.rax, cond)
     code += movzxByte(.rax, .rax)
@@ -712,5 +806,4 @@ func describe(_ op: Opcode) -> String {
   default: return "other"
   }
 }
-
 #endif

@@ -95,6 +95,25 @@
       #expect(state.cpsr == 0x4000_0000)
     }
 
+    @Test("rotated MOVS immediate updates carry")
+    func rotatedMovsCarry() throws {
+      let bytes: [UInt8] = [0x02, 0x01, 0xB0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1]
+      var state = ARMv7A32State()
+      try ARMv7A32Runner.run(bytes, state: &state)
+      #expect(state[0] == 0x8000_0000)
+      #expect(state.cpsr == 0xA000_0000)
+    }
+
+    @Test("PC operands are rejected")
+    func pcOperandRejected() throws {
+      do {
+        _ = try ARMv7A32Lifter.lift([0x0F, 0x00, 0xA0, 0xE1], pc: 0x1000)
+        Issue.record("expected PC operand rejection")
+      } catch let error as ARMv7EmulatorError {
+        #expect(error == .unsupportedInstruction(pc: 0x1000, word: 0xE1A0_000F))
+      }
+    }
+
     @Test("ANDS preserves carry from earlier ADDS")
     func andsPreservesCarry() throws {
       let bytes: [UInt8] = [

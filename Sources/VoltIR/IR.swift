@@ -271,6 +271,8 @@ public final class Function {
   // Per-value type and defining inst (nil = block parameter), in value order.
   public private(set) var valueTypes: [Type] = []
   public private(set) var valueDefs: [Inst?] = []
+  // Result value by instruction id; nil for instructions without results.
+  public private(set) var instResults: [Value?] = []
 
   public init() {}
 
@@ -300,6 +302,7 @@ public final class Function {
     instOpcodes.append(op)
     instResultTypes.append(ty)
     let v = Value(raw: UInt32(valueTypes.count))
+    instResults.append(v)
     valueTypes.append(ty)
     valueDefs.append(i)
     blockInsts[Int(block.raw)].append(i)
@@ -310,17 +313,13 @@ public final class Function {
   public func instForValue(_ value: Value) -> Inst? { valueDefs[Int(value.raw)] }
 
   /// The result value produced by `inst` (nil for stores, which produce none).
-  public func resultValue(of inst: Inst) -> Value? {
-    for (idx, def) in valueDefs.enumerated() where def == inst {
-      return Value(raw: UInt32(idx))
-    }
-    return nil
-  }
+  public func resultValue(of inst: Inst) -> Value? { instResults[Int(inst.raw)] }
 
   /// Append a store (no result).
   public func appendStore(_ block: Block, value: Value, ptr: Value) {
     let i = Inst(raw: UInt32(instOpcodes.count))
     instOpcodes.append(.store(Store(value: value, ptr: ptr, isVolatile: false)))
+    instResults.append(nil)
     blockInsts[Int(block.raw)].append(i)
   }
 

@@ -34,6 +34,51 @@ struct X86_64JITTests {
     #expect(f(0) == 42)
   }
 
+  @Test("u32 arithmetic wraps and comparisons are unsigned")
+  func unsigned32Semantics() throws {
+    let fn = Function()
+    let u32 = fn.types.intern(.int(signedness: false, bits: 32))
+    let entry = fn.appendBlock()
+    let x = fn.appendBlockParam(entry, u32)
+    let y = fn.appendBlockParam(entry, u32)
+    let b = Builder(function: fn, block: entry)
+    let sum = b.arith(.add, x, y)
+    b.ret(sum)
+    let j = try jitCompileModule(JITModule(functions: [NamedFunction(name: "u32", function: fn)]))
+    typealias U32Fn = @convention(c) (UInt32, UInt32) -> UInt32
+    let add: U32Fn = j.entry(as: U32Fn.self, name: "u32")!
+    #expect(add(UInt32.max, 1) == 0)
+
+    let compare = Function()
+    let cu32 = compare.types.intern(.int(signedness: false, bits: 32))
+    let cbool = compare.types.intern(.bool)
+    let ce = compare.appendBlock()
+    let cx = compare.appendBlockParam(ce, cu32)
+    let cy = compare.appendBlockParam(ce, cu32)
+    let yes = compare.appendBlock()
+    let no = compare.appendBlock()
+    let cb = Builder(function: compare, block: ce)
+    cb.condBr(cb.icmp(.lt, cx, cy, boolTy: cbool), then: yes, else: no)
+    Builder(function: compare, block: yes).ret(Builder(function: compare, block: yes).iconst(cu32, 1))
+    Builder(function: compare, block: no).ret(Builder(function: compare, block: no).iconst(cu32, 0))
+    let cj = try jitCompileModule(JITModule(functions: [NamedFunction(name: "ucmp", function: compare)]))
+    let less: U32Fn = cj.entry(as: U32Fn.self, name: "ucmp")!
+    #expect(less(UInt32.max, 1) == 0)
+    #expect(less(1, UInt32.max) == 1)
+  }
+
+  @Test("unsupported integer widths fail closed")
+  func unsupportedIntegerWidth() throws {
+    let fn = Function()
+    let i8 = fn.types.intern(.int(signedness: true, bits: 8))
+    let entry = fn.appendBlock()
+    let x = fn.appendBlockParam(entry, i8)
+    Builder(function: fn, block: entry).ret(x)
+    #expect(throws: CodegenError.self) {
+      try compileFunction(fn)
+    }
+  }
+
   @Test("double an argument")
   func doubleArg() throws {
     let (fn, i64, _) = buildTestContext()
@@ -126,6 +171,31 @@ struct X86_64JITTests {
     #expect(f(-1, -1) == -1)
   }
 
+  @Test("loop keeps invariant values live across backedges")
+  func loopInvariantLiveness() throws {
+    let (fn, i64, bool) = buildTestContext()
+    let entry = fn.appendBlock()
+    let x = fn.appendBlockParam(entry, i64)
+    let n = fn.appendBlockParam(entry, i64)
+    let head = fn.appendBlock()
+    let body = fn.appendBlock()
+    let done = fn.appendBlock()
+    let i = fn.appendBlockParam(head, i64)
+    let acc = fn.appendBlockParam(head, i64)
+    let result = fn.appendBlockParam(done, i64)
+    Builder(function: fn, block: entry).jump(head, [n, Builder(function: fn, block: entry).iconst(i64, 0)])
+    let hb = Builder(function: fn, block: head)
+    let nextAcc = hb.arith(.add, acc, x)
+    let isDone = hb.icmp(.eq, i, hb.iconst(i64, 0), boolTy: bool)
+    hb.condBr(isDone, then: done, [acc], else: body, [])
+    let bb = Builder(function: fn, block: body)
+    bb.jump(head, [bb.arithImm(.sub, i, 1), nextAcc])
+    Builder(function: fn, block: done).ret(result)
+    let j = try run(JITModule(functions: [NamedFunction(name: "loop-invariant", function: fn)]), "loop-invariant")
+    let f: JitFn2 = j.entry(as: JitFn2.self, name: "loop-invariant")!
+    #expect(f(10, 3) == 30)
+  }
+
   @Test("loop with block parameters counts down")
   func loopCountdown() throws {
     // sum(n): i = n; acc = 0; loop: if i == 0 ret acc else { acc += i; i -= 1 }
@@ -192,6 +262,22 @@ struct X86_64JITTests {
     #expect(f(20) == 41)
   }
 
+  @Test("select preserves live input values")
+  func selectPreservesInputs() throws {
+    let (fn, i64, bool) = buildTestContext()
+    let entry = fn.appendBlock()
+    let x = fn.appendBlockParam(entry, i64)
+    let y = fn.appendBlockParam(entry, i64)
+    let b = Builder(function: fn, block: entry)
+    let cond = b.icmp(.eq, y, b.iconst(i64, 1), boolTy: bool)
+    let selected = b.select(cond, x, y)
+    b.ret(b.arith(.add, selected, x))
+    let j = try run(JITModule(functions: [NamedFunction(name: "select-live", function: fn)]), "select-live")
+    let f: JitFn2 = j.entry(as: JitFn2.self, name: "select-live")!
+    #expect(f(10, 7) == 17)
+    #expect(f(10, 1) == 20)
+  }
+
   @Test("select becomes a cmov")
   func selectCmov() throws {
     // abs(x): select x >= 0 ? x : 0 - x
@@ -233,6 +319,7 @@ struct X86_64JITTests {
     #expect(movImm(.rax, 42, false) == [0xB8, 0x2A, 0x00, 0x00, 0x00])
     #expect(addRR(.rax, .rbx, false) == [0x01, 0xD8])
     #expect(movImm(.r8, 42, false) == [0x41, 0xB8, 0x2A, 0x00, 0x00, 0x00])
+    #expect(shiftCl(4, .r8, false) == [0x41, 0xD3, 0xE0])
     #expect(x86Ret() == [0xC3])
     #expect(pushReg(.rbx) == [0x53])
     #expect(pushReg(.r12) == [0x41, 0x54])
@@ -486,5 +573,4 @@ func pointerOffsetLoadStore() throws {
   #expect(result == 42)
   #expect(data[1] == 42)
 }
-
 #endif

@@ -135,9 +135,11 @@ struct AArch64DisasmTests {
     expectOne(0x1F62_8C20, "fnmsub d0, d1, d2, d3")
   }
 
-  @Test("unknown words render as .word")
+  @Test("unknown and reserved words render as .word")
   func unknownWord() {
     #expect(AArch64Disassembler.one(word: 0xFFFF_FFFF) == ".word 0xffffffff")
+    #expect(AArch64Disassembler.one(word: 0x5329_A000) == ".word 0x5329a000")
+    #expect(AArch64Disassembler.disassembleOne(code: [0, 0, 0, 0], at: -1) == nil)
   }
 
   @Test("formatModule annotates branch targets")
@@ -167,5 +169,4 @@ struct AArch64DisasmTests {
     )
   }
 }
-
 #endif
