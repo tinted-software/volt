@@ -1,3 +1,4 @@
+#if X86_64
 //! End-to-end tests for the x86_64 JIT: build IR, compile, map executable,
 //! and call the result on the host. These mirror the Zig backend's execution
 //! tests (arithmetic, branches, calls across linked functions).
@@ -5,7 +6,6 @@
 import Testing
 import VoltIR
 import VoltTarget
-import VoltTargetX86_64
 
 typealias JitFn1 = @convention(c) (Int64) -> Int64
 typealias JitFn2 = @convention(c) (Int64, Int64) -> Int64
@@ -486,3 +486,5 @@ func pointerOffsetLoadStore() throws {
   #expect(result == 42)
   #expect(data[1] == 42)
 }
+
+#endif

@@ -1,6 +1,7 @@
-#if ARMv7Emulator
+#if ARMv7
+#if ARMv7
   import Testing
-  import VoltTargetARMv7
+  import VoltTarget
 
   @Suite("ARMv7 disassembler")
   struct ARMv7DisasmTests {
@@ -18,4 +19,6 @@
       #expect(ARMv7Disassembler.disassembleOne(code: [1, 2, 3], at: 0) == nil)
     }
   }
+#endif
+
 #endif

@@ -1,3 +1,4 @@
+#if AArch64
 //! Known-answer vectors for the AArch64 disassembler: hand-checked words
 //! (verified against objdump in the Zig original) plus the listing shapes.
 //! The host cannot execute A64, so these pin the decode text instead.
@@ -8,7 +9,6 @@
 
 import Testing
 import VoltTarget
-import VoltTargetAArch64
 
 @Suite("AArch64 disassembler")
 struct AArch64DisasmTests {
@@ -167,3 +167,5 @@ struct AArch64DisasmTests {
     )
   }
 }
+
+#endif

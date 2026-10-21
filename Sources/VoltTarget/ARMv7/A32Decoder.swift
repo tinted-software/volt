@@ -1,3 +1,4 @@
+#if ARMv7
 import Foundation
 
 public enum A32Instruction: Sendable, Equatable {
@@ -88,3 +89,5 @@ public enum ARMv7A32Decoder {
     return A32DecodedInstruction(pc: pc, word: w, instruction: instruction)
   }
 }
+
+#endif

@@ -1,4 +1,4 @@
-import VoltTarget
+#if ARMv7
 
 /// A useful ARM-state (A32) decoder for common integer, branch, and memory instructions.
 /// Unsupported words are preserved as `.word` directives. Input is little-endian.
@@ -162,3 +162,5 @@ extension UInt32 {
     count == 0 ? self : (self >> count) | (self << (32 - count))
   }
 }
+
+#endif

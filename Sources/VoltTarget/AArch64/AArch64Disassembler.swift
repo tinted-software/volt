@@ -1,3 +1,4 @@
+#if AArch64
 //! AArch64 (A64) disassembler: decodes the instruction subset Volt's encoder
 //! emits into a readable listing, so codegen debugging does not mean
 //! hand-decoding hex. Field positions mirror `encode.zig` bit-for-bit.
@@ -10,7 +11,6 @@
 //! known-answer vectors as the Zig original (see `AArch64DisasmTests`).
 
 import VoltIR
-import VoltTarget
 
 // MARK: - Field extraction
 
@@ -728,3 +728,5 @@ public enum AArch64Disassembler: Disassembler {
     return out
   }
 }
+
+#endif

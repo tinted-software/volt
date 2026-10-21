@@ -1,3 +1,4 @@
+#if X86_64
 //! x86-64 instruction encoding. Each encoder returns `[UInt8]` bytes.
 //! An x86 instruction is at most 15 bytes long.
 //! Modeled on `libs/vulcan-target/x86_64/encode.zig`.
@@ -449,3 +450,5 @@ public func popReg(_ r: Reg) -> [UInt8] {
 
 /// `ret` (near return).
 public func x86Ret() -> [UInt8] { [0xC3] }
+
+#endif

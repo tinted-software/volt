@@ -1,6 +1,6 @@
+#if X86_64
 import VoltIR
 import VoltTarget
-import VoltTargetX86_64
 
 // double(x) = x * 2
 let fn = Function()
@@ -22,3 +22,8 @@ do {
 } catch {
   print("jit failed: \(error)")
 }
+
+#else
+import Foundation
+print("volt-jit requires the X86_64 package trait")
+#endif

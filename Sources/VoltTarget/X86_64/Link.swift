@@ -1,3 +1,4 @@
+#if X86_64
 //! In-memory linker + JIT for x86-64. Compiles named functions, lays them out
 //! consecutively in one blob, and resolves each `call` relocation (a rel32
 //! displacement) to the target symbol's offset. The result is a
@@ -8,7 +9,6 @@
 //! needs a dynamic GOT) fail closed with `CodegenError.unsupportedReloc`.
 
 import VoltIR
-import VoltTarget
 
 /// Compile and link `module`'s functions into one blob, 16-byte aligned starts,
 /// NOP-padded between functions. Intra-module `.call` relocs resolve to
@@ -97,3 +97,5 @@ public final class JittedModule {
 public func jitCompileModule(_ module: JITModule, names: [String]? = nil) throws -> JittedModule {
   try JittedModule(linked: compileModule(module, names: names))
 }
+
+#endif

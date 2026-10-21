@@ -1,3 +1,4 @@
+#if X86_64
 //! x86_64 instruction selection: lowers an IR `Function` to machine code.
 //! System V AMD64 ABI: integer arguments in RDI, RSI, RDX, RCX, R8, R9, result
 //! in RAX. Modeled on `libs/vulcan-target/x86_64/isel.zig`, simplified for the
@@ -20,7 +21,6 @@
 //! shuffling). Anything else throws `CodegenError.unsupported`.
 
 import VoltIR
-import VoltTarget
 
 let argRegs: [Reg] = [.rdi, .rsi, .rdx, .rcx, .r8, .r9]
 let retReg: Reg = .rax
@@ -712,3 +712,5 @@ func describe(_ op: Opcode) -> String {
   default: return "other"
   }
 }
+
+#endif

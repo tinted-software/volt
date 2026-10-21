@@ -1,7 +1,7 @@
 #if ARMv7Emulator
   import Testing
   import VoltEmulator
-  import VoltTargetARMv7
+  import VoltTarget
 
   @Suite("ARMv7 A32 emulator")
   struct ARMv7EmulatorTests {

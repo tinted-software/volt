@@ -1,8 +1,6 @@
 #if ARMv7Emulator
   import VoltIR
   import VoltTarget
-  import VoltTargetARMv7
-  import VoltTargetX86_64
 
   /// Guest-visible A32 state with sixteen 32-bit registers and CPSR.
   public struct ARMv7A32State {
