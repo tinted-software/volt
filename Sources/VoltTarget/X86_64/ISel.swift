@@ -39,6 +39,7 @@ let calleeSavedRegs: Set<Reg> = [.rbx, .r12, .r13, .r14, .r15]
 ///   unsigned u32 values, bool conditions, and pointers; unsupported IR types
 ///   or mismatched operands fail closed.
 public func compileFunction(_ function: Function) throws -> CompiledCode {
+  try function.verify()
   guard function.blockCount() > 0 else {
     throw CodegenError.invalidFunction("no blocks")
   }
@@ -51,6 +52,7 @@ public func compileFunction(_ function: Function) throws -> CompiledCode {
 /// Run the allocator over `function` and return the raw scan (homes, spill
 /// count, register count) for tests and tools. `compileFunction` uses this.
 public func allocateFunction(_ function: Function) throws -> ScanResult {
+  try function.verify()
   guard function.blockCount() > 0 else {
     throw CodegenError.invalidFunction("no blocks")
   }

@@ -68,6 +68,9 @@ public struct TypeTable: Sendable {
   public mutating func ptrGlobal() -> Type { intern(.ptr(.global)) }
 
   public func kind(of type: Type) -> Type.Kind { kinds[type.index] }
+  func contains(_ type: Type) -> Bool {
+    type.index >= 0 && type.index < kinds.count && kinds[type.index] == type.kind
+  }
   public var count: Int { kinds.count }
 }
 
