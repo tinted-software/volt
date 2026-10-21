@@ -34,13 +34,15 @@ extension Function {
     try require(blockInsts.count == blockCount, "block instruction table count mismatch")
     try require(terminators.count == blockCount, "terminator table count mismatch")
     try require(instResults.count == instCount, "instruction result table count mismatch")
-    try require(instResultTypes.count == instResults.compactMap { $0 }.count,
+    try require(
+      instResultTypes.count == instResults.compactMap { $0 }.count,
       "instruction result type table count mismatch")
     try require(valueDefs.count == valueCount, "value definition table count mismatch")
 
     for (index, block) in blocks.enumerated() {
       try require(block.raw == UInt32(index), "block IDs are not dense at index \(index)")
-      try require(blockParams[index].count == blockParamTypes[index].count,
+      try require(
+        blockParams[index].count == blockParamTypes[index].count,
         "block \(index) parameter/type count mismatch")
     }
 
@@ -56,7 +58,8 @@ extension Function {
       try require(validType(type), "value \(index) has a type not interned in this function")
     }
     for (index, type) in instResultTypes.enumerated() {
-      try require(validType(type), "instruction \(index) has a result type not interned in this function")
+      try require(
+        validType(type), "instruction \(index) has a result type not interned in this function")
     }
     for block in 0..<blockCount {
       for (paramIndex, type) in blockParamTypes[block].enumerated() {
@@ -64,13 +67,14 @@ extension Function {
       }
     }
 
-    var instructionOwner = Array<Int?>(repeating: nil, count: instCount)
-    var instructionPosition = Array<Int?>(repeating: nil, count: instCount)
+    var instructionOwner = [Int?](repeating: nil, count: instCount)
+    var instructionPosition = [Int?](repeating: nil, count: instCount)
     for block in 0..<blockCount {
       for (position, inst) in blockInsts[block].enumerated() {
         let index = Int(inst.raw)
         try require(index < instCount, "block \(block) references invalid instruction \(inst.raw)")
-        try require(instructionOwner[index] == nil,
+        try require(
+          instructionOwner[index] == nil,
           "instruction \(index) appears in multiple block instruction lists")
         instructionOwner[index] = block
         instructionPosition[index] = position
@@ -80,14 +84,17 @@ extension Function {
       try require(instructionOwner[index] != nil, "instruction \(index) is not owned by a block")
     }
 
-    var definitions = Array<ValueDefinition?>(repeating: nil, count: valueCount)
+    var definitions = [ValueDefinition?](repeating: nil, count: valueCount)
     for block in 0..<blockCount {
       for (paramIndex, value) in blockParams[block].enumerated() {
         let index = Int(value.raw)
-        try require(index < valueCount, "block \(block) references invalid parameter value \(value.raw)")
+        try require(
+          index < valueCount, "block \(block) references invalid parameter value \(value.raw)")
         try require(definitions[index] == nil, "value \(index) has multiple definitions")
-        try require(valueDefs[index] == nil, "block parameter \(index) has an instruction definition")
-        try require(valueTypes[index] == blockParamTypes[block][paramIndex],
+        try require(
+          valueDefs[index] == nil, "block parameter \(index) has an instruction definition")
+        try require(
+          valueTypes[index] == blockParamTypes[block][paramIndex],
           "block \(block) parameter \(index) type table mismatch")
         definitions[index] = ValueDefinition(block: block, instructionPosition: nil)
       }
@@ -105,11 +112,15 @@ extension Function {
       }
       if let result {
         let valueIndex = Int(result.raw)
-        try require(valueIndex < valueCount, "instruction \(index) references invalid result value \(result.raw)")
+        try require(
+          valueIndex < valueCount,
+          "instruction \(index) references invalid result value \(result.raw)")
         try require(definitions[valueIndex] == nil, "value \(valueIndex) has multiple definitions")
-        try require(valueDefs[valueIndex] == Inst(raw: UInt32(index)),
+        try require(
+          valueDefs[valueIndex] == Inst(raw: UInt32(index)),
           "instruction \(index) result definition table mismatch")
-        try require(valueTypes[valueIndex] == instResultTypes[resultTypeIndex],
+        try require(
+          valueTypes[valueIndex] == instResultTypes[resultTypeIndex],
           "instruction \(index) result type table mismatch")
         resultTypeIndex += 1
         definitions[valueIndex] = ValueDefinition(block: owner, instructionPosition: position)
@@ -124,8 +135,11 @@ extension Function {
       try require(definitions[index] != nil, "value \(index) has no definition")
       if let definingInst = valueDefs[index] {
         let instIndex = Int(definingInst.raw)
-        try require(instIndex < instCount, "value \(index) references invalid defining instruction \(definingInst.raw)")
-        try require(instResults[instIndex] == Value(raw: UInt32(index)),
+        try require(
+          instIndex < instCount,
+          "value \(index) references invalid defining instruction \(definingInst.raw)")
+        try require(
+          instResults[instIndex] == Value(raw: UInt32(index)),
           "value \(index) and instruction result tables disagree")
       }
     }
@@ -138,13 +152,19 @@ extension Function {
       }
       func addEdge(_ target: Block, _ args: [Value]) throws {
         let targetIndex = Int(target.raw)
-        try require(targetIndex < blockCount, "block \(block) branches to invalid block \(target.raw)")
+        try require(
+          targetIndex < blockCount, "block \(block) branches to invalid block \(target.raw)")
         let params = blockParams[targetIndex]
-        try require(args.count == params.count,
-          "edge \(block) -> \(targetIndex) passes \(args.count) arguments for \(params.count) parameters")
+        try require(
+          args.count == params.count,
+          "edge \(block) -> \(targetIndex) passes \(args.count) arguments for \(params.count) parameters"
+        )
         for (argument, parameter) in zip(args, params) {
-          try require(valueIndexIsValid(argument), "edge \(block) -> \(targetIndex) uses invalid value \(argument.raw)")
-          try require(valueTypes[Int(argument.raw)] == valueTypes[Int(parameter.raw)],
+          try require(
+            valueIndexIsValid(argument),
+            "edge \(block) -> \(targetIndex) uses invalid value \(argument.raw)")
+          try require(
+            valueTypes[Int(argument.raw)] == valueTypes[Int(parameter.raw)],
             "edge \(block) -> \(targetIndex) argument type mismatch")
         }
         successors[block].append(targetIndex)
@@ -159,8 +179,12 @@ extension Function {
       case .jump(let jump):
         try addEdge(jump.target, jump.args)
       case .condBr(let branch):
-        try require(valueIndexIsValid(branch.cond), "block \(block) branches on invalid value \(branch.cond.raw)")
-        try require(isBool(valueTypes[Int(branch.cond.raw)]), "block \(block) conditional branch condition is not bool")
+        try require(
+          valueIndexIsValid(branch.cond),
+          "block \(block) branches on invalid value \(branch.cond.raw)")
+        try require(
+          isBool(valueTypes[Int(branch.cond.raw)]),
+          "block \(block) conditional branch condition is not bool")
         try addEdge(branch.then, branch.thenArgs)
         try addEdge(branch.else, branch.elseArgs)
       default:
@@ -188,7 +212,10 @@ extension Function {
         var next = preds.first.map { dominators[$0] } ?? Set<Int>()
         for predecessor in preds.dropFirst() { next.formIntersection(dominators[predecessor]) }
         next.insert(block)
-        if next != dominators[block] { dominators[block] = next; changed = true }
+        if next != dominators[block] {
+          dominators[block] = next
+          changed = true
+        }
       }
     }
 
@@ -197,11 +224,13 @@ extension Function {
       let definition = definitions[Int(value.raw)]!
       if definition.block == block {
         if let definingPosition = definition.instructionPosition {
-          try require(definingPosition < position,
+          try require(
+            definingPosition < position,
             "\(context) uses value \(value.raw) before its definition")
         }
       } else {
-        try require(dominators[block].contains(definition.block),
+        try require(
+          dominators[block].contains(definition.block),
           "\(context) uses value \(value.raw) that does not dominate this block")
       }
     }
@@ -215,9 +244,13 @@ extension Function {
         }
         switch opcode {
         case .alloca(let op):
-          try require(validType(op.elem), "instruction \(index) has an alloca element type not interned in this function")
+          try require(
+            validType(op.elem),
+            "instruction \(index) has an alloca element type not interned in this function")
         case .vaArg(let op):
-          try require(validType(op.ty), "instruction \(index) has a va_arg type not interned in this function")
+          try require(
+            validType(op.ty), "instruction \(index) has a va_arg type not interned in this function"
+          )
         default: break
         }
         try verifyTypes(
@@ -226,12 +259,16 @@ extension Function {
       }
       let termPosition = blockInsts[block].count
       for value in operands(of: terminators[block]!) {
-        try checkUse(value, from: block, before: termPosition, context: "terminator in block \(block)")
+        try checkUse(
+          value, from: block, before: termPosition, context: "terminator in block \(block)")
       }
     }
 
     func valueIndexIsValid(_ value: Value) -> Bool { Int(value.raw) < valueCount }
-    func isBool(_ type: Type) -> Bool { if case .bool = type.kind { return true }; return false }
+    func isBool(_ type: Type) -> Bool {
+      if case .bool = type.kind { return true }
+      return false
+    }
   }
 }
 
@@ -267,19 +304,34 @@ private func operands(of opcode: Opcode) -> [Value] {
 private func verifyTypes(
   _ opcode: Opcode, result: Type?, typeOf: (Value) -> Type, context: String
 ) throws {
-  func fail(_ reason: String) -> IRVerificationError { IRVerificationError("\(context): \(reason)") }
+  func fail(_ reason: String) -> IRVerificationError {
+    IRVerificationError("\(context): \(reason)")
+  }
   guard let result else {
     guard case .store(let op) = opcode else { throw fail("missing result") }
     guard isPointer(typeOf(op.ptr)) else { throw fail("store address must be a pointer") }
     return
   }
   func same(_ lhs: Type, _ rhs: Type) -> Bool { lhs == rhs }
-  func isInteger(_ type: Type) -> Bool { if case .int = type.kind { return true }; return false }
-  func isFloat(_ type: Type) -> Bool { if case .float = type.kind { return true }; return false }
-  func isPointer(_ type: Type) -> Bool { if case .ptr = type.kind { return true }; return false }
-  func isBool(_ type: Type) -> Bool { if case .bool = type.kind { return true }; return false }
+  func isInteger(_ type: Type) -> Bool {
+    if case .int = type.kind { return true }
+    return false
+  }
+  func isFloat(_ type: Type) -> Bool {
+    if case .float = type.kind { return true }
+    return false
+  }
+  func isPointer(_ type: Type) -> Bool {
+    if case .ptr = type.kind { return true }
+    return false
+  }
+  func isBool(_ type: Type) -> Bool {
+    if case .bool = type.kind { return true }
+    return false
+  }
   func arithmeticType(_ type: Type, op: BinOp) -> Bool {
-    let integerOp = op == .add || op == .sub || op == .mul || op == .div || op == .rem
+    let integerOp =
+      op == .add || op == .sub || op == .mul || op == .div || op == .rem
       || op == .bitAnd || op == .bitOr || op == .bitXor || op == .shl || op == .shr || op == .mulH
     let floatingOp = op == .add || op == .sub || op == .mul || op == .div || op == .rem
     if isInteger(type) { return integerOp }
@@ -291,13 +343,19 @@ private func verifyTypes(
   }
   switch opcode {
   case .ptrAdd(let op):
-    guard same(result, typeOf(op.base)), isPointer(result) else { throw fail("ptrAdd requires matching pointer operand and result types") }
+    guard same(result, typeOf(op.base)), isPointer(result) else {
+      throw fail("ptrAdd requires matching pointer operand and result types")
+    }
   case .arith(let op):
-    guard same(typeOf(op.lhs), typeOf(op.rhs)), same(result, typeOf(op.lhs)), arithmeticType(result, op: op.op) else {
+    guard same(typeOf(op.lhs), typeOf(op.rhs)), same(result, typeOf(op.lhs)),
+      arithmeticType(result, op: op.op)
+    else {
       throw fail("arithmetic operands and result must have matching numeric types")
     }
   case .arithImm(let op):
-    guard same(result, typeOf(op.lhs)), isInteger(result) else { throw fail("immediate arithmetic requires a matching integer result") }
+    guard same(result, typeOf(op.lhs)), isInteger(result) else {
+      throw fail("immediate arithmetic requires a matching integer result")
+    }
   case .compare:
     guard isBool(result) else { throw fail("comparison result must be bool") }
   case .cmp(let op):
@@ -316,7 +374,8 @@ private func verifyTypes(
       throw fail("comparison requires comparable matching operands and bool result")
     }
   case .select(let op):
-    guard isBool(typeOf(op.cond)), same(result, typeOf(op.then)), same(result, typeOf(op.else)) else {
+    guard isBool(typeOf(op.cond)), same(result, typeOf(op.then)), same(result, typeOf(op.else))
+    else {
       throw fail("select requires a bool condition and matching arm/result types")
     }
   case .structNew(let op):
@@ -327,16 +386,22 @@ private func verifyTypes(
     let aggregate = typeOf(op.aggregate)
     switch aggregate.kind {
     case .indirectStruct(let fields):
-      guard Int(op.index) < fields.count, result == fields[Int(op.index)] else { throw fail("invalid struct field extraction") }
+      guard Int(op.index) < fields.count, result == fields[Int(op.index)] else {
+        throw fail("invalid struct field extraction")
+      }
     case .vector(let vector):
-      guard op.index < vector.len, result == vector.elem else { throw fail("invalid vector lane extraction") }
+      guard op.index < vector.len, result == vector.elem else {
+        throw fail("invalid vector lane extraction")
+      }
     default: throw fail("extract requires a struct or vector operand")
     }
   case .convert:
     break
   case .unary(let op):
     if op.op != .reinterpret {
-      guard isFloat(result), same(result, typeOf(op.value)) else { throw fail("floating unary operation requires matching float types") }
+      guard isFloat(result), same(result, typeOf(op.value)) else {
+        throw fail("floating unary operation requires matching float types")
+      }
     }
   case .alloca:
     guard isPointer(result) else { throw fail("alloca result must be a pointer") }
@@ -351,7 +416,9 @@ private func verifyTypes(
       throw fail("invalid call ABI metadata")
     }
   case .callIndirect(let op):
-    guard isPointer(typeOf(op.target)), Int(op.numFixed) <= op.args.count, op.retPieces.count <= 4, op.retRegs <= 4 else {
+    guard isPointer(typeOf(op.target)), Int(op.numFixed) <= op.args.count, op.retPieces.count <= 4,
+      op.retRegs <= 4
+    else {
       throw fail("invalid indirect call target or ABI metadata")
     }
   case .globalAddr:
@@ -371,7 +438,9 @@ private func verifyTypes(
   case .vaEnd(let op):
     guard isPointer(typeOf(op.list)) else { throw fail("variadic list must be a pointer") }
   case .vaArg(let op):
-    guard isPointer(typeOf(op.list)), result == op.ty else { throw fail("va_arg list or result type is invalid") }
+    guard isPointer(typeOf(op.list)), result == op.ty else {
+      throw fail("va_arg list or result type is invalid")
+    }
   case .iconst(let value):
     if isInteger(result) { break }
     guard isBool(result), value == 0 || value == 1 else {
@@ -381,4 +450,3 @@ private func verifyTypes(
     throw fail("terminator stored as an instruction")
   }
 }
-

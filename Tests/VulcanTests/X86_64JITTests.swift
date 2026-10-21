@@ -23,6 +23,29 @@ struct X86_64JITTests {
     try jitCompileModule(mod)
   }
 
+  @Test("owning callable retains its executable mapping")
+  func owningCallableRetainsMapping() throws {
+    let fn = Function()
+    let i64 = fn.types.intern(.int(signedness: true, bits: 64))
+    let entry = fn.appendBlock()
+    let x = fn.appendBlockParam(entry, i64)
+    let builder = Builder(function: fn, block: entry)
+    builder.ret(builder.arith(.mul, x, builder.iconst(i64, 2)))
+
+    weak var weakModule: JittedModule?
+    var callable: JittedInt64Function?
+    do {
+      let module = try jitCompileModule(JITModule(functions: [NamedFunction(name: "double", function: fn)]))
+      weakModule = module
+      callable = module.int64Function(named: "double")
+    }
+
+    #expect(weakModule != nil)
+    #expect(callable?(21) == 42)
+    callable = nil
+    #expect(weakModule == nil)
+  }
+
   @Test("return a constant")
   func returnConstant() throws {
     let (fn, i64, _) = buildTestContext()
@@ -45,8 +68,7 @@ struct X86_64JITTests {
     let sum = b.arith(.add, x, y)
     b.ret(sum)
     let j = try jitCompileModule(JITModule(functions: [NamedFunction(name: "u32", function: fn)]))
-    typealias U32Fn = @convention(c) (UInt32, UInt32) -> UInt32
-    let add: U32Fn = j.entry(as: U32Fn.self, name: "u32")!
+    let add = try #require(j.uint32BinaryFunction(named: "u32"))
     #expect(add(UInt32.max, 1) == 0)
 
     let compare = Function()
@@ -62,7 +84,7 @@ struct X86_64JITTests {
     Builder(function: compare, block: yes).ret(Builder(function: compare, block: yes).iconst(cu32, 1))
     Builder(function: compare, block: no).ret(Builder(function: compare, block: no).iconst(cu32, 0))
     let cj = try jitCompileModule(JITModule(functions: [NamedFunction(name: "ucmp", function: compare)]))
-    let less: U32Fn = cj.entry(as: U32Fn.self, name: "ucmp")!
+    let less = try #require(cj.uint32BinaryFunction(named: "ucmp"))
     #expect(less(UInt32.max, 1) == 0)
     #expect(less(1, UInt32.max) == 1)
   }
@@ -566,8 +588,7 @@ func pointerOffsetLoadStore() throws {
   b.store(b.iconst(i64, 42), field)
   b.ret(b.load(i64, field))
   let j = try jitCompileModule(JITModule(functions: [NamedFunction(name: "field", function: fn)]))
-  typealias FieldFn = @convention(c) (UnsafeMutablePointer<Int64>) -> Int64
-  let f: FieldFn = j.entry(as: FieldFn.self, name: "field")!
+  let f = try #require(j.int64PointerFunction(named: "field"))
   var data: [Int64] = [0, 0]
   let result = data.withUnsafeMutableBufferPointer { f($0.baseAddress!) }
   #expect(result == 42)

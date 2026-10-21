@@ -1,100 +1,219 @@
 #if X86_64
-//! In-memory linker + JIT for x86-64. Compiles named functions, lays them out
-//! consecutively in one blob, and resolves each `call` relocation (a rel32
-//! displacement) to the target symbol's offset. The result is a
-//! position-independent blob entered at any function's offset.
-//! Modeled on `libs/vulcan-target/x86_64/link.zig` + `aarch64/jit.zig`.
-//!
-//! v1 carries only `.call` relocs; `.pcrel_lea` (data) and `.got_pcrel` (which
-//! needs a dynamic GOT) fail closed with `CodegenError.unsupportedReloc`.
+  //! In-memory linker + JIT for x86-64. Compiles named functions, lays them out
+  //! consecutively in one blob, and resolves each `call` relocation (a rel32
+  //! displacement) to the target symbol's offset. The result is a
+  //! position-independent blob entered at any function's offset.
+  //! Modeled on `libs/vulcan-target/x86_64/link.zig` + `aarch64/jit.zig`.
+  //!
+  //! v1 carries only `.call` relocs; `.pcrel_lea` (data) and `.got_pcrel` (which
+  //! needs a dynamic GOT) fail closed with `CodegenError.unsupportedReloc`.
 
-import VoltIR
+  import VoltIR
 
-/// Compile and link `module`'s functions into one blob, 16-byte aligned starts,
-/// NOP-padded between functions. Intra-module `.call` relocs resolve to
-/// `rel32 = target - (site + 4)`.
-public func compileModule(_ module: JITModule, names: [String]? = nil) throws -> LinkedModule {
-  var compiled: [CompiledCode] = []
-  for (i, e) in module.functions.enumerated() {
-    var c = try compileFunction(e.function)
-    // v1 symbol threading: `Call` carries an index; the driver supplies names.
-    if let names, !names.isEmpty {
-      c.relocs = c.relocs.map { r in
-        var r = r
-        if r.symbol.hasPrefix("extern"), let idx = UInt32(r.symbol.dropFirst(6)) {
-          if Int(idx) < names.count { r.symbol = names[Int(idx)] }
+  /// Compile and link `module`'s functions into one blob, 16-byte aligned starts,
+  /// NOP-padded between functions. Intra-module `.call` relocs resolve to
+  /// `rel32 = target - (site + 4)`.
+  public func compileModule(_ module: JITModule, names: [String]? = nil) throws -> LinkedModule {
+    var compiled: [CompiledCode] = []
+    for (i, e) in module.functions.enumerated() {
+      var c = try compileFunction(e.function)
+      // v1 symbol threading: `Call` carries an index; the driver supplies names.
+      if let names, !names.isEmpty {
+        c.relocs = c.relocs.map { r in
+          var r = r
+          if r.symbol.hasPrefix("extern"), let idx = UInt32(r.symbol.dropFirst(6)) {
+            if Int(idx) < names.count { r.symbol = names[Int(idx)] }
+          }
+          _ = i
+          return r
         }
-        _ = i
-        return r
+      }
+      compiled.append(c)
+    }
+
+    var offsets: [Int] = []
+    var total = 0
+    for c in compiled {
+      offsets.append(total)
+      total += (c.bytes.count + 15) & ~15
+    }
+
+    var symbols: [FuncSymbol] = []
+    for (i, e) in module.functions.enumerated() {
+      symbols.append(FuncSymbol(name: e.name, offset: offsets[i]))
+    }
+
+    var code = [UInt8](repeating: 0x90, count: total)  // pad with NOPs
+    for (i, c) in compiled.enumerated() {
+      code.replaceSubrange(offsets[i]..<(offsets[i] + c.bytes.count), with: c.bytes)
+    }
+
+    for (i, c) in compiled.enumerated() {
+      for r in c.relocs {
+        let site = offsets[i] + r.offset
+        switch r.kind {
+        case .call:
+          guard let target = symbols.first(where: { $0.name == r.symbol })?.offset else {
+            throw CodegenError.undefinedSymbol(r.symbol)
+          }
+          let rel = Int32(target - (site + 4))
+          let u = UInt32(bitPattern: rel)
+          code[site] = UInt8(u & 0xFF)
+          code[site + 1] = UInt8((u >> 8) & 0xFF)
+          code[site + 2] = UInt8((u >> 16) & 0xFF)
+          code[site + 3] = UInt8((u >> 24) & 0xFF)
+        case .pcrelLea:
+          throw CodegenError.unsupportedReloc("pcrel_lea needs map-time data addresses")
+        case .gotPCRel:
+          throw CodegenError.unsupportedReloc("got_pcrel needs a dynamic GOT")
+        }
       }
     }
-    compiled.append(c)
+    return LinkedModule(code: code, symbols: symbols)
   }
 
-  var offsets: [Int] = []
-  var total = 0
-  for c in compiled {
-    offsets.append(total)
-    total += (c.bytes.count + 15) & ~15
-  }
+  /// An owning callable for an `Int64 -> Int64` C ABI entry point.
+  public struct JittedInt64Function {
+    private let owner: JittedModule
+    private let function: @convention(c) (Int64) -> Int64
 
-  var symbols: [FuncSymbol] = []
-  for (i, e) in module.functions.enumerated() {
-    symbols.append(FuncSymbol(name: e.name, offset: offsets[i]))
-  }
+    fileprivate init(owner: JittedModule, function: @convention(c) (Int64) -> Int64) {
+      self.owner = owner
+      self.function = function
+    }
 
-  var code = [UInt8](repeating: 0x90, count: total)  // pad with NOPs
-  for (i, c) in compiled.enumerated() {
-    code.replaceSubrange(offsets[i]..<(offsets[i] + c.bytes.count), with: c.bytes)
-  }
-
-  for (i, c) in compiled.enumerated() {
-    for r in c.relocs {
-      let site = offsets[i] + r.offset
-      switch r.kind {
-      case .call:
-        guard let target = symbols.first(where: { $0.name == r.symbol })?.offset else {
-          throw CodegenError.undefinedSymbol(r.symbol)
-        }
-        let rel = Int32(target - (site + 4))
-        let u = UInt32(bitPattern: rel)
-        code[site] = UInt8(u & 0xFF)
-        code[site + 1] = UInt8((u >> 8) & 0xFF)
-        code[site + 2] = UInt8((u >> 16) & 0xFF)
-        code[site + 3] = UInt8((u >> 24) & 0xFF)
-      case .pcrelLea:
-        throw CodegenError.unsupportedReloc("pcrel_lea needs map-time data addresses")
-      case .gotPCRel:
-        throw CodegenError.unsupportedReloc("got_pcrel needs a dynamic GOT")
-      }
+    public func callAsFunction(_ value: Int64) -> Int64 {
+      withExtendedLifetime(owner) { function(value) }
     }
   }
-  return LinkedModule(code: code, symbols: symbols)
-}
 
-/// A JIT-compiled module: its live executable buffer plus each function's byte
-/// offset into it.
-public final class JittedModule {
-  public let memory: ExecutableMemory
-  public let linked: LinkedModule
+  /// An owning callable for an `(Int64, Int64) -> Int64` C ABI entry point.
+  public struct JittedInt64BinaryFunction {
+    private let owner: JittedModule
+    private let function: @convention(c) (Int64, Int64) -> Int64
 
-  public init(linked: LinkedModule) throws {
-    self.linked = linked
-    self.memory = try ExecutableMemory(byteCount: linked.code.count)
-    try memory.write(linked.code)
-    try memory.protectExecutable()
+    fileprivate init(owner: JittedModule, function: @convention(c) (Int64, Int64) -> Int64) {
+      self.owner = owner
+      self.function = function
+    }
+
+    public func callAsFunction(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+      withExtendedLifetime(owner) { function(lhs, rhs) }
+    }
   }
 
-  /// A typed callable pointer to the function named `name`, or nil if absent.
-  public func entry<T>(as type: T.Type, name: String) -> T? {
-    guard let off = linked.addressOf(name) else { return nil }
-    return memory.entry(as: type, offset: off)
-  }
-}
+  /// An owning callable for an `(UInt32, UInt32) -> UInt32` C ABI entry point.
+  public struct JittedUInt32BinaryFunction {
+    private let owner: JittedModule
+    private let function: @convention(c) (UInt32, UInt32) -> UInt32
 
-/// JIT-compile a module: link it into one position-independent image and map it
-/// into executable memory.
-public func jitCompileModule(_ module: JITModule, names: [String]? = nil) throws -> JittedModule {
-  try JittedModule(linked: compileModule(module, names: names))
-}
+    fileprivate init(owner: JittedModule, function: @convention(c) (UInt32, UInt32) -> UInt32) {
+      self.owner = owner
+      self.function = function
+    }
+
+    public func callAsFunction(_ lhs: UInt32, _ rhs: UInt32) -> UInt32 {
+      withExtendedLifetime(owner) { function(lhs, rhs) }
+    }
+  }
+
+  /// An owning callable for an `(UnsafeMutablePointer<Int64>) -> Int64` C ABI entry point.
+  public struct JittedInt64PointerFunction {
+    private let owner: JittedModule
+    private let function: @convention(c) (UnsafeMutablePointer<Int64>) -> Int64
+
+    fileprivate init(
+      owner: JittedModule, function: @convention(c) (UnsafeMutablePointer<Int64>) -> Int64
+    ) {
+      self.owner = owner
+      self.function = function
+    }
+
+    public func callAsFunction(_ pointer: UnsafeMutablePointer<Int64>) -> Int64 {
+      withExtendedLifetime(owner) { function(pointer) }
+    }
+  }
+
+  /// An owning callable for an `(UnsafeMutableRawPointer) -> Void` C ABI entry point.
+  public struct JittedVoidPointerFunction {
+    private let owner: JittedModule
+    private let function: @convention(c) (UnsafeMutableRawPointer) -> Void
+
+    fileprivate init(
+      owner: JittedModule, function: @convention(c) (UnsafeMutableRawPointer) -> Void
+    ) {
+      self.owner = owner
+      self.function = function
+    }
+
+    public func callAsFunction(_ pointer: UnsafeMutableRawPointer) {
+      withExtendedLifetime(owner) { function(pointer) }
+    }
+  }
+
+  /// A JIT-compiled module: its live executable buffer plus each function's byte
+  /// offset into it. Typed accessors assume the named symbol has the requested ABI;
+  /// the current linker does not retain function-signature metadata.
+  public final class JittedModule {
+    public let memory: ExecutableMemory
+    public let linked: LinkedModule
+
+    public init(linked: LinkedModule) throws {
+      self.linked = linked
+      self.memory = try ExecutableMemory(byteCount: linked.code.count)
+      try memory.write(linked.code)
+      try memory.protectExecutable()
+    }
+
+    /// Owning callable for a common `Int64 -> Int64` C ABI function, or nil if absent.
+    public func int64Function(named name: String) -> JittedInt64Function? {
+      guard let offset = linked.addressOf(name) else { return nil }
+      let function = memory.entry(as: (@convention(c) (Int64) -> Int64).self, offset: offset)
+      return JittedInt64Function(owner: self, function: function)
+    }
+
+    /// Owning callable for a common `(Int64, Int64) -> Int64` C ABI function, or nil if absent.
+    public func int64BinaryFunction(named name: String) -> JittedInt64BinaryFunction? {
+      guard let offset = linked.addressOf(name) else { return nil }
+      let function = memory.entry(as: (@convention(c) (Int64, Int64) -> Int64).self, offset: offset)
+      return JittedInt64BinaryFunction(owner: self, function: function)
+    }
+
+    /// Owning callable for a `(UInt32, UInt32) -> UInt32` C ABI function, or nil if absent.
+    public func uint32BinaryFunction(named name: String) -> JittedUInt32BinaryFunction? {
+      guard let offset = linked.addressOf(name) else { return nil }
+      let function = memory.entry(
+        as: (@convention(c) (UInt32, UInt32) -> UInt32).self, offset: offset)
+      return JittedUInt32BinaryFunction(owner: self, function: function)
+    }
+
+    /// Owning callable for an `(UnsafeMutablePointer<Int64>) -> Int64` C ABI function, or nil if absent.
+    public func int64PointerFunction(named name: String) -> JittedInt64PointerFunction? {
+      guard let offset = linked.addressOf(name) else { return nil }
+      let function = memory.entry(
+        as: (@convention(c) (UnsafeMutablePointer<Int64>) -> Int64).self, offset: offset)
+      return JittedInt64PointerFunction(owner: self, function: function)
+    }
+
+    /// Owning callable for an `(UnsafeMutableRawPointer) -> Void` C ABI function, or nil if absent.
+    public func voidPointerFunction(named name: String) -> JittedVoidPointerFunction? {
+      guard let offset = linked.addressOf(name) else { return nil }
+      let function = memory.entry(
+        as: (@convention(c) (UnsafeMutableRawPointer) -> Void).self, offset: offset)
+      return JittedVoidPointerFunction(owner: self, function: function)
+    }
+
+    /// UNSAFE: this raw callable pointer does not retain the module. It must not
+    /// outlive this `JittedModule`; prefer the owning typed callable methods above.
+    public func entry<T>(as type: T.Type, name: String) -> T? {
+      guard let off = linked.addressOf(name) else { return nil }
+      return memory.entry(as: type, offset: off)
+    }
+  }
+
+  /// JIT-compile a module: link it into one position-independent image and map it
+  /// into executable memory.
+  public func jitCompileModule(_ module: JITModule, names: [String]? = nil) throws -> JittedModule {
+    try JittedModule(linked: compileModule(module, names: names))
+  }
 #endif

@@ -108,8 +108,6 @@
     }
   }
 
-  typealias DifferentialJitFn = @convention(c) (Int64, Int64) -> Int64
-
   @Suite("differential JIT")
   struct DifferentialJITTests {
     @Test("randomized integer expressions agree with the IR interpreter")
@@ -157,8 +155,7 @@
       ]
 
       for (name, function) in functions {
-        let compiled: DifferentialJitFn = try #require(
-          jitted.entry(as: DifferentialJitFn.self, name: name))
+        let compiled = try #require(jitted.int64BinaryFunction(named: name))
         for (x, y) in inputs {
           let expected = try interpret(function, arguments: [x, y])
           #expect(compiled(x, y) == expected, "\(name)(\(x), \(y))")
@@ -188,8 +185,7 @@
 
       let module = JITModule(functions: [NamedFunction(name: "choose", function: function)])
       let jitted = try jitCompileModule(module)
-      let compiled: DifferentialJitFn = try #require(
-        jitted.entry(as: DifferentialJitFn.self, name: "choose"))
+      let compiled = try #require(jitted.int64BinaryFunction(named: "choose"))
       let cases: [(Int64, Int64)] = [(-4, 9), (9, -4), (0, 0), (Int64.min, Int64.max)]
       var generator = DeterministicGenerator(state: 0x4252_414E_4348)
       let randomCases = (0..<64).map { _ in

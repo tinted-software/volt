@@ -176,15 +176,21 @@
         case .mvnRegister(let rd, let rm, let s):
           emitLogic(rd: rd, r: b.arithImm(.bitXor, loadReg(rm), Int64(0xFFFF_FFFF)), s: s)
         case .andImmediate(let rd, let rn, let value, let s):
-          emitLogic(rd: rd, r: b.arithImm(.bitAnd, loadReg(rn), Int64(value)), s: s, shifterCarry: d.shifterCarry)
+          emitLogic(
+            rd: rd, r: b.arithImm(.bitAnd, loadReg(rn), Int64(value)), s: s,
+            shifterCarry: d.shifterCarry)
         case .andRegister(let rd, let rn, let rm, let s):
           emitLogic(rd: rd, r: b.arith(.bitAnd, loadReg(rn), loadReg(rm)), s: s)
         case .eorImmediate(let rd, let rn, let value, let s):
-          emitLogic(rd: rd, r: b.arithImm(.bitXor, loadReg(rn), Int64(value)), s: s, shifterCarry: d.shifterCarry)
+          emitLogic(
+            rd: rd, r: b.arithImm(.bitXor, loadReg(rn), Int64(value)), s: s,
+            shifterCarry: d.shifterCarry)
         case .eorRegister(let rd, let rn, let rm, let s):
           emitLogic(rd: rd, r: b.arith(.bitXor, loadReg(rn), loadReg(rm)), s: s)
         case .orrImmediate(let rd, let rn, let value, let s):
-          emitLogic(rd: rd, r: b.arithImm(.bitOr, loadReg(rn), Int64(value)), s: s, shifterCarry: d.shifterCarry)
+          emitLogic(
+            rd: rd, r: b.arithImm(.bitOr, loadReg(rn), Int64(value)), s: s,
+            shifterCarry: d.shifterCarry)
         case .orrRegister(let rd, let rn, let rm, let s):
           emitLogic(rd: rd, r: b.arith(.bitOr, loadReg(rn), loadReg(rm)), s: s)
         case .addImmediate(let rd, let rn, let value, let s):
@@ -213,8 +219,7 @@
       let f = try ARMv7A32Lifter.lift(code, pc: pc)
       let jit = try jitCompileModule(
         JITModule(functions: [NamedFunction(name: "guest", function: f)]))
-      typealias GuestFn = @convention(c) (UnsafeMutableRawPointer) -> Void
-      let entry: GuestFn = jit.entry(as: GuestFn.self, name: "guest")!
+      let entry = jit.voidPointerFunction(named: "guest")!
       withUnsafeMutablePointer(to: &state) { entry(UnsafeMutableRawPointer($0)) }
     }
   }
