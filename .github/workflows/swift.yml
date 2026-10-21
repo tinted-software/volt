@@ -1,0 +1,43 @@
+name: Swift CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Swift 6.4 — ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default traits
+            swift_args: ""
+          - name: all backends
+            swift_args: "--traits default,ARMv7Emulator"
+          - name: ARMv7 only
+            swift_args: "--disable-default-traits --traits ARMv7"
+          - name: AArch64 only
+            swift_args: "--disable-default-traits --traits AArch64"
+          - name: x86_64 only
+            swift_args: "--disable-default-traits --traits X86_64"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Swift 6.4
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.4"
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Test
+        run: swift test ${{ matrix.swift_args }}
