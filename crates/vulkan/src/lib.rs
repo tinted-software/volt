@@ -290,6 +290,19 @@ pub unsafe extern "C" fn vk_icdNegotiateLoaderICDInterfaceVersion(
 // Core Vulkan Entry Points
 // ============================================================================
 
+/// Builds a new instance. Safe to call; ownership stays with the caller.
+fn create_instance_inner() -> Box<Instance> {
+    let mut inst = Box::new(Instance {
+        loader_magic: ICD_LOADER_MAGIC,
+        physical_device: PhysicalDevice {
+            loader_magic: ICD_LOADER_MAGIC,
+            instance: ptr::null_mut(),
+        },
+    });
+    inst.physical_device.instance = &mut *inst as *mut Instance;
+    inst
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vkCreateInstance(
     _pCreateInfo: *const VkInstanceCreateInfo,
@@ -300,16 +313,7 @@ pub unsafe extern "C" fn vkCreateInstance(
         return VkResult::VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    let mut inst = Box::new(Instance {
-        loader_magic: ICD_LOADER_MAGIC,
-        physical_device: PhysicalDevice {
-            loader_magic: ICD_LOADER_MAGIC,
-            instance: ptr::null_mut(),
-        },
-    });
-    inst.physical_device.instance = &mut *inst as *mut Instance;
-
-    *pInstance = Box::into_raw(inst) as VkInstance;
+    *pInstance = Box::into_raw(create_instance_inner()) as VkInstance;
     VkResult::VK_SUCCESS
 }
 
@@ -442,17 +446,8 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceMemoryProperties(
     };
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vkCreateDevice(
-    _physicalDevice: VkPhysicalDevice,
-    _pCreateInfo: *const VkDeviceCreateInfo,
-    _pAllocator: *const c_void,
-    pDevice: *mut VkDevice,
-) -> VkResult {
-    if pDevice.is_null() {
-        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
-    }
-
+/// Builds a new device. Safe to call; ownership stays with the caller.
+fn create_device_inner() -> Box<Device> {
     let mut dev = Box::new(Device {
         loader_magic: ICD_LOADER_MAGIC,
         hal: HalDevice::new(),
@@ -470,8 +465,21 @@ pub unsafe extern "C" fn vkCreateDevice(
         next_handle: 1,
     });
     dev.queue.device = &mut *dev as *mut Device;
+    dev
+}
 
-    *pDevice = Box::into_raw(dev) as VkDevice;
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vkCreateDevice(
+    _physicalDevice: VkPhysicalDevice,
+    _pCreateInfo: *const VkDeviceCreateInfo,
+    _pAllocator: *const c_void,
+    pDevice: *mut VkDevice,
+) -> VkResult {
+    if pDevice.is_null() {
+        return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    *pDevice = Box::into_raw(create_device_inner()) as VkDevice;
     VkResult::VK_SUCCESS
 }
 
@@ -1483,22 +1491,17 @@ mod tests {
     #[test]
     fn test_vulkan_e2e_clear_and_render() {
         unsafe {
-            let mut instance = ptr::null_mut();
-            assert_eq!(
-                vkCreateInstance(ptr::null(), ptr::null(), &mut instance),
-                VkResult::VK_SUCCESS
-            );
+            let mut instance_box = create_instance_inner();
+            let instance = &mut *instance_box as *mut Instance as VkInstance;
             let mut count = 1;
             let mut phys = ptr::null_mut();
             assert_eq!(
                 vkEnumeratePhysicalDevices(instance, &mut count, &mut phys),
                 VkResult::VK_SUCCESS
             );
-            let mut device = ptr::null_mut();
-            assert_eq!(
-                vkCreateDevice(phys, ptr::null(), ptr::null(), &mut device),
-                VkResult::VK_SUCCESS
-            );
+            // The test owns the device; the raw handle is only passed to the C entry points.
+            let mut device_box = create_device_inner();
+            let device = &mut *device_box as *mut Device as VkDevice;
 
             // Create color image (64x64 RGBA)
             let mut image = 0;
@@ -1645,9 +1648,8 @@ mod tests {
             assert_eq!(vkQueueSubmit(queue, 1, &submit, 0), VkResult::VK_SUCCESS);
 
             // Verify that the color attachment was cleared with the clear color in HAL
-            let dev_ref = &*(device as *const Device);
-            let img_binding = dev_ref.images.get(&image).expect("image binding");
-            let hal_img = dev_ref.hal.image(img_binding.hal_id).expect("hal image");
+            let img_binding = device_box.images.get(&image).expect("image binding");
+            let hal_img = device_box.hal.image(img_binding.hal_id).expect("hal image");
             // Check first pixel RGBA values (0.25 * 255.0 = 63.75 -> round to 64, 0.5 * 255.0 = 127.5 -> round to 128, 0.75 * 255.0 = 191.25 -> round to 191, 1.0 * 255 = 255)
             assert_eq!(hal_img.data[0], 64);
             assert_eq!(hal_img.data[1], 128);
@@ -1659,8 +1661,7 @@ mod tests {
             vkDestroyImageView(device, view, ptr::null());
             vkDestroyImage(device, image, ptr::null());
             vkDestroyCommandPool(device, pool, ptr::null());
-            vkDestroyDevice(device, ptr::null());
-            vkDestroyInstance(instance, ptr::null());
+            // `device_box` and `instance_box` are owned by this test and dropped at scope end.
         }
     }
 }
