@@ -123,11 +123,11 @@ pub fn parse(image: &[u8]) -> Result<Kernel, Error> {
                 if !in_file {
                     return Err(bad("segment data runs past the end of the file"));
                 }
-                if segment.filesize > segment.vmsize {
-                    return Err(bad("segment has more file data than memory"));
-                }
-                // Prelink placeholders are empty and linked at unrelated addresses.
+                // Prelink placeholders and non-loaded segments (e.g. __CTF) have vmsize == 0.
                 if segment.vmsize != 0 {
+                    if segment.filesize > segment.vmsize {
+                        return Err(bad("segment has more file data than memory"));
+                    }
                     segments.push(segment);
                 }
             }
