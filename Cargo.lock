@@ -18,12 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "arrayvec"
-version = "0.7.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
-
-[[package]]
 name = "awint"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -108,6 +102,20 @@ name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a1f896587b6f2c069c73d2f0913e2d590c3990285cd2f0b6aa02b786b4c679c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
 
 [[package]]
 name = "bytes"
@@ -186,6 +194,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "glam"
+version = "0.33.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37bfe73dc8ec21f54d181e5a60554327ec3f1c600c455a75ccbfc65d2106a6c4"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -194,6 +211,7 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+ "rustc-std-workspace-alloc",
 ]
 
 [[package]]
@@ -229,6 +247,22 @@ name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "linkme"
@@ -331,13 +365,12 @@ dependencies = [
  "once_vec",
  "pliron-derive",
  "regex",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "rustc_apfloat",
  "slotmap",
  "smallvec",
  "spin",
  "thiserror",
- "utf8-chars",
 ]
 
 [[package]]
@@ -351,8 +384,20 @@ dependencies = [
  "indexmap",
  "proc-macro2",
  "quote",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "pliron-llvm"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b04f59dc2ac2198d67f24775a5d5b37f7d4da1feedc893cd43f2cb7d8ff1d9a"
+dependencies = [
+ "bitflags",
+ "log",
+ "pliron",
+ "thiserror",
 ]
 
 [[package]]
@@ -418,10 +463,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rspirv"
+version = "0.13.0+sdk-1.4.341.0"
+source = "git+https://github.com/gfx-rs/rspirv#7e6f38e1cf4b787a4d38409272c8c9f30541f0fd"
+dependencies = [
+ "rustc-hash 1.1.0",
+ "spirv",
+]
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+
+[[package]]
+name = "rustc-std-workspace-alloc"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9d441c3b2ebf55cebf796bfdc265d67fa09db17b7bb6bd4be75c509e1e8fec3"
 
 [[package]]
 name = "rustc_apfloat"
@@ -476,6 +542,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
 dependencies = [
  "lock_api",
+]
+
+[[package]]
+name = "spirv"
+version = "0.4.0+sdk-1.4.341.0"
+source = "git+https://github.com/gfx-rs/rspirv#7e6f38e1cf4b787a4d38409272c8c9f30541f0fd"
+dependencies = [
+ "bitflags",
 ]
 
 [[package]]
@@ -542,19 +616,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
-name = "utf8-chars"
-version = "3.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92498c67ea3511b37eccff13b573ed871faf0ce9c4056ab032bd01a681f445a0"
-dependencies = [
- "arrayvec",
-]
-
-[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "volt-codegen"
+version = "0.1.0"
+dependencies = [
+ "hashbrown",
+ "pliron",
+ "pliron-llvm",
+]
+
+[[package]]
+name = "volt-codegen-gfx10"
+version = "0.1.0"
+dependencies = [
+ "pliron",
+ "volt-codegen",
+]
+
+[[package]]
+name = "volt-drm"
+version = "0.1.0"
 
 [[package]]
 name = "volt-emulator"
@@ -562,8 +648,9 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "parking_lot",
- "volt-ir",
- "volt-target",
+ "volt-emulator-core",
+ "volt-host",
+ "volt-platform",
 ]
 
 [[package]]
@@ -571,8 +658,72 @@ name = "volt-emulator-cli"
 version = "0.1.0"
 dependencies = [
  "volt-emulator",
+ "volt-host",
+ "volt-platform",
  "winnow-args",
  "zrip",
+]
+
+[[package]]
+name = "volt-emulator-core"
+version = "0.1.0"
+dependencies = [
+ "hashbrown",
+ "libm",
+ "spin",
+ "volt-hal",
+ "volt-host",
+ "volt-ir",
+ "volt-platform",
+ "volt-target-core",
+]
+
+[[package]]
+name = "volt-gl"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libloading",
+ "spin",
+ "volt-gles",
+ "volt-hal",
+ "volt-platform",
+ "volt-wsi",
+]
+
+[[package]]
+name = "volt-gles"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "hashbrown",
+ "libm",
+ "smallvec",
+ "spin",
+ "volt-hal",
+ "volt-raster",
+]
+
+[[package]]
+name = "volt-hal"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "hashbrown",
+ "smallvec",
+ "volt-raster",
+ "volt-shader",
+ "volt-shader-abi",
+]
+
+[[package]]
+name = "volt-host"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libloading",
+ "volt-platform",
 ]
 
 [[package]]
@@ -583,12 +734,83 @@ dependencies = [
 ]
 
 [[package]]
+name = "volt-platform"
+version = "0.1.0"
+
+[[package]]
+name = "volt-raster"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "libm",
+]
+
+[[package]]
+name = "volt-shader"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "pliron",
+ "pliron-llvm",
+ "volt-codegen",
+ "volt-codegen-gfx10",
+ "volt-raster",
+ "volt-shader-abi",
+]
+
+[[package]]
+name = "volt-shader-abi"
+version = "0.1.0"
+
+[[package]]
+name = "volt-shader-spirv"
+version = "0.1.0"
+dependencies = [
+ "rspirv",
+ "spirv",
+]
+
+[[package]]
 name = "volt-target"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "volt-host",
+ "volt-ir",
+ "volt-platform",
+ "volt-target-core",
+]
+
+[[package]]
+name = "volt-target-core"
+version = "0.1.0"
+dependencies = [
  "object",
  "volt-ir",
+]
+
+[[package]]
+name = "volt-vulkan"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "hashbrown",
+ "smallvec",
+ "volt-hal",
+ "volt-raster",
+ "volt-shader-spirv",
+]
+
+[[package]]
+name = "volt-wsi"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libloading",
+ "spin",
+ "volt-drm",
+ "volt-hal",
+ "volt-platform",
 ]
 
 [[package]]

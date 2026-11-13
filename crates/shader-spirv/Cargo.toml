@@ -1,0 +1,12 @@
+[package]
+name = "volt-shader-spirv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rspirv.workspace = true
+spirv.workspace = true
+
+[lints]
+workspace = true

@@ -1,11 +1,28 @@
 [workspace]
 resolver = "3"
 members = [
-    "src/target",
-    "src/ir",
-    "src/emulator",
-    "src/emulator/cli",
+    "crates/platform",
+    "crates/host",
+    "crates/target-core",
+    "crates/target",
+    "crates/ir",
+    "crates/shader-abi",
+    "crates/codegen",
+    "crates/codegen-gfx10",
+    "crates/raster",
+    "crates/shader",
+    "crates/shader-spirv",
+    "crates/hal",
+    "crates/gles",
+    "crates/drm",
+    "crates/wsi",
+    "crates/gl",
+    "crates/vulkan",
+    "crates/emulator-core",
+    "crates/emulator",
+    "crates/boot",
 ]
+exclude = ["crates/baremetal"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,16 +30,37 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-volt-ir = { path = "src/ir" }
-volt-target = { path = "src/target" }
-volt-emulator = { path = "src/emulator" }
-
+volt-platform = { path = "crates/platform" }
+volt-host = { path = "crates/host" }
+volt-ir = { path = "crates/ir" }
+volt-target-core = { path = "crates/target-core" }
+volt-emulator-core = { path = "crates/emulator-core" }
+volt-emulator = { path = "crates/emulator" }
+volt-shader-abi = { path = "crates/shader-abi" }
+volt-codegen = { path = "crates/codegen" }
+volt-codegen-gfx10 = { path = "crates/codegen-gfx10" }
+volt-raster = { path = "crates/raster" }
+volt-shader = { path = "crates/shader" }
+volt-shader-spirv = { path = "crates/shader-spirv" }
+volt-hal = { path = "crates/hal" }
+volt-gles = { path = "crates/gles" }
+volt-drm = { path = "crates/drm" }
+volt-wsi = { path = "crates/wsi" }
+pliron = { version = "0.19.0", default-features = false }
+pliron-llvm = { version = "0.19.0", default-features = false }
+bytemuck = { version = "1.25.2", default-features = false, features = ["derive"] }
+glam = { version = "0.33.7", default-features = false, features = ["nostd-libm", "all-types"] }
+smallvec = { version = "1.16.1", default-features = false }
+rspirv = { git = "https://github.com/gfx-rs/rspirv", default-features = false }
+spirv = { git = "https://github.com/gfx-rs/rspirv", default-features = false }
 object = { version = "0.40.0", default-features = false, features = ["read_core", "write_core", "elf", "macho"] }
 libc = "0.2"
 parking_lot = "0.12"
 winnow-args = "0.1"
 zrip = "0.8"
-
+hashbrown = { version = "0.17.1", default-features = false, features = ["alloc", "default-hasher"] }
+spin = { version = "0.12.3", default-features = false, features = ["mutex", "spin_mutex", "rwlock", "once", "lazy"] }
+libm = { version = "0.2.16", default-features = false }
 [workspace.lints.clippy]
 std_instead_of_core = "deny"
 std_instead_of_alloc = "warn"

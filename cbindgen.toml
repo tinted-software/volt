@@ -1,0 +1,44 @@
+language = "C"
+include_guard = "VOLT_H"
+pragma_once = true
+usize_is_size_t = true
+no_includes = false
+tab_width = 4
+documentation = true
+cpp_compat = true
+
+after_includes = """
+typedef void GLvoid;
+typedef char GLchar;
+typedef unsigned int GLenum;
+typedef unsigned char GLboolean;
+typedef unsigned int GLbitfield;
+typedef signed char GLbyte;
+typedef short GLshort;
+typedef int GLint;
+typedef int GLsizei;
+typedef unsigned char GLubyte;
+typedef unsigned short GLushort;
+typedef unsigned int GLuint;
+typedef float GLfloat;
+typedef float GLclampf;
+typedef double GLdouble;
+typedef double GLclampd;
+typedef int GLfixed;
+typedef int GLclampx;
+typedef intptr_t GLintptr;
+
+typedef int EGLint;
+typedef unsigned int EGLBoolean;
+typedef unsigned int EGLenum;
+typedef void *EGLConfig;
+typedef void *EGLContext;
+typedef void *EGLDisplay;
+typedef void *EGLSurface;
+typedef void *EGLClientBuffer;
+typedef void (*__eglMustCastToProperFunctionPointerType)(void);
+"""
+
+[parse]
+parse_deps = true
+include = ["volt-gles", "volt_gles", "volt-gl", "volt_gl"]

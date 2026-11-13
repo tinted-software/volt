@@ -1,0 +1,21 @@
+[package]
+name = "volt-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+std = ["volt-raster/std", "volt-shader/std"]
+amdgpu = ["volt-shader/backend-amdgpu"]
+
+[dependencies]
+bytemuck.workspace = true
+volt-raster.workspace = true
+volt-shader.workspace = true
+volt-shader-abi.workspace = true
+hashbrown.workspace = true
+smallvec.workspace = true
+
+[lints]
+workspace = true

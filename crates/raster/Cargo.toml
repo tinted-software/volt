@@ -1,0 +1,16 @@
+[package]
+name = "volt-raster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+std = []
+
+[dependencies]
+bytemuck.workspace = true
+libm.workspace = true
+
+[lints]
+workspace = true

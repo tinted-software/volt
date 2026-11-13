@@ -1,0 +1,29 @@
+[package]
+name = "volt-gl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EGL 1.4 + GBM + GLES 1.1 C ABI library for Volt."
+
+[lib]
+name = "volt_gl"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[features]
+default = ["std", "capi"]
+std = ["volt-gles/std", "volt-hal/std", "volt-wsi/std"]
+capi = []
+
+[dependencies]
+spin.workspace = true
+volt-gles.workspace = true
+volt-hal.workspace = true
+volt-platform.workspace = true
+volt-wsi.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+libloading = "0.9.0"
+
+[lints]
+workspace = true

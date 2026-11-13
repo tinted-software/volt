@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "volt-baremetal"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+volt-platform = { path = "../platform" }
+volt-target-core = { path = "../target-core", default-features = false, features = ["aarch64"] }
+volt-emulator-core = { path = "../emulator-core" }
+volt-hal = { path = "../hal", default-features = false }
+volt-raster = { path = "../raster", default-features = false }
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 3

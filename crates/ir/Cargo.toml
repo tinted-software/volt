@@ -1,0 +1,18 @@
+[package]
+name = "volt-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+pliron = { workspace = true, optional = true }
+
+[features]
+default = ["std"]
+std = ["dep:pliron"]

@@ -1,0 +1,24 @@
+[package]
+name = "volt-wsi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared window system integration (DRM, GEM, DRI3, X11 MIT-SHM, software fallback) for Volt."
+
+[features]
+default = ["std"]
+std = ["dep:libloading", "volt-hal/std"]
+amdgpu = ["volt-hal/amdgpu"]
+
+[dependencies]
+volt-platform.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+volt-hal.workspace = true
+volt-drm.workspace = true
+libc.workspace = true
+spin.workspace = true
+libloading = { version = "0.9.0", default-features = false, optional = true }
+
+[lints]
+workspace = true

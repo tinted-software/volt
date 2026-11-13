@@ -1,0 +1,12 @@
+[package]
+name = "volt-drm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Linux DRM client substrate: render nodes, dumb GEM buffers, PRIME fd passing."
+
+[features]
+default = []
+
+[lints]
+workspace = true

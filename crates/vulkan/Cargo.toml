@@ -1,0 +1,26 @@
+[package]
+name = "volt-vulkan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vulkan ICD implementation for Volt."
+
+[lib]
+name = "volt_vk"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["std"]
+std = ["volt-hal/std"]
+capi = []
+
+[dependencies]
+smallvec.workspace = true
+volt-hal.workspace = true
+volt-shader-spirv.workspace = true
+volt-raster.workspace = true
+hashbrown.workspace = true
+bytemuck.workspace = true
+
+[lints]
+workspace = true

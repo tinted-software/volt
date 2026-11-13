@@ -1,0 +1,27 @@
+[package]
+name = "volt-gles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenGL ES 1.1 (CM) state machine and C ABI entry points for Volt."
+
+[lib]
+name = "volt_gles"
+crate-type = ["rlib"]
+
+[features]
+default = []
+std = ["volt-hal/std", "volt-raster/std"]
+
+[dependencies]
+smallvec.workspace = true
+volt-hal.workspace = true
+volt-raster.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+hashbrown.workspace = true
+spin.workspace = true
+libm.workspace = true
+
+[lints]
+workspace = true

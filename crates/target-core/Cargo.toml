@@ -1,0 +1,20 @@
+[package]
+name = "volt-target-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+object = { workspace = true, optional = true }
+volt-ir = { workspace = true, default-features = false }
+
+[lints]
+workspace = true
+
+[features]
+default = ["aarch64", "x86_64"]
+aarch64 = ["dep:object"]
+x86_64 = ["dep:object"]

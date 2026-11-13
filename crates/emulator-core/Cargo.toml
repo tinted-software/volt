@@ -1,0 +1,20 @@
+[package]
+name = "volt-emulator-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+volt-ir = { workspace = true, default-features = false }
+volt-target-core.workspace = true
+volt-hal = { workspace = true, default-features = false }
+volt-platform.workspace = true
+hashbrown.workspace = true
+libm.workspace = true
+spin.workspace = true
+
+[dev-dependencies]
+volt-host.workspace = true
+
+[lints]
+workspace = true

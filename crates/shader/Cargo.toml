@@ -1,0 +1,32 @@
+[package]
+name = "volt-shader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+std = ["volt-raster/std"]
+backend-amdgpu = ["dep:volt-shader-abi"]
+
+[dependencies]
+libm.workspace = true
+volt-raster.workspace = true
+volt-shader-abi = { workspace = true, optional = true }
+
+[build-dependencies]
+pliron.workspace = true
+pliron-llvm.workspace = true
+volt-codegen.workspace = true
+volt-codegen-gfx10.workspace = true
+volt-raster.workspace = true
+volt-shader-abi.workspace = true
+
+[dev-dependencies]
+pliron.workspace = true
+pliron-llvm.workspace = true
+volt-codegen.workspace = true
+volt-codegen-gfx10.workspace = true
+
+[lints]
+workspace = true

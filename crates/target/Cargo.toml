@@ -1,0 +1,24 @@
+[package]
+name = "volt-target"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+volt-target-core.workspace = true
+volt-ir.workspace = true
+volt-platform.workspace = true
+volt-host = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+
+[lints]
+workspace = true
+
+[features]
+default = ["std", "aarch64", "x86_64"]
+std = ["dep:volt-host", "dep:libc"]
+aarch64 = ["volt-target-core/aarch64"]
+x86_64 = ["volt-target-core/x86_64"]
