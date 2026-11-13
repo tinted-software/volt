@@ -1753,12 +1753,8 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             immediate: ((word >> 8) & 15) as u8,
         }));
     }
-    if word & 0xffe0_f000 == 0xd420_0000 {
-        return if word & 0x0000_ffe0 == 0x20 {
-            Ok(Trap)
-        } else {
-            Err(UnsupportedInstruction)
-        };
+    if word & 0xffe0_001f == 0xd420_0000 {
+        return Ok(Trap);
     }
     if word & 0x1f00_0000 == 0x1000_0000 {
         let page = word & 0x8000_0000 != 0;

@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 const MH_MAGIC_64: u32 = 0xfeed_facf;
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const MH_EXECUTE: u32 = 2;
+const MH_FILESET: u32 = 0xc;
 const LC_UNIXTHREAD: u32 = 0x5;
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_MAIN: u32 = 0x8000_0028;
@@ -86,8 +87,10 @@ pub fn parse(image: &[u8]) -> Result<Kernel, Error> {
     if word(4) != CPU_TYPE_ARM64 {
         return Err(bad("not an arm64 Mach-O"));
     }
-    if word(12) != MH_EXECUTE {
-        return Err(bad("not an executable Mach-O"));
+    // A kernelcache (`MH_FILESET`) is loaded the same way: its outer header lists
+    // every segment of the collection and the entry point.
+    if word(12) != MH_EXECUTE && word(12) != MH_FILESET {
+        return Err(bad("not an executable or fileset Mach-O"));
     }
     let commands_end = HEADER_SIZE
         .checked_add(word(20) as usize)

@@ -144,8 +144,9 @@ enum Op {
         rn: u8,
         rm: u8,
     },
-    /// `shl`, and `sshr`/`ushr`, by an immediate.
+    /// `shl`, and `sshr`/`ushr` (`ssra`/`usra` when `accumulate`), by an immediate.
     ShiftImm {
+        accumulate: bool,
         right: bool,
         signed: bool,
         size: u32,
@@ -356,6 +357,7 @@ fn parse(word: u32) -> Option<Op> {
         let esize = 8 << size;
         return match (u, (word >> 11) & 0x1f) {
             (false, 0b01010) if size < 3 || q => Some(Op::ShiftImm {
+                accumulate: false,
                 right: false,
                 signed: false,
                 size,
@@ -364,7 +366,8 @@ fn parse(word: u32) -> Option<Op> {
                 rd,
                 rn,
             }),
-            (_, 0b00000) if size < 3 || q => Some(Op::ShiftImm {
+            (_, 0b00000 | 0b00010) if size < 3 || q => Some(Op::ShiftImm {
+                accumulate: (word >> 11) & 0x1f == 0b00010,
                 right: true,
                 signed: !u,
                 size,
@@ -701,6 +704,7 @@ pub fn run(cpu: &mut Cpu, word: u32) {
             write(cpu, rd, value, false);
         }
         Op::ShiftImm {
+            accumulate,
             right,
             signed: signed_lane,
             size,
@@ -710,6 +714,7 @@ pub fn run(cpu: &mut Cpu, word: u32) {
             rn,
         } => {
             let a = read(cpu, rn);
+            let acc = if accumulate { read(cpu, rd) } else { 0 };
             let bits = 8 << size;
             let mut out = 0;
             for i in 0..lanes(size, q) {
@@ -721,7 +726,12 @@ pub fn run(cpu: &mut Cpu, word: u32) {
                 } else {
                     x >> shift
                 };
-                put(&mut out, bits, i, r & mask(bits));
+                put(
+                    &mut out,
+                    bits,
+                    i,
+                    r.wrapping_add(get(acc, bits, i)) & mask(bits),
+                );
             }
             write(cpu, rd, out, q);
         }
@@ -1129,6 +1139,14 @@ mod tests {
         assert_eq!(c.v[0], [u64::MAX >> 1, 1]);
         run(&mut c, 0x6f200420);
         assert_eq!(c.v[0], [0, 0]);
+        // usra.4s #4 adds the shifted lanes to the destination; ssra.4s #4 sign-fills.
+        c.v[0] = pack(32, 4, |i| u128::from(i + 100));
+        c.v[1] = pack(32, 4, |i| [0x10, 0x20, 0xffff_fff0, 0x40][i as usize]);
+        run(&mut c, 0x6f3c1420);
+        assert_eq!(unpack(c.v[0], 32, 4), [101, 103, 102 + 0x0fff_ffff, 107]);
+        c.v[0] = pack(32, 4, |_| 5);
+        run(&mut c, 0x4f3c1420);
+        assert_eq!(unpack(c.v[0], 32, 4), [6, 7, 4, 9]);
         // sshr.16b #7 and sshr.8h #16 fill with the sign bit.
         c.v[1] = pack(8, 16, |i| if i % 2 == 0 { 0x80 } else { 0x7f });
         run(&mut c, 0x4f090420);

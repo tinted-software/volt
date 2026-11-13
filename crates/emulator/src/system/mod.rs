@@ -91,6 +91,8 @@ pub struct BootReport {
     pub instruction: Option<InstructionDiagnostic>,
     pub last_fault_walk: Vec<WalkEntry>,
     pub trace: Vec<machine::TraceEntry>,
+    /// Printable text from the XNU panic log region (`chosen/pram`), if any.
+    pub panic_log: String,
     pub elapsed: Duration,
 }
 impl core::fmt::Display for BootReport {
@@ -142,6 +144,10 @@ impl core::fmt::Display for BootReport {
                 i.physical_address,
                 i.word
             )?;
+        }
+        if !self.panic_log.is_empty() {
+            writeln!(f, "--- panic log:")?;
+            writeln!(f, "{}", self.panic_log)?;
         }
         if !self.last_fault_walk.is_empty() {
             writeln!(f, "page tables for last fault at {:x}:", s.far_el1)?;
@@ -571,6 +577,16 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
     let last_fault_walk =
         walk_diagnostic(&machine.cpu, &machine.memory, machine.cpu.system.far_el1);
     let trace = machine.recent_trace(24);
+    let panic_log = if is_xnu {
+        let mut bytes = vec![0; afdt::PANIC_LOG_SIZE as usize];
+        let base = RAM_BASE + ram_size as u64 - u64::from(afdt::PANIC_LOG_SIZE);
+        match machine.memory.read(base, &mut bytes) {
+            Ok(()) => printable(&bytes),
+            Err(_) => String::new(),
+        }
+    } else {
+        String::new()
+    };
     let report = BootReport {
         reason,
         layout,
@@ -585,10 +601,25 @@ pub fn boot_system<B: crate::devices::BlockBackend>(
         instruction,
         last_fault_walk,
         trace,
+        panic_log,
         elapsed,
     };
     Ok(report)
 }
+fn printable(bytes: &[u8]) -> String {
+    // Keep runs of printable text (and line breaks) from the raw log bytes.
+    let mut out = String::new();
+    for &b in bytes {
+        match b {
+            b'\n' | b'\t' => out.push(b as char),
+            0x20..=0x7e => out.push(b as char),
+            0 => {}
+            _ => out.push('.'),
+        }
+    }
+    out.trim().to_string()
+}
+
 fn instruction_diagnostic<M: GuestMemory>(
     machine: &mut volt_emulator_core::system::machine::Machine<M, volt_host::HostExecMemory>,
     at: u64,
@@ -627,32 +658,43 @@ fn walk_diagnostic(cpu: &Cpu, memory: &impl GuestMemory, address: u64) -> Vec<Wa
     if address == 0 || cpu.system.sctlr_el1 & 1 == 0 {
         return entries;
     }
+    // Same granule and index arithmetic as the translator, so 16KB (Apple) and
+    // 64KB granules are walked as well as 4KB.
+    let tcr = cpu.system.tcr_el1;
     let upper = address >> 63 != 0;
-    let size = if upper {
-        (cpu.system.tcr_el1 >> 16) & 63
+    let (size, granule) = if upper {
+        (
+            (tcr >> 16) & 63,
+            [0u32, 14, 12, 16][((tcr >> 30) & 3) as usize],
+        )
     } else {
-        cpu.system.tcr_el1 & 63
+        (tcr & 63, [12u32, 16, 14, 0][((tcr >> 14) & 3) as usize])
     };
-    let granule = if upper {
-        (cpu.system.tcr_el1 >> 30) & 3
-    } else {
-        (cpu.system.tcr_el1 >> 14) & 3
-    };
-    if (!upper && granule != 0) || (upper && granule != 2) {
+    if granule == 0 || size > 48 || size <= u64::from(granule) {
         return entries;
     }
-    let bits = 64u64.saturating_sub(size);
-    let levels = bits.saturating_sub(12).div_ceil(9).clamp(1, 4) as u8;
+    let va_bits = 64 - size as u32;
+    let stride = granule - 3;
+    let levels = (va_bits - granule).div_ceil(stride).clamp(1, 4);
     let mut table = if upper {
         cpu.system.ttbr1_el1
     } else {
         cpu.system.ttbr0_el1
-    } & 0x0000_ffff_ffff_f000;
-    for level in 4 - levels..4 {
-        let index = (address >> (39 - 9 * level)) & 0x1ff;
+    } & 0x0000_ffff_ffff_ffff
+        & !((1u64 << granule) - 1);
+    for step in 0..levels {
+        let level = (4 - levels + step) as u8;
+        let shift = granule + stride * (levels - 1 - step);
+        let index_bits = if step == 0 {
+            va_bits - (granule + stride * (levels - 1))
+        } else {
+            stride
+        };
+        let index = (address >> shift) & ((1u64 << index_bits) - 1);
+        let at = table.wrapping_add(index * 8);
         let mut bytes = [0; 8];
         let descriptor = memory
-            .read(table + index * 8, &mut bytes)
+            .read(at, &mut bytes)
             .ok()
             .map(|_| u64::from_le_bytes(bytes));
         entries.push(WalkEntry {
@@ -667,7 +709,7 @@ fn walk_diagnostic(cpu: &Cpu, memory: &impl GuestMemory, address: u64) -> Vec<Wa
         if descriptor & 3 != 3 || level == 3 {
             break;
         }
-        table = descriptor & 0x0000_ffff_ffff_f000;
+        table = descriptor & 0x0000_ffff_ffff_ffff & !((1u64 << granule) - 1);
     }
     entries
 }

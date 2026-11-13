@@ -384,7 +384,11 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
                     exception::eret(&mut self.cpu);
                 }
                 Trap::Svc | Trap::Brk => {
-                    let ec = if self.cpu.trap == Trap::Svc { 0x15 } else { 0 };
+                    let ec = match self.cpu.trap {
+                        Trap::Svc => 0x15,
+                        Trap::Brk => 0x3c,
+                        _ => 0,
+                    };
                     self.cpu.trap = Trap::None;
                     let pc = self.cpu.pc;
                     exception::take(
@@ -620,7 +624,9 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
             0x24
         };
         let status = if permission {
-            if instruction { 13 } else { 12 }
+            // Permission faults exist only at levels 1-3 (0x0d-0x0f); XNU rejects
+            // anything else. Report the leaf level of a page mapping.
+            0b001111
         } else {
             4
         };
@@ -633,7 +639,8 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
             exception::Reason {
                 kind: exception::Kind::Sync,
                 ec,
-                instruction,
+                // ESR.IL: every AArch64 instruction is 32 bits. XNU panics on IL=0.
+                instruction: true,
                 status,
             },
             address,
