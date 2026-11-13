@@ -419,6 +419,9 @@ pub struct SimdExtract {
     /// Log2 of the element width in bytes.
     pub esize: u8,
     pub index: u8,
+    /// `smov`: sign-extend the lane (to 64 bits when `x64`, else to 32).
+    pub signed: bool,
+    pub x64: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SimdFmov {
@@ -1179,6 +1182,15 @@ fn system_register(
         0x3420 => Nzcv,
         _ => return Err(DecodeError::UnsupportedInstruction),
     })
+}
+
+/// Words of a native SIMD class the JIT has no operation for run on the host.
+fn neon_fallback(word: u32) -> Result<Instruction, DecodeError> {
+    if super::neon::is_supported(word) {
+        Ok(Instruction::Host(word))
+    } else {
+        Err(DecodeError::UnsupportedInstruction)
+    }
 }
 
 pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
@@ -1977,7 +1989,7 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             (true, 0b01010) => SimdAluOp::UMaxV,
             (true, 0b11010) => SimdAluOp::UMinV,
             (true, 0b00011) => SimdAluOp::UAddLV,
-            _ => return Err(UnsupportedInstruction),
+            _ => return neon_fallback(word),
         };
         return Ok(SimdAlu(self::SimdAlu {
             op,
@@ -1995,8 +2007,8 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
         let q = word & 0x4000_0000 != 0;
         let u = word & 0x2000_0000 != 0;
         let size = ((word >> 22) & 3) as u8;
-        if !q && size == 3 {
-            return Err(UnsupportedInstruction);
+        if !q && size == 3 && ((word >> 11) & 31) != 0b00011 {
+            return neon_fallback(word);
         }
         let opc = ((word >> 11) & 31) as u8;
         let op = match (u, opc) {
@@ -2048,7 +2060,7 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
             (true, 0b00011) if size == 1 => Bsl,
             (true, 0b00011) if size == 2 => Bit,
             (true, 0b00011) if size == 3 => Bif,
-            _ => return Err(UnsupportedInstruction),
+            _ => return neon_fallback(word),
         };
         return Ok(SimdAlu(self::SimdAlu {
             op,
@@ -2093,9 +2105,28 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
                         rn,
                         esize,
                         index,
+                        signed: false,
+                        x64: false,
                     }))
                 };
             }
+        }
+    }
+    // `smov Wd/Xd, Vn.T[index]`: imm4 = 0101, with Q selecting the destination width.
+    if word & 0xbfe0_fc00 == 0x0e00_2c00 {
+        let imm5 = (word >> 16) & 0x1f;
+        let esize = imm5.trailing_zeros() as u8;
+        let x64 = word & 0x4000_0000 != 0;
+        // Bytes and halfwords either way; words only into an X register.
+        if imm5 != 0 && (esize < 2 || (esize == 2 && x64)) {
+            return Ok(SimdExtract(self::SimdExtract {
+                rd,
+                rn,
+                esize,
+                index: (imm5 >> (esize + 1)) as u8,
+                signed: true,
+                x64,
+            }));
         }
     }
     // `mov Vd.T[i], Vn.T[j]` (`ins`, element): imm5 gives the size and the
@@ -2247,6 +2278,9 @@ pub fn decode(word: u32) -> Result<Instruction, DecodeError> {
         0xd400_0001 => Ok(Svc),
         0xd400_0002 => Ok(Psci),
         0xd503_207f => Ok(Wfi),
+        // The rest of Advanced SIMD runs on the host, after every native decoder
+        // above has had its chance.
+        _ if super::neon::is_supported(word) => Ok(Host(word)),
         _ => Err(UnsupportedInstruction),
     }
 }

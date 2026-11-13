@@ -6,6 +6,7 @@ pub mod exception;
 pub mod fp;
 pub mod host;
 pub mod identification;
+pub mod neon;
 pub mod simd;
 pub mod simd_struct;
 pub mod translate;

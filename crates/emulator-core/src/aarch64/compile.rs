@@ -1248,7 +1248,15 @@ pub fn translate_block(
                 let word = a.index as usize / per_dw;
                 let shift = (a.index as usize % per_dw) as u64 * ebits;
                 let source = l.load(l.u64, at_n + word * 8);
-                let value = l.imm(l.u64, B::BitAnd, l.imm(l.u64, B::Shr, source, shift), emask);
+                let mut value = l.imm(l.u64, B::BitAnd, l.imm(l.u64, B::Shr, source, shift), emask);
+                if a.signed && ebits < 64 {
+                    // `smov`: sign-extend, to 32 bits for a W destination.
+                    let n = 64 - ebits;
+                    value = l.shift(Width::X64, l.imm(l.u64, B::Shl, value, n), Shift::Asr, n);
+                    if !a.x64 {
+                        value = l.imm(l.u64, B::BitAnd, value, 0xffff_ffff);
+                    }
+                }
                 l.put(a.rd, value);
             }
             Instruction::SimdDupElement(a) => {
@@ -3082,6 +3090,25 @@ mod tests {
             let block = compile(0x1000, &bytes(&[word])).unwrap();
             block.run(&mut cpu);
             assert_eq!(cpu.v[0], want, "{word:08x}");
+        }
+    }
+    #[test]
+    fn smov_sign_extends_a_lane_to_w_or_x_and_umov_zero_extends() {
+        // Lane values: b[3] = 0xf0, h[3] = 0x8000, s[3] = 0x8000_0001.
+        let v = [0x8000_0001_f002_0180, 0x8000_0001_8001_ff7f];
+        for (word, want) in [
+            (0x0e072c20, 0x0000_0000_ffff_fff0), // smov w0, v1.b[3]
+            (0x4e072c20, 0xffff_ffff_ffff_fff0), // smov x0, v1.b[3]
+            (0x0e0e2c20, 0x0000_0000_ffff_8000), // smov w0, v1.h[3]
+            (0x4e0e2c20, 0xffff_ffff_ffff_8000), // smov x0, v1.h[3]
+            (0x4e1c2c20, 0xffff_ffff_8000_0001), // smov x0, v1.s[3]
+            (0x0e073c20, 0x0000_0000_0000_00f0), // umov w0, v1.b[3] stays unsigned
+        ] {
+            let mut cpu = Cpu::default();
+            cpu.v[1] = v;
+            let block = compile(0x1000, &bytes(&[word])).unwrap();
+            block.run(&mut cpu);
+            assert_eq!(cpu.x[0], want, "{word:08x}");
         }
     }
     #[test]

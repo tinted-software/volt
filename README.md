@@ -58,12 +58,16 @@ serial-device-name=uart0`. Custom boot-args must not start with `-`.
 
 ### Current state
 
-- **QEMU XNU (`kernel.development.qemu`):** Boots through pmap/VM bootstrap,
-  zone/IOKit start-up, scheduler, and IONVRAM, then panics in `read_random`
-  because the bare kernel lacks the `corecrypto` kext (a prelinked kernelcache
-  is needed to go further).
+- **QEMU XNU kernelcache (`MH_FILESET`):** Boots through VM bootstrap, zone and
+  IOKit start-up, MAC policies and BSD init, up to the root-device wait (the same
+  point QEMU reaches without a rootfs). Pass the kernelcache, not the bare
+  `mach_kernel`.
 - **Apple Silicon / `vmapple` XNU:** Loads Mach-O segments, but currently faults
   on unimplemented ARMv8.3 Pointer Authentication instructions (e.g. `xpaci`).
+- **Advanced SIMD:** The ARMv8.0 integer and floating-point NEON set is
+  implemented in vector and scalar forms and checked bit-for-bit against real
+  hardware. Half-precision, crypto, dot-product and complex-number extensions
+  are not (the ID registers don't advertise them).
 - **Not modelled:** PAN enforcement in translation, physical timer interrupts,
   FP `FPSR` flags / non-nearest rounding, and GICv3 SPIs/SGIs/group 1.
 

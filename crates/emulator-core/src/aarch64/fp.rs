@@ -18,14 +18,14 @@ enum Precision {
     Double,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Unary {
+pub(super) enum Unary {
     Move,
     Abs,
     Neg,
     Sqrt,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Binary {
+pub(super) enum Binary {
     Mul,
     Div,
     Add,
@@ -37,7 +37,7 @@ enum Binary {
     Nmul,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fused {
+pub(super) enum Fused {
     Madd,
     Msub,
     Nmadd,
@@ -350,7 +350,7 @@ pub fn is_supported(word: u32) -> bool {
     parse(word).is_some()
 }
 
-trait Float: Copy + PartialOrd {
+pub(super) trait Float: Copy + PartialOrd {
     const SIGN: u64;
     const QUIET: u64;
     fn from_u64(bits: u64) -> Self;
@@ -431,24 +431,31 @@ float!(
     libm::fma
 );
 
-/// An operation that produced a NaN returns the first NaN operand, quietened, or
-/// the default NaN when the operands were numbers (the host's NaN has its own sign).
-fn nan_or<T: Float>(result: T, operands: &[T]) -> T {
+/// An operation that produced a NaN returns the NaN operand the architecture picks,
+/// quietened: the first signaling NaN if there is one, else the first quiet NaN. It
+/// returns the default NaN when the operands were numbers (the host's NaN has its
+/// own sign).
+pub(super) fn nan_or<T: Float>(result: T, operands: &[T]) -> T {
     if !result.is_nan() {
         return result;
     }
+    let signaling = |o: &&T| o.is_nan() && o.to_u64() & T::QUIET == 0;
     operands
         .iter()
-        .find(|o| o.is_nan())
+        .find(signaling)
+        .or_else(|| operands.iter().find(|o| o.is_nan()))
         .map_or(T::default_nan(), |o| o.quiet())
 }
 
 fn extremum<T: Float>(a: T, b: T, max: bool, numbers_win: bool) -> T {
     if a.is_nan() || b.is_nan() {
-        // `fmaxnm`/`fminnm` prefer the number over a quiet NaN.
-        if numbers_win && !(a.is_nan() && b.is_nan()) {
+        // `fmaxnm`/`fminnm` prefer the number over a quiet NaN only; a signaling
+        // NaN still produces a NaN.
+        let quiet_nan = |x: T| x.is_nan() && x.to_u64() & T::QUIET != 0;
+        if numbers_win && ((quiet_nan(a) && !b.is_nan()) || (quiet_nan(b) && !a.is_nan())) {
             return if a.is_nan() { b } else { a };
         }
+        // Two quiet NaNs under `fmaxnm` also stay NaN (the first one).
         return nan_or(T::default_nan(), &[a, b]);
     }
     if a == b {
@@ -458,7 +465,7 @@ fn extremum<T: Float>(a: T, b: T, max: bool, numbers_win: bool) -> T {
     if (a > b) == max { a } else { b }
 }
 
-fn binary<T: Float>(kind: Binary, a: T, b: T) -> T {
+pub(super) fn binary<T: Float>(kind: Binary, a: T, b: T) -> T {
     let result = match kind {
         Binary::Mul => a.mul(b),
         Binary::Div => a.div(b),
@@ -480,7 +487,7 @@ fn binary<T: Float>(kind: Binary, a: T, b: T) -> T {
     nan_or(result, &[a, b])
 }
 
-fn fused<T: Float>(kind: Fused, n: T, m: T, a: T) -> T {
+pub(super) fn fused<T: Float>(kind: Fused, n: T, m: T, a: T) -> T {
     // fmadd: a + n*m; fmsub: a - n*m; fnmadd: -a - n*m; fnmsub: n*m - a.
     let (n, a) = match kind {
         Fused::Madd => (n, a),
@@ -488,13 +495,25 @@ fn fused<T: Float>(kind: Fused, n: T, m: T, a: T) -> T {
         Fused::Nmadd => (n.neg(), a.neg()),
         Fused::Nmsub => (n, a.neg()),
     };
-    nan_or(n.fma(m, a), &[n, m, a])
+    // `inf * 0` is invalid whatever the addend (the host `fma` can return an infinite
+    // addend instead); a signaling-NaN addend still wins and is quietened.
+    let inf = |x: T| !x.is_nan() && x.sub(x).is_nan();
+    let zero = |x: T| x.to_u64() & !T::SIGN == 0;
+    if (inf(n) && zero(m)) || (zero(n) && inf(m)) {
+        let signaling = a.is_nan() && a.to_u64() & T::QUIET == 0;
+        return if signaling {
+            a.quiet()
+        } else {
+            T::default_nan()
+        };
+    }
+    // NaN operands are processed addend first, then the two factors.
+    nan_or(n.fma(m, a), &[a, n, m])
 }
 
-fn unary<T: Float>(kind: Unary, a: T) -> T {
+pub(super) fn unary<T: Float>(kind: Unary, a: T) -> T {
     match kind {
         Unary::Move => a,
-        Unary::Abs if a.is_nan() => a,
         Unary::Abs => T::from_u64(a.to_u64() & !T::SIGN),
         Unary::Neg => a.neg(),
         Unary::Sqrt => nan_or(a.sqrt(), &[a]),

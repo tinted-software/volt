@@ -1,8 +1,10 @@
 //! Instructions the JIT does not compile. It stores the raw word in `Cpu::value`
 //! and traps; the machine (or user mode) then runs the word on the host here.
-//! Floating point and the wider integer SIMD families live in [`fp`] and [`simd`].
+//! Floating point and the wider integer SIMD families live in [`fp`] and [`simd`];
+//! [`neon`] is the catch-all for the rest of Advanced SIMD, which the decoder only
+//! consults once nothing else claims a word.
 
-use super::{Cpu, fp, simd};
+use super::{Cpu, fp, neon, simd};
 
 /// Whether [`run`] implements `word`.
 pub fn is_supported(word: u32) -> bool {
@@ -13,7 +15,9 @@ pub fn is_supported(word: u32) -> bool {
 pub fn run(cpu: &mut Cpu, word: u32) {
     if fp::is_supported(word) {
         fp::run(cpu, word)
-    } else {
+    } else if simd::is_supported(word) {
         simd::run(cpu, word)
+    } else {
+        neon::run(cpu, word)
     }
 }
