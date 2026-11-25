@@ -1,5 +1,5 @@
 use super::{
-    compile::{Block, Error, compile_with_exec},
+    compile::{Block, Error, compile_decoded_with_exec, compile_with_exec},
     cpu::Cpu,
     decode::{Instruction, decode},
 };
@@ -21,7 +21,7 @@ pub trait AheadCompiler: Send + Sync {
 }
 
 pub(super) const MAX_INSNS: usize = 64;
-const DIRECT_SET_BITS: u32 = 15;
+const DIRECT_SET_BITS: u32 = 13;
 const DIRECT_WAYS: usize = 4;
 const NO_ENTRY: u32 = u32::MAX;
 /// `Entry::epoch` value that matches no `Fetch::translation_epoch`.
@@ -36,13 +36,28 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     h
 }
 
+#[derive(Clone, Copy)]
+struct HotEntry {
+    pc: u64,
+    entry: unsafe extern "C" fn(*mut Cpu) -> u64,
+    tlb_epoch: u64,
+    write_epoch: u64,
+    page: u64,
+    version: u32,
+    modifies_sys: bool,
+    fast: bool,
+    succ: [u32; 2],
+}
+
 pub struct Cache<E: ExecMemory> {
     entries: Vec<Entry<E::Image>>,
+    hot: Vec<HotEntry>,
     index: HashMap<(u64, u64), Vec<usize>>,
     /// Set-associative `pc -> entry` table for the hit fast path, `DIRECT_WAYS`
     /// slots per set, newest first. Slots carry the pc so a probe never touches
     /// `entries` unless it matches.
     direct: Box<[DirectSlot]>,
+    last_idx: u32,
     /// Where blocks come from on a local miss. Private to this cache unless
     /// built with `with_shared`.
     shared: Arc<SharedBlocks<E>>,
@@ -51,8 +66,10 @@ impl<E: ExecMemory + Default> Default for Cache<E> {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
+            hot: Vec::new(),
             index: HashMap::new(),
             direct: alloc_direct(),
+            last_idx: NO_ENTRY,
             shared: Arc::new(SharedBlocks::new(E::default(), false)),
         }
     }
@@ -140,6 +157,27 @@ impl<E: ExecMemory> SharedBlocks<E> {
         self.inline_memory
     }
     pub fn get(&self, pc: u64, bytes: &[u8]) -> Result<Arc<Block<E::Image>>, Error> {
+        self.get_with_origin(pc, bytes, None)
+            .map(|(block, _)| block)
+    }
+
+    pub fn get_decoded(
+        &self,
+        pc: u64,
+        bytes: &[u8],
+        decoded: &[Instruction],
+    ) -> Result<Arc<Block<E::Image>>, Error> {
+        self.get_with_origin(pc, bytes, Some(decoded))
+            .map(|(block, _)| block)
+    }
+
+    /// Look up or compile `(pc, bytes)`, returning `(block, compiled_here)`.
+    pub fn get_with_origin(
+        &self,
+        pc: u64,
+        bytes: &[u8],
+        decoded: Option<&[Instruction]>,
+    ) -> Result<(Arc<Block<E::Image>>, bool), Error> {
         let key = (pc, hash_bytes(bytes));
         let slot = {
             let mut map = lock(&self.map);
@@ -158,18 +196,17 @@ impl<E: ExecMemory> SharedBlocks<E> {
         };
         let mut compiled = lock(&slot.block);
         if let Some(block) = &*compiled {
-            return Ok(block.clone());
+            return Ok((block.clone(), false));
         }
         // A failed compile leaves the slot empty, so the next request retries.
-        let block = Arc::new(compile_with_exec(
-            &self.exec,
-            pc,
-            bytes,
-            self.inline_memory,
-        )?);
+        let compiled_block = match decoded {
+            Some(insns) => compile_decoded_with_exec(&self.exec, pc, insns, self.inline_memory)?,
+            None => compile_with_exec(&self.exec, pc, bytes, self.inline_memory)?,
+        };
+        let block = Arc::new(compiled_block);
         self.compiled.fetch_add(1, Ordering::Relaxed);
         *compiled = Some(block.clone());
-        Ok(block)
+        Ok((block, true))
     }
 }
 
@@ -193,6 +230,14 @@ pub trait Fetch {
     }
     /// Current write-tracker version of physical code page `page`.
     fn page_version(&self, _page: u64) -> Option<u32> {
+        None
+    }
+    /// Global watched-page write epoch (Acquire).
+    fn write_epoch(&self) -> Option<u64> {
+        None
+    }
+    /// Global watched-page write epoch (Relaxed) for burst validation.
+    fn write_epoch_relaxed(&self) -> Option<u64> {
         None
     }
 }
@@ -224,8 +269,10 @@ impl<E: ExecMemory> Cache<E> {
     pub fn with_shared(shared: Arc<SharedBlocks<E>>) -> Self {
         Self {
             entries: Vec::new(),
+            hot: Vec::new(),
             index: HashMap::new(),
             direct: alloc_direct(),
+            last_idx: NO_ENTRY,
             shared,
         }
     }
@@ -239,10 +286,15 @@ impl<E: ExecMemory> Cache<E> {
         self.entries.is_empty()
     }
     pub fn get_or_compile(&mut self, pc: u64, bytes: &[u8]) -> Result<&Block<E::Image>, Error> {
-        let at = self.lookup_or_compile(pc, bytes)?;
+        let at = self.lookup_or_compile(pc, bytes, None)?;
         Ok(&self.entries[at].block)
     }
-    fn lookup_or_compile(&mut self, pc: u64, bytes: &[u8]) -> Result<usize, Error> {
+    fn lookup_or_compile(
+        &mut self,
+        pc: u64,
+        bytes: &[u8],
+        decoded: Option<&[Instruction]>,
+    ) -> Result<usize, Error> {
         let key = (pc, hash_bytes(bytes));
         if let Some(bucket) = self.index.get(&key) {
             for &at in bucket {
@@ -251,11 +303,25 @@ impl<E: ExecMemory> Cache<E> {
                 }
             }
         }
-        let block = self.shared.get(pc, bytes)?;
-        // Another thread may have just written this block's code; make sure this
-        // one fetches the new instructions.
-        self.shared.exec().instruction_barrier();
+        let (block, compiled_here) = self.shared.get_with_origin(pc, bytes, decoded)?;
+        // Another thread may have written this block's code; make sure this
+        // thread fetches the new instructions. When compiled here, `map_code`
+        // already executed `sync_icache` on this thread.
+        if !compiled_here {
+            self.shared.exec().instruction_barrier();
+        }
         let at = self.entries.len();
+        self.hot.push(HotEntry {
+            pc,
+            entry: block.entry,
+            tlb_epoch: NO_EPOCH,
+            write_epoch: NO_EPOCH,
+            page: 0,
+            version: 0,
+            modifies_sys: block.meta.modifies_sys,
+            fast: false,
+            succ: [NO_ENTRY, NO_ENTRY],
+        });
         self.entries.push(Entry {
             pc,
             bytes: bytes.into(),
@@ -287,6 +353,120 @@ impl<E: ExecMemory> Cache<E> {
         set.copy_within(..way, 1);
         set[0] = DirectSlot { pc, at };
     }
+    #[inline(always)]
+    fn record_chain(&mut self, at: u32) {
+        if self.last_idx != NO_ENTRY {
+            let s0 = self.hot[self.last_idx as usize].succ[0];
+            if s0 != at {
+                self.hot[self.last_idx as usize].succ = [at, s0];
+            }
+        }
+        self.last_idx = at;
+    }
+
+    pub fn run_burst<T: Fetch>(
+        &mut self,
+        cpu: &mut Cpu,
+        fetch: &mut T,
+        trace: &mut [crate::system::machine::TraceEntry; 512],
+        blocks_run: &mut u64,
+        watch_timer: bool,
+        budget: usize,
+    ) -> Result<usize, Error> {
+        let Some(cur_tlb_epoch) = fetch.translation_epoch() else {
+            trace[*blocks_run as usize & 511] = crate::system::machine::TraceEntry {
+                pc: cpu.pc,
+                sp: cpu.sp,
+            };
+            self.run_block_with(cpu, fetch)?;
+            *blocks_run += 1;
+            return Ok(1);
+        };
+        let Some(_) = fetch.write_epoch() else {
+            trace[*blocks_run as usize & 511] = crate::system::machine::TraceEntry {
+                pc: cpu.pc,
+                sp: cpu.sp,
+            };
+            self.run_block_with(cpu, fetch)?;
+            *blocks_run += 1;
+            return Ok(1);
+        };
+
+        let mut pc = cpu.pc;
+        let cval = cpu.system.cntv_cval_el0;
+        cpu.trap = super::cpu::Trap::None;
+        let mut ran = 0usize;
+
+        while ran < budget {
+            let mut hit = NO_ENTRY;
+            if self.last_idx != NO_ENTRY {
+                let succ = self.hot[self.last_idx as usize].succ;
+                if succ[0] != NO_ENTRY && self.hot[succ[0] as usize].pc == pc {
+                    hit = succ[0];
+                } else if succ[1] != NO_ENTRY && self.hot[succ[1] as usize].pc == pc {
+                    hit = succ[1];
+                    self.hot[self.last_idx as usize].succ = [hit, succ[0]];
+                }
+            }
+            if hit == NO_ENTRY {
+                let cand = self.find_direct(pc);
+                if cand != NO_ENTRY && self.hot[cand as usize].pc == pc {
+                    hit = cand;
+                    if self.last_idx != NO_ENTRY {
+                        let s0 = self.hot[self.last_idx as usize].succ[0];
+                        if s0 != hit {
+                            self.hot[self.last_idx as usize].succ = [hit, s0];
+                        }
+                    }
+                }
+            }
+            if hit != NO_ENTRY {
+                let h = &mut self.hot[hit as usize];
+                if h.fast && h.tlb_epoch == cur_tlb_epoch {
+                    let relaxed_we = fetch.write_epoch_relaxed().unwrap_or(NO_EPOCH);
+                    let valid = if h.write_epoch == relaxed_we {
+                        true
+                    } else {
+                        let cur_we = fetch.write_epoch().unwrap_or(NO_EPOCH);
+                        if fetch.page_version(h.page) == Some(h.version) {
+                            h.write_epoch = cur_we;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if valid {
+                        trace[*blocks_run as usize & 511] =
+                            crate::system::machine::TraceEntry { pc, sp: cpu.sp };
+                        *blocks_run += 1;
+                        ran += 1;
+                        let entry = h.entry;
+                        let modifies_sys = h.modifies_sys;
+                        pc = unsafe { entry(cpu) };
+                        self.last_idx = hit;
+                        if cpu.trap != super::cpu::Trap::None || modifies_sys {
+                            cpu.pc = pc;
+                            return Ok(ran);
+                        }
+                        if watch_timer && cpu.system.cntvct_el0 >= cval {
+                            cpu.pc = pc;
+                            return Ok(ran);
+                        }
+                        continue;
+                    }
+                }
+            }
+            cpu.pc = pc;
+            trace[*blocks_run as usize & 511] =
+                crate::system::machine::TraceEntry { pc, sp: cpu.sp };
+            self.run_block_with(cpu, fetch)?;
+            *blocks_run += 1;
+            return Ok(ran + 1);
+        }
+        cpu.pc = pc;
+        Ok(ran)
+    }
+
     pub fn run_block<F>(&mut self, cpu: &mut Cpu, fetch: F) -> Result<u64, Error>
     where
         F: FnMut(&Cpu, u64, &mut [u8]) -> Result<usize, Error>,
@@ -309,20 +489,29 @@ impl<E: ExecMemory> Cache<E> {
                 if epoch != NO_EPOCH
                     && self.entries[at].epoch == epoch
                     && let Some((page, version)) = self.entries[at].key
-                    && fetch.page_version(page) == Some(version)
                 {
-                    return Ok(self.entries[at].block.run(cpu));
+                    let we = fetch.write_epoch().unwrap_or(NO_EPOCH);
+                    if fetch.page_version(page) == Some(version) {
+                        self.hot[at].write_epoch = we;
+                        self.record_chain(candidate);
+                        return Ok(self.entries[at].block.run(cpu));
+                    }
                 }
+                let we = fetch.write_epoch().unwrap_or(NO_EPOCH);
                 if let Some(now) = fetch.code_key(cpu, pc, false)
                     && self.entries[at].key == Some(now)
                 {
                     self.entries[at].epoch = epoch;
+                    self.hot[at].tlb_epoch = epoch;
+                    self.hot[at].write_epoch = we;
+                    self.record_chain(candidate);
                     return Ok(self.entries[at].block.run(cpu));
                 }
                 // 2. Otherwise (untracked memory, or the page was written):
                 //    refetch the stored length and compare the bytes. On a match
                 //    the entry is still valid and gets the fresh version.
                 let watched = fetch.code_key(cpu, pc, true);
+                let we = fetch.write_epoch().unwrap_or(NO_EPOCH);
                 let len = self.entries[at].bytes.len();
                 let mut bytes = [0u8; MAX_INSNS * 4];
                 let room = &mut bytes[..len];
@@ -331,6 +520,13 @@ impl<E: ExecMemory> Cache<E> {
                 {
                     self.entries[at].key = watched;
                     self.entries[at].epoch = epoch;
+                    if let Some((page, version)) = watched {
+                        self.hot[at].page = page;
+                        self.hot[at].version = version;
+                        self.hot[at].tlb_epoch = epoch;
+                        self.hot[at].write_epoch = we;
+                    }
+                    self.record_chain(candidate);
                     return Ok(self.entries[at].block.run(cpu));
                 }
             }
@@ -338,7 +534,10 @@ impl<E: ExecMemory> Cache<E> {
         // Slow path. Watch the page BEFORE reading any bytes so a concurrent
         // write can only ever make the recorded version stale, never the bytes.
         let watched = fetch.code_key(cpu, pc, true);
+        let we = fetch.write_epoch().unwrap_or(NO_EPOCH);
         let mut bytes = [0u8; MAX_INSNS * 4];
+        let mut decoded = [Instruction::Nop; MAX_INSNS];
+        let mut decoded_len = 0usize;
         let mut count = 0usize;
         let mut complete = false;
         let mut last = None;
@@ -375,6 +574,8 @@ impl<E: ExecMemory> Cache<E> {
                     return Err(Error::Decode { word, pc: at });
                 }
             };
+            decoded[decoded_len] = instruction;
+            decoded_len += 1;
             last = Some((instruction, at));
             if instruction.terminates_with(self.shared.inline_memory()) {
                 complete = true;
@@ -389,11 +590,19 @@ impl<E: ExecMemory> Cache<E> {
             }
         }
         let known = self.entries.len();
-        let at = self.lookup_or_compile(pc, &bytes[..count])?;
+        let at = self.lookup_or_compile(pc, &bytes[..count], Some(&decoded[..decoded_len]))?;
         if complete && (pc & 0xfff) + count as u64 <= 0x1000 {
+            let epoch = fetch.translation_epoch().unwrap_or(NO_EPOCH);
             self.entries[at].fast = true;
             self.entries[at].key = watched;
-            self.entries[at].epoch = fetch.translation_epoch().unwrap_or(NO_EPOCH);
+            self.entries[at].epoch = epoch;
+            if let Some((page, version)) = watched {
+                self.hot[at].fast = true;
+                self.hot[at].page = page;
+                self.hot[at].version = version;
+                self.hot[at].tlb_epoch = epoch;
+                self.hot[at].write_epoch = we;
+            }
             self.insert_direct(pc, at as u32);
             // A block this cache has not seen: have spare cores build what can follow.
             if self.entries.len() > known
@@ -403,6 +612,7 @@ impl<E: ExecMemory> Cache<E> {
                 ahead.offer_successors(last, last_pc, (page << 12) | (last_pc & 0xfff));
             }
         }
+        self.record_chain(at as u32);
         Ok(self.entries[at].block.run(cpu))
     }
 }

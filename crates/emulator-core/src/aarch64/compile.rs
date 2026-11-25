@@ -53,13 +53,19 @@ impl From<MemoryError> for Error {
         Self::Memory(e)
     }
 }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockMeta {
+    pub modifies_mmu: bool,
+    pub modifies_sys: bool,
+}
 pub struct Block<I: ExecImage> {
     /// Keeps the executable mapping `entry` points into alive.
     _image: I,
-    entry: unsafe extern "C" fn(*mut Cpu) -> u64,
+    pub(crate) entry: unsafe extern "C" fn(*mut Cpu) -> u64,
+    pub(crate) meta: BlockMeta,
 }
 impl<I: ExecImage> Block<I> {
-    fn new(image: I) -> Self {
+    fn new(image: I, meta: BlockMeta) -> Self {
         let ptr = image.as_ptr();
         // SAFETY: the generated function has exactly this signature, and the
         // pointer is only used while `_image` keeps its mapping alive.
@@ -67,6 +73,7 @@ impl<I: ExecImage> Block<I> {
         Self {
             _image: image,
             entry,
+            meta,
         }
     }
     pub fn run(&self, cpu: &mut Cpu) -> u64 {
@@ -77,6 +84,95 @@ impl<I: ExecImage> Block<I> {
         next
     }
 }
+#[derive(Clone, Copy, Default)]
+enum FlagsState {
+    #[default]
+    Clean,
+    Arith {
+        width: Width,
+        op: ArithOp,
+        lhs: Value,
+        rhs: Value,
+        res: Value,
+    },
+    ArithImm {
+        width: Width,
+        op: ArithOp,
+        lhs: Value,
+        imm: u64,
+        res: Option<Value>,
+    },
+    Logic {
+        width: Width,
+        res: Value,
+    },
+}
+
+struct RegCache {
+    vals: [Option<Value>; 32],
+    dirty: u32,
+    count: u8,
+}
+
+impl Default for RegCache {
+    fn default() -> Self {
+        Self {
+            vals: [None; 32],
+            dirty: 0,
+            count: 0,
+        }
+    }
+}
+
+enum SlowKind {
+    Memory {
+        rn: u8,
+        addressing: Addressing,
+        size: Size,
+        rt: u8,
+        signed: SignExtend,
+        op: MemoryOp,
+        trap: Trap,
+    },
+    Literal {
+        address: u64,
+        size: Size,
+        rt: u8,
+    },
+    Pair {
+        rn: u8,
+        addressing: Addressing,
+        pair: Pair,
+        trap: Trap,
+    },
+    SimdMemory {
+        rn: u8,
+        addressing: Addressing,
+        bytes: u8,
+        rt: u8,
+        trap: Trap,
+    },
+    SimdPair {
+        rn: u8,
+        addressing: Addressing,
+        bytes: u8,
+        rt: u8,
+        rt2: u8,
+        trap: Trap,
+    },
+    DcZva {
+        rt: u8,
+    },
+    Isb,
+}
+
+struct DeferredSlow {
+    branches: [Option<ir::Inst>; 2],
+    pc: u64,
+    pending: u64,
+    kind: SlowKind,
+}
+
 struct Lower {
     f: RefCell<Function>,
     /// Block currently being emitted into. Memory fast paths switch it.
@@ -91,6 +187,11 @@ struct Lower {
     /// counter is bumped once per exit path (`ret`) and before anything that
     /// reads it, instead of with a load/add/store per instruction.
     pending: Cell<u64>,
+    modifies_mmu: Cell<bool>,
+    modifies_sys: Cell<bool>,
+    cache: RefCell<RegCache>,
+    flags_state: Cell<FlagsState>,
+    deferred_slows: RefCell<Vec<DeferredSlow>>,
 }
 impl Lower {
     fn new() -> Self {
@@ -123,6 +224,11 @@ impl Lower {
             boolean,
             ptr,
             pending: Cell::new(0),
+            modifies_mmu: Cell::new(false),
+            modifies_sys: Cell::new(false),
+            cache: RefCell::new(RegCache::default()),
+            flags_state: Cell::new(FlagsState::Clean),
+            deferred_slows: RefCell::new(Vec::new()),
         }
     }
     fn emit(&self, t: Type, op: Opcode) -> Value {
@@ -202,12 +308,89 @@ impl Lower {
             offset_of!(Cpu, x) + r as usize * 8
         }
     }
+    fn cache_insert(&self, idx: usize, v: Value, dirty: bool) {
+        let evict = {
+            let mut c = self.cache.borrow_mut();
+            if c.vals[idx].is_some() {
+                c.vals[idx] = Some(v);
+                if dirty {
+                    c.dirty |= 1u32 << idx;
+                }
+                return;
+            }
+            if c.count < 10 {
+                c.vals[idx] = Some(v);
+                c.count += 1;
+                if dirty {
+                    c.dirty |= 1u32 << idx;
+                }
+                return;
+            }
+            let mut clean_idx = None;
+            for i in 0..32 {
+                if c.vals[i].is_some() && (c.dirty & (1u32 << i)) == 0 {
+                    clean_idx = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = clean_idx {
+                c.vals[i] = None;
+                c.vals[idx] = Some(v);
+                if dirty {
+                    c.dirty |= 1u32 << idx;
+                }
+                return;
+            }
+            let ev_i = c.dirty.trailing_zeros() as usize;
+            let ev_v = c.vals[ev_i].take().unwrap();
+            c.dirty &= !(1u32 << ev_i);
+            c.vals[idx] = Some(v);
+            if dirty {
+                c.dirty |= 1u32 << idx;
+            }
+            (ev_i, ev_v)
+        };
+        self.store(Self::reg_at(evict.0 as u8), evict.1);
+    }
+    fn flush_dirty_regs(&self) {
+        let (mut dirty, vals) = {
+            let mut c = self.cache.borrow_mut();
+            let d = c.dirty;
+            if d == 0 {
+                return;
+            }
+            c.dirty = 0;
+            (d, c.vals)
+        };
+        while dirty != 0 {
+            let i = dirty.trailing_zeros() as usize;
+            dirty &= dirty - 1;
+            if let Some(v) = vals[i] {
+                self.store(Self::reg_at(i as u8), v);
+            }
+        }
+    }
+    fn clear_reg_cache(&self) {
+        let mut c = self.cache.borrow_mut();
+        c.vals = [None; 32];
+        c.dirty = 0;
+        c.count = 0;
+    }
+    fn flush_and_clear_regs(&self) {
+        self.flush_dirty_regs();
+        self.clear_reg_cache();
+    }
     fn reg(&self, t: Type, r: u8, zero: bool) -> Value {
         if zero && r == 31 {
-            self.k(t, 0)
-        } else {
-            self.cv(t, self.load(self.u64, Self::reg_at(r)))
+            return self.k(t, 0);
         }
+        let idx = r as usize;
+        if let Some(v) = self.cache.borrow().vals[idx] {
+            return self.cv(t, v);
+        }
+        let v = self.load(self.u64, Self::reg_at(r));
+        self.cache_insert(idx, v, false);
+        self.cv(t, v)
     }
     fn put(&self, r: u8, v: Value) {
         if r != 31 {
@@ -215,7 +398,8 @@ impl Lower {
         }
     }
     fn put_sp(&self, r: u8, v: Value) {
-        self.store(Self::reg_at(r), self.cv(self.u64, v))
+        let v64 = self.cv(self.u64, v);
+        self.cache_insert(r as usize, v64, true);
     }
     fn ty(&self, w: Width) -> Type {
         if w == Width::X64 { self.u64 } else { self.u32 }
@@ -238,6 +422,8 @@ impl Lower {
         }
     }
     fn ret(&self, v: Value) {
+        self.flush_dirty_regs();
+        self.flush_flags();
         // Every exit leaves with the counter current. `pending` is not
         // cleared: sibling paths (slow blocks) share the main path's count.
         let n = self.pending.get();
@@ -258,44 +444,256 @@ impl Lower {
             self.k(self.u32, 0),
         )
     }
-    fn condition(&self, c: Condition) -> Value {
+    fn condition_from_memory(&self, c: Condition) -> Value {
         let f = self.load(self.u32, offset_of!(Cpu, flags));
-        let n = self.flag(f, 31);
-        let z = self.flag(f, 30);
-        let carry = self.flag(f, 29);
-        let v = self.flag(f, 28);
-        let changed = self.bin(self.boolean, B::BitXor, n, v);
-        let ordered = self.not(changed);
-        let positive = self.not(z);
         match c {
-            Condition::Eq => z,
-            Condition::Ne => positive,
-            Condition::Cs => carry,
-            Condition::Cc => self.not(carry),
-            Condition::Mi => n,
-            Condition::Pl => self.not(n),
-            Condition::Vs => v,
-            Condition::Vc => self.not(v),
-            Condition::Hi => self.bin(self.boolean, B::BitAnd, carry, positive),
-            Condition::Ls => self.not(self.bin(self.boolean, B::BitAnd, carry, positive)),
-            Condition::Ge => ordered,
-            Condition::Lt => changed,
-            Condition::Gt => self.bin(self.boolean, B::BitAnd, positive, ordered),
-            Condition::Le => self.not(self.bin(self.boolean, B::BitAnd, positive, ordered)),
+            Condition::Eq => self.flag(f, 30),
+            Condition::Ne => self.not(self.flag(f, 30)),
+            Condition::Cs => self.flag(f, 29),
+            Condition::Cc => self.not(self.flag(f, 29)),
+            Condition::Mi => self.flag(f, 31),
+            Condition::Pl => self.not(self.flag(f, 31)),
+            Condition::Vs => self.flag(f, 28),
+            Condition::Vc => self.not(self.flag(f, 28)),
+            Condition::Hi => {
+                let carry = self.flag(f, 29);
+                let nz = self.not(self.flag(f, 30));
+                self.bin(self.boolean, B::BitAnd, carry, nz)
+            }
+            Condition::Ls => {
+                let carry = self.flag(f, 29);
+                let nz = self.not(self.flag(f, 30));
+                self.not(self.bin(self.boolean, B::BitAnd, carry, nz))
+            }
+            Condition::Ge => {
+                let n = self.flag(f, 31);
+                let v = self.flag(f, 28);
+                self.not(self.bin(self.boolean, B::BitXor, n, v))
+            }
+            Condition::Lt => {
+                let n = self.flag(f, 31);
+                let v = self.flag(f, 28);
+                self.bin(self.boolean, B::BitXor, n, v)
+            }
+            Condition::Gt => {
+                let n = self.flag(f, 31);
+                let z = self.flag(f, 30);
+                let v = self.flag(f, 28);
+                let ordered = self.not(self.bin(self.boolean, B::BitXor, n, v));
+                self.bin(self.boolean, B::BitAnd, self.not(z), ordered)
+            }
+            Condition::Le => {
+                let n = self.flag(f, 31);
+                let z = self.flag(f, 30);
+                let v = self.flag(f, 28);
+                let ordered = self.not(self.bin(self.boolean, B::BitXor, n, v));
+                self.not(self.bin(self.boolean, B::BitAnd, self.not(z), ordered))
+            }
             Condition::Al | Condition::Nv => self.k(self.boolean, 1),
         }
     }
-    fn pack(&self, n: Value, z: Value, c: Value, v: Value) -> Value {
-        let mut out = self.k(self.u32, 0);
-        for (bit, shift) in [(n, 31), (z, 30), (c, 29), (v, 28)] {
-            out = self.bin(
-                self.u32,
-                B::BitOr,
-                out,
-                self.imm(self.u32, B::Shl, self.cv(self.u32, bit), shift),
-            );
+    fn condition(&self, c: Condition) -> Value {
+        if matches!(c, Condition::Al | Condition::Nv) {
+            return self.k(self.boolean, 1);
         }
-        out
+        match self.flags_state.get() {
+            FlagsState::Clean => self.condition_from_memory(c),
+            FlagsState::Logic { width, res } => {
+                let t = self.ty(width);
+                let s = self.signed(width);
+                match c {
+                    Condition::Eq => self.cmp(C::Eq, res, self.k(t, 0)),
+                    Condition::Ne => self.cmp(C::Ne, res, self.k(t, 0)),
+                    Condition::Mi | Condition::Lt => self.cmp(C::Lt, self.cv(s, res), self.k(s, 0)),
+                    Condition::Pl | Condition::Ge => self.cmp(C::Ge, self.cv(s, res), self.k(s, 0)),
+                    Condition::Gt => self.cmp(C::Gt, self.cv(s, res), self.k(s, 0)),
+                    Condition::Le => self.cmp(C::Le, self.cv(s, res), self.k(s, 0)),
+                    Condition::Vs | Condition::Cs | Condition::Hi => self.k(self.boolean, 0),
+                    Condition::Vc | Condition::Cc | Condition::Ls => self.k(self.boolean, 1),
+                    Condition::Al | Condition::Nv => unreachable!(),
+                }
+            }
+            FlagsState::Arith {
+                width,
+                op: ArithOp::Sub,
+                lhs,
+                rhs,
+                res,
+            } => {
+                let s = self.signed(width);
+                match c {
+                    Condition::Eq => self.cmp(C::Eq, lhs, rhs),
+                    Condition::Ne => self.cmp(C::Ne, lhs, rhs),
+                    Condition::Cs => self.cmp(C::Ge, lhs, rhs),
+                    Condition::Cc => self.cmp(C::Lt, lhs, rhs),
+                    Condition::Hi => self.cmp(C::Gt, lhs, rhs),
+                    Condition::Ls => self.cmp(C::Le, lhs, rhs),
+                    Condition::Ge => self.cmp(C::Ge, self.cv(s, lhs), self.cv(s, rhs)),
+                    Condition::Lt => self.cmp(C::Lt, self.cv(s, lhs), self.cv(s, rhs)),
+                    Condition::Gt => self.cmp(C::Gt, self.cv(s, lhs), self.cv(s, rhs)),
+                    Condition::Le => self.cmp(C::Le, self.cv(s, lhs), self.cv(s, rhs)),
+                    Condition::Mi => self.cmp(C::Lt, self.cv(s, res), self.k(s, 0)),
+                    Condition::Pl => self.cmp(C::Ge, self.cv(s, res), self.k(s, 0)),
+                    Condition::Vs | Condition::Vc => {
+                        self.flush_flags();
+                        self.condition_from_memory(c)
+                    }
+                    Condition::Al | Condition::Nv => unreachable!(),
+                }
+            }
+            FlagsState::Arith {
+                width,
+                op: ArithOp::Add,
+                lhs,
+                res,
+                ..
+            } => {
+                let t = self.ty(width);
+                let s = self.signed(width);
+                match c {
+                    Condition::Eq => self.cmp(C::Eq, res, self.k(t, 0)),
+                    Condition::Ne => self.cmp(C::Ne, res, self.k(t, 0)),
+                    Condition::Cs => self.cmp(C::Lt, res, lhs),
+                    Condition::Cc => self.cmp(C::Ge, res, lhs),
+                    Condition::Mi => self.cmp(C::Lt, self.cv(s, res), self.k(s, 0)),
+                    Condition::Pl => self.cmp(C::Ge, self.cv(s, res), self.k(s, 0)),
+                    _ => {
+                        self.flush_flags();
+                        self.condition_from_memory(c)
+                    }
+                }
+            }
+            FlagsState::ArithImm {
+                width,
+                op: ArithOp::Sub,
+                lhs,
+                imm,
+                res,
+            } => {
+                let t = self.ty(width);
+                let s = self.signed(width);
+                match c {
+                    Condition::Eq => self.cmp(C::Eq, lhs, self.k(t, imm)),
+                    Condition::Ne => self.cmp(C::Ne, lhs, self.k(t, imm)),
+                    Condition::Cs => self.cmp(C::Ge, lhs, self.k(t, imm)),
+                    Condition::Cc => self.cmp(C::Lt, lhs, self.k(t, imm)),
+                    Condition::Hi => self.cmp(C::Gt, lhs, self.k(t, imm)),
+                    Condition::Ls => self.cmp(C::Le, lhs, self.k(t, imm)),
+                    Condition::Ge => self.cmp(C::Ge, self.cv(s, lhs), self.k(s, imm)),
+                    Condition::Lt => self.cmp(C::Lt, self.cv(s, lhs), self.k(s, imm)),
+                    Condition::Gt => self.cmp(C::Gt, self.cv(s, lhs), self.k(s, imm)),
+                    Condition::Le => self.cmp(C::Le, self.cv(s, lhs), self.k(s, imm)),
+                    Condition::Mi | Condition::Pl => {
+                        let r = res.unwrap_or_else(|| {
+                            let r = self.imm(t, B::Sub, lhs, imm);
+                            self.flags_state.set(FlagsState::ArithImm {
+                                width,
+                                op: ArithOp::Sub,
+                                lhs,
+                                imm,
+                                res: Some(r),
+                            });
+                            r
+                        });
+                        let op = if c == Condition::Mi { C::Lt } else { C::Ge };
+                        self.cmp(op, self.cv(s, r), self.k(s, 0))
+                    }
+                    Condition::Vs | Condition::Vc => {
+                        self.flush_flags();
+                        self.condition_from_memory(c)
+                    }
+                    Condition::Al | Condition::Nv => unreachable!(),
+                }
+            }
+            FlagsState::ArithImm {
+                width,
+                op: ArithOp::Add,
+                lhs,
+                imm,
+                res,
+            } => {
+                let t = self.ty(width);
+                let s = self.signed(width);
+                let ensure_res = || {
+                    res.unwrap_or_else(|| {
+                        let r = self.imm(t, B::Add, lhs, imm);
+                        self.flags_state.set(FlagsState::ArithImm {
+                            width,
+                            op: ArithOp::Add,
+                            lhs,
+                            imm,
+                            res: Some(r),
+                        });
+                        r
+                    })
+                };
+                match c {
+                    Condition::Eq => {
+                        let r = ensure_res();
+                        self.cmp(C::Eq, r, self.k(t, 0))
+                    }
+                    Condition::Ne => {
+                        let r = ensure_res();
+                        self.cmp(C::Ne, r, self.k(t, 0))
+                    }
+                    Condition::Cs => {
+                        let r = ensure_res();
+                        self.cmp(C::Lt, r, lhs)
+                    }
+                    Condition::Cc => {
+                        let r = ensure_res();
+                        self.cmp(C::Ge, r, lhs)
+                    }
+                    Condition::Mi => {
+                        let r = ensure_res();
+                        self.cmp(C::Lt, self.cv(s, r), self.k(s, 0))
+                    }
+                    Condition::Pl => {
+                        let r = ensure_res();
+                        self.cmp(C::Ge, self.cv(s, r), self.k(s, 0))
+                    }
+                    _ => {
+                        self.flush_flags();
+                        self.condition_from_memory(c)
+                    }
+                }
+            }
+        }
+    }
+    fn flush_flags(&self) {
+        match self.flags_state.replace(FlagsState::Clean) {
+            FlagsState::Clean => {}
+            FlagsState::Arith {
+                width,
+                op,
+                lhs,
+                rhs,
+                res,
+            } => {
+                self.store(
+                    offset_of!(Cpu, flags),
+                    self.flags(width, op, lhs, rhs, res, None),
+                );
+            }
+            FlagsState::ArithImm {
+                width,
+                op,
+                lhs,
+                imm,
+                res,
+            } => {
+                let t = self.ty(width);
+                let r = res.unwrap_or_else(|| self.imm(t, arithmetic_op(op), lhs, imm));
+                let rhs = self.k(t, imm);
+                self.store(
+                    offset_of!(Cpu, flags),
+                    self.flags(width, op, lhs, rhs, r, None),
+                );
+            }
+            FlagsState::Logic { width, res } => {
+                self.logic_flags(width, res);
+            }
+        }
     }
     fn flags(
         &self,
@@ -308,49 +706,76 @@ impl Lower {
     ) -> Value {
         let t = self.ty(w);
         let zero = self.k(t, 0);
-        let n = self.cmp(
-            C::Ne,
-            self.imm(t, B::BitAnd, r, 1u64 << ((w as u32) - 1)),
-            zero,
+        let n = if w == Width::W32 {
+            self.imm(self.u32, B::BitAnd, r, 0x8000_0000)
+        } else {
+            self.imm(
+                self.u32,
+                B::BitAnd,
+                self.cv(self.u32, self.imm(self.u64, B::Shr, r, 32)),
+                0x8000_0000,
+            )
+        };
+        let z = self.imm(
+            self.u32,
+            B::Shl,
+            self.cv(self.u32, self.cmp(C::Eq, r, zero)),
+            30,
         );
-        let z = self.cmp(C::Eq, r, zero);
-        let c = carry.unwrap_or_else(|| {
+        let c_bool = carry.unwrap_or_else(|| {
             if op == ArithOp::Sub {
                 self.cmp(C::Ge, a, b)
             } else {
                 self.cmp(C::Lt, r, a)
             }
         });
-        let s = self.signed(w);
-        let sz = self.k(s, 0);
-        let an = self.cmp(C::Lt, self.cv(s, a), sz);
-        let bn = self.cmp(C::Lt, self.cv(s, b), sz);
-        let rn = self.cmp(C::Lt, self.cv(s, r), sz);
-        let diff = self.bin(self.boolean, B::BitXor, an, bn);
-        let flip = self.bin(self.boolean, B::BitXor, an, rn);
-        let v = self.bin(
-            self.boolean,
-            B::BitAnd,
-            if op == ArithOp::Sub {
-                diff
-            } else {
-                self.not(diff)
-            },
-            flip,
-        );
-        self.pack(n, z, c, v)
+        let c = self.imm(self.u32, B::Shl, self.cv(self.u32, c_bool), 29);
+        let ar = self.bin(t, B::BitXor, a, r);
+        let ov = if op == ArithOp::Sub {
+            let ab = self.bin(t, B::BitXor, a, b);
+            self.bin(t, B::BitAnd, ab, ar)
+        } else {
+            let br = self.bin(t, B::BitXor, b, r);
+            self.bin(t, B::BitAnd, ar, br)
+        };
+        let v = if w == Width::W32 {
+            self.imm(
+                self.u32,
+                B::BitAnd,
+                self.imm(self.u32, B::Shr, ov, 3),
+                0x1000_0000,
+            )
+        } else {
+            self.imm(
+                self.u32,
+                B::BitAnd,
+                self.cv(self.u32, self.imm(self.u64, B::Shr, ov, 35)),
+                0x1000_0000,
+            )
+        };
+        let nz = self.bin(self.u32, B::BitOr, n, z);
+        let cv = self.bin(self.u32, B::BitOr, c, v);
+        self.bin(self.u32, B::BitOr, nz, cv)
     }
     fn logic_flags(&self, w: Width, r: Value) {
         let t = self.ty(w);
-        let zero = self.k(t, 0);
-        let n = self.cmp(
-            C::Ne,
-            self.imm(t, B::BitAnd, r, 1u64 << ((w as u32) - 1)),
-            zero,
+        let n = if w == Width::W32 {
+            self.imm(self.u32, B::BitAnd, r, 0x8000_0000)
+        } else {
+            self.imm(
+                self.u32,
+                B::BitAnd,
+                self.cv(self.u32, self.imm(self.u64, B::Shr, r, 32)),
+                0x8000_0000,
+            )
+        };
+        let z = self.imm(
+            self.u32,
+            B::Shl,
+            self.cv(self.u32, self.cmp(C::Eq, r, self.k(t, 0))),
+            30,
         );
-        let z = self.cmp(C::Eq, r, zero);
-        let no = self.k(self.boolean, 0);
-        self.store(offset_of!(Cpu, flags), self.pack(n, z, no, no));
+        self.store(offset_of!(Cpu, flags), self.bin(self.u32, B::BitOr, n, z));
     }
     fn shift(&self, w: Width, v: Value, s: Shift, n: u64) -> Value {
         if n == 0 {
@@ -435,13 +860,23 @@ impl Lower {
     fn new_block(&self) -> ir::Block {
         self.f.borrow_mut().append_block()
     }
-    fn branch_if(&self, c: Value, then: ir::Block, otherwise: ir::Block) {
-        self.f.borrow_mut().append_if(
+    fn branch_if_deferred(&self, c: Value, then: ir::Block) -> ir::Inst {
+        let mut f = self.f.borrow_mut();
+        f.append_if(
             self.block.get(),
             c,
             ir::EdgeDesc::bare(then),
-            ir::EdgeDesc::bare(otherwise),
-        )
+            ir::EdgeDesc::bare(ir::Block::from_u32(0)),
+        );
+        ir::Inst::from_u32(f.inst_count() as u32 - 1)
+    }
+    fn defer_slow(&self, branches: [Option<ir::Inst>; 2], pc: u64, kind: SlowKind) {
+        self.deferred_slows.borrow_mut().push(DeferredSlow {
+            branches,
+            pc,
+            pending: self.pending.get(),
+            kind,
+        });
     }
     /// Like `address`, but a base-register writeback (pre- or post-index) is
     /// returned instead of applied or scheduled for the machine, so each path
@@ -515,8 +950,7 @@ impl Lower {
     }
     /// Emit a load or store with an inline fast path. On a data-TLB hit the
     /// access happens in place and emission continues in a fresh block; on a
-    /// miss control goes to a slow block that hands the access to the machine
-    /// (`slow` fills in the request) and returns.
+    /// miss control goes to a deferred cold slow block.
     fn memory_access(
         &self,
         address: Value,
@@ -525,14 +959,16 @@ impl Lower {
         rt: u8,
         signed: SignExtend,
         post: Option<(u8, Value)>,
-        slow: impl FnOnce(&Lower),
+        pc: u64,
+        slow_kind: SlowKind,
     ) {
+        self.flush_dirty_regs();
+        self.flush_flags();
         let write = op == MemoryOp::Store;
         let (hit, host) = self.dtlb_probe(address, size, write);
-        let (fast_block, slow_block) = (self.new_block(), self.new_block());
-        self.branch_if(hit, fast_block, slow_block);
-        self.block.set(slow_block);
-        slow(self);
+        let fast_block = self.new_block();
+        let br = self.branch_if_deferred(hit, fast_block);
+        self.defer_slow([Some(br), None], pc, slow_kind);
         self.block.set(fast_block);
         if write {
             self.fast_store(host, size, rt);
@@ -545,30 +981,31 @@ impl Lower {
     }
     /// Inline fast path for a GPR load/store pair: one data-TLB probe covers
     /// both accesses when the first is naturally aligned and the second starts
-    /// in the same page. Anything else takes `slow`, which hands the whole pair
-    /// to the machine.
+    /// in the same page. Anything else takes a deferred cold slow block.
     fn pair_access(
         &self,
         address: Value,
         a: Pair,
         post: Option<(u8, Value)>,
-        slow: impl FnOnce(&Lower),
+        pc: u64,
+        slow_kind: SlowKind,
     ) {
+        self.flush_dirty_regs();
+        self.flush_flags();
         let write = a.op == MemoryOp::Store;
         let n = a.size as u64;
         let (hit, host) = self.dtlb_probe(address, a.size, write);
-        let (check_block, fast_block, slow_block) =
-            (self.new_block(), self.new_block(), self.new_block());
-        self.branch_if(hit, check_block, slow_block);
+        let check_block = self.new_block();
+        let br1 = self.branch_if_deferred(hit, check_block);
         // `address` is aligned to `n`, so the second access leaves the page
         // exactly when it starts on a page boundary.
         self.block.set(check_block);
         let second_at = self.imm(self.u64, B::Add, address, n);
         let offset = self.imm(self.u64, B::BitAnd, second_at, 0xfff);
         let same_page = self.cmp(C::Ne, offset, self.k(self.u64, 0));
-        self.branch_if(same_page, fast_block, slow_block);
-        self.block.set(slow_block);
-        slow(self);
+        let fast_block = self.new_block();
+        let br2 = self.branch_if_deferred(same_page, fast_block);
+        self.defer_slow([Some(br1), Some(br2)], pc, slow_kind);
         self.block.set(fast_block);
         let second = self.imm(self.ptr, B::Add, host, n);
         if write {
@@ -635,13 +1072,11 @@ fn low_mask(n: u8) -> u64 {
     if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
 }
 
-pub fn compile_with_exec<E: ExecMemory>(
+fn compile_ir_with_exec<E: ExecMemory>(
     exec: &E,
-    guest_pc: u64,
-    bytes: &[u8],
-    inline_memory: bool,
+    function: Function,
+    meta: BlockMeta,
 ) -> Result<Block<E::Image>, Error> {
-    let function = translate_block(guest_pc, bytes, inline_memory)?;
     #[cfg(target_arch = "aarch64")]
     {
         let words = volt_target_core::aarch64::isel::compile_owned(function)
@@ -649,20 +1084,40 @@ pub fn compile_with_exec<E: ExecMemory>(
         let code =
             unsafe { core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 4) };
         let image = exec.map_code(code).map_err(|e| Error::Exec(Box::new(e)))?;
-        Ok(Block::new(image))
+        Ok(Block::new(image, meta))
     }
     #[cfg(target_arch = "x86_64")]
     {
         let code =
             volt_target_core::x86_64::compile(&function).map_err(|e| Error::Exec(Box::new(e)))?;
         let image = exec.map_code(&code).map_err(|e| Error::Exec(Box::new(e)))?;
-        Ok(Block::new(image))
+        Ok(Block::new(image, meta))
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        let _ = (exec, function);
+        let _ = (exec, function, meta);
         Err(Error::UnsupportedHost)
     }
+}
+
+pub fn compile_with_exec<E: ExecMemory>(
+    exec: &E,
+    guest_pc: u64,
+    bytes: &[u8],
+    inline_memory: bool,
+) -> Result<Block<E::Image>, Error> {
+    let (function, meta) = translate_block_with_meta(guest_pc, bytes, inline_memory)?;
+    compile_ir_with_exec(exec, function, meta)
+}
+
+pub(crate) fn compile_decoded_with_exec<E: ExecMemory>(
+    exec: &E,
+    guest_pc: u64,
+    decoded: &[Instruction],
+    inline_memory: bool,
+) -> Result<Block<E::Image>, Error> {
+    let (function, meta) = translate_decoded_with_meta(guest_pc, decoded, inline_memory)?;
+    compile_ir_with_exec(exec, function, meta)
 }
 
 /// Translate an AArch64 guest basic block into Volt IR.
@@ -671,21 +1126,35 @@ pub fn translate_block(
     bytes: &[u8],
     inline_memory: bool,
 ) -> Result<Function, Error> {
+    translate_block_with_meta(guest_pc, bytes, inline_memory).map(|(f, _)| f)
+}
+
+pub(crate) fn translate_block_with_meta(
+    guest_pc: u64,
+    bytes: &[u8],
+    inline_memory: bool,
+) -> Result<(Function, BlockMeta), Error> {
     if bytes.is_empty() {
         return Err(Error::EmptyBlock);
     }
     if !bytes.len().is_multiple_of(4) {
         return Err(Error::UnsupportedInstruction);
     }
-    let l = Lower::new();
-    let mut pc = guest_pc;
-    let mut ended = false;
-    for &chunk in bytes.as_chunks::<4>().0 {
-        l.pending.set(l.pending.get() + 1);
+    let chunks = bytes.as_chunks::<4>().0;
+    let mut stack = [Instruction::Nop; super::cache::MAX_INSNS];
+    let mut heap = Vec::new();
+    let decoded: &mut [Instruction] = if chunks.len() <= stack.len() {
+        &mut stack[..chunks.len()]
+    } else {
+        heap.resize(chunks.len(), Instruction::Nop);
+        &mut heap
+    };
+    for (idx, &chunk) in chunks.iter().enumerate() {
         let word = u32::from_le_bytes(chunk);
-        let instruction = match decode(word) {
+        decoded[idx] = match decode(word) {
             Ok(insn) => insn,
             Err(_) => {
+                let pc = guest_pc.wrapping_add((idx * 4) as u64);
                 #[cfg(test)]
                 {
                     std::eprintln!(
@@ -704,6 +1173,23 @@ pub fn translate_block(
                 return Err(Error::Decode { word, pc });
             }
         };
+    }
+    translate_decoded_with_meta(guest_pc, decoded, inline_memory)
+}
+
+pub(crate) fn translate_decoded_with_meta(
+    guest_pc: u64,
+    decoded: &[Instruction],
+    inline_memory: bool,
+) -> Result<(Function, BlockMeta), Error> {
+    if decoded.is_empty() {
+        return Err(Error::EmptyBlock);
+    }
+    let l = Lower::new();
+    let mut pc = guest_pc;
+    let mut ended = false;
+    for &instruction in decoded {
+        l.pending.set(l.pending.get() + 1);
         ended = instruction.terminates_with(inline_memory);
         match instruction {
             Instruction::Movz(a) | Instruction::Movn(a) => {
@@ -732,16 +1218,24 @@ pub fn translate_block(
             Instruction::ArithImm(a) => {
                 let t = l.ty(a.width);
                 let lhs = l.reg(t, a.rn, false);
-                let rhs = l.k(t, a.immediate as u64);
-                let r = l.bin(t, arithmetic_op(a.op), lhs, rhs);
                 if a.flags {
-                    l.put(a.rd, r);
-                    l.store(
-                        offset_of!(Cpu, flags),
-                        l.flags(a.width, a.op, lhs, rhs, r, None),
-                    );
+                    let imm = a.immediate as u64;
+                    let res = if a.rd != 31 {
+                        let r = l.imm(t, arithmetic_op(a.op), lhs, imm);
+                        l.put(a.rd, r);
+                        Some(r)
+                    } else {
+                        None
+                    };
+                    l.flags_state.set(FlagsState::ArithImm {
+                        width: a.width,
+                        op: a.op,
+                        lhs,
+                        imm,
+                        res,
+                    });
                 } else {
-                    l.put_sp(a.rd, r)
+                    l.put_sp(a.rd, l.imm(t, arithmetic_op(a.op), lhs, a.immediate as u64));
                 }
             }
             Instruction::ArithReg(a) => {
@@ -753,10 +1247,13 @@ pub fn translate_block(
                     l.put(a.rd, r)
                 }
                 if a.flags {
-                    l.store(
-                        offset_of!(Cpu, flags),
-                        l.flags(a.width, a.op, lhs, rhs, r, None),
-                    );
+                    l.flags_state.set(FlagsState::Arith {
+                        width: a.width,
+                        op: a.op,
+                        lhs,
+                        rhs,
+                        res: r,
+                    });
                 }
             }
             Instruction::ArithExt(a) => {
@@ -767,10 +1264,13 @@ pub fn translate_block(
                 let r = l.bin(t, arithmetic_op(a.op), lhs, rhs);
                 if a.flags {
                     l.put(a.rd, r);
-                    l.store(
-                        offset_of!(Cpu, flags),
-                        l.flags(a.width, a.op, lhs, rhs, r, None),
-                    );
+                    l.flags_state.set(FlagsState::Arith {
+                        width: a.width,
+                        op: a.op,
+                        lhs,
+                        rhs,
+                        res: r,
+                    });
                 } else {
                     l.put_sp(a.rd, r)
                 }
@@ -787,7 +1287,10 @@ pub fn translate_block(
                 let r = l.bin(t, logic_op(a.op), lhs, rhs);
                 l.put(a.rd, r);
                 if a.flags {
-                    l.logic_flags(a.width, r)
+                    l.flags_state.set(FlagsState::Logic {
+                        width: a.width,
+                        res: r,
+                    });
                 }
             }
             Instruction::LogicImm(a) => {
@@ -795,12 +1298,16 @@ pub fn translate_block(
                 let r = l.imm(t, logic_op(a.op), l.reg(t, a.rn, true), a.immediate);
                 if a.flags {
                     l.put(a.rd, r);
-                    l.logic_flags(a.width, r)
+                    l.flags_state.set(FlagsState::Logic {
+                        width: a.width,
+                        res: r,
+                    });
                 } else {
                     l.put_sp(a.rd, r)
                 }
             }
             Instruction::ArithCarry(a) => {
+                l.flush_flags();
                 let t = l.ty(a.width);
                 let lhs = l.reg(t, a.rn, true);
                 let loaded = l.reg(t, a.rm, true);
@@ -844,15 +1351,12 @@ pub fn translate_block(
                     CompareOperand::Immediate(n) => l.k(t, n as u64),
                 };
                 let r = l.bin(t, arithmetic_op(a.op), lhs, rhs);
+                let cond = l.condition(a.cond);
+                l.flags_state.set(FlagsState::Clean);
                 let flags = l.flags(a.width, a.op, lhs, rhs, r, None);
                 l.store(
                     offset_of!(Cpu, flags),
-                    l.sel(
-                        l.u32,
-                        l.condition(a.cond),
-                        flags,
-                        l.k(l.u32, (a.nzcv as u64) << 28),
-                    ),
+                    l.sel(l.u32, cond, flags, l.k(l.u32, (a.nzcv as u64) << 28)),
                 );
             }
             Instruction::Variable(a) => lower_variable(&l, a),
@@ -959,15 +1463,24 @@ pub fn translate_block(
                 };
                 if inline_memory {
                     let (address, post) = l.address_split(a.rn, a.addressing);
-                    l.memory_access(address, a.size, a.op, a.rt, a.signed, post, |l| {
-                        setup_memory(l, address, a.size, a.rt, a.signed, a.op);
-                        if let Some((rn, value)) = post {
-                            l.store(offset_of!(Cpu, writeback_value), value);
-                            l.byte(offset_of!(Cpu, writeback_dest), rn as u64);
-                            l.byte(offset_of!(Cpu, writeback), 1);
-                        }
-                        l.trap(pc.wrapping_add(4), trap);
-                    });
+                    l.memory_access(
+                        address,
+                        a.size,
+                        a.op,
+                        a.rt,
+                        a.signed,
+                        post,
+                        pc,
+                        SlowKind::Memory {
+                            rn: a.rn,
+                            addressing: a.addressing,
+                            size: a.size,
+                            rt: a.rt,
+                            signed: a.signed,
+                            op: a.op,
+                            trap,
+                        },
+                    );
                 } else {
                     let address = l.address(a.rn, a.addressing);
                     setup_memory(&l, address, a.size, a.rt, a.signed, a.op);
@@ -975,7 +1488,8 @@ pub fn translate_block(
                 }
             }
             Instruction::Literal(a) => {
-                let address = l.k(l.u64, pc.wrapping_add(a.offset as u64));
+                let target_addr = pc.wrapping_add(a.offset as u64);
+                let address = l.k(l.u64, target_addr);
                 if inline_memory {
                     l.memory_access(
                         address,
@@ -984,16 +1498,11 @@ pub fn translate_block(
                         a.rt,
                         SignExtend::None,
                         None,
-                        |l| {
-                            setup_memory(
-                                l,
-                                address,
-                                a.size,
-                                a.rt,
-                                SignExtend::None,
-                                MemoryOp::Load,
-                            );
-                            l.trap(pc.wrapping_add(4), Trap::Load);
+                        pc,
+                        SlowKind::Literal {
+                            address: target_addr,
+                            size: a.size,
+                            rt: a.rt,
                         },
                     );
                 } else {
@@ -1121,15 +1630,18 @@ pub fn translate_block(
                 };
                 if inline_memory {
                     let (address, post) = l.address_split(a.rn, a.addressing);
-                    l.pair_access(address, a, post, |l| {
-                        setup_pair(l, address, a);
-                        if let Some((rn, value)) = post {
-                            l.store(offset_of!(Cpu, writeback_value), value);
-                            l.byte(offset_of!(Cpu, writeback_dest), rn as u64);
-                            l.byte(offset_of!(Cpu, writeback), 1);
-                        }
-                        l.trap(pc.wrapping_add(4), trap);
-                    });
+                    l.pair_access(
+                        address,
+                        a,
+                        post,
+                        pc,
+                        SlowKind::Pair {
+                            rn: a.rn,
+                            addressing: a.addressing,
+                            pair: a,
+                            trap,
+                        },
+                    );
                 } else {
                     let address = l.address(a.rn, a.addressing);
                     setup_pair(&l, address, a);
@@ -2062,40 +2574,57 @@ pub fn translate_block(
                 if !inline_memory {
                     l.simd_trap_access(address, a.bytes as u64, a.rt, Some(a.rt2), post, pc, trap);
                 } else {
+                    l.flush_dirty_regs();
+                    l.flush_flags();
                     let at_rt = offset_of!(Cpu, v) + a.rt as usize * 16;
                     let at_rt2 = offset_of!(Cpu, v) + a.rt2 as usize * 16;
-                    let slow_block = l.new_block();
+                    let check_block = l.new_block();
                     let store = a.op == MemoryOp::Store;
                     let (bytes, chunk_count) = if a.bytes == 16 { (16, 4) } else { (8, 2) };
-                    let starts: [Value; 4] = [
-                        address,
-                        l.imm(l.u64, B::Add, address, 8),
-                        l.imm(l.u64, B::Add, address, 16),
-                        l.imm(l.u64, B::Add, address, 24),
-                    ];
+                    let total_bytes = (chunk_count * 8) as u64;
+                    let (hit, host) = l.dtlb_probe(address, Size::Double, store);
+                    let br1 = l.branch_if_deferred(hit, check_block);
+                    l.block.set(check_block);
+                    let page_off = l.imm(l.u64, B::BitAnd, address, 0xfff);
+                    let fits = l.cmp(C::Le, page_off, l.k(l.u64, 4096 - total_bytes));
+                    let fast_block = l.new_block();
+                    let br2 = l.branch_if_deferred(fits, fast_block);
+                    l.defer_slow(
+                        [Some(br1), Some(br2)],
+                        pc,
+                        SlowKind::SimdPair {
+                            rn: a.rn,
+                            addressing: a.addressing,
+                            bytes: a.bytes,
+                            rt: a.rt,
+                            rt2: a.rt2,
+                            trap,
+                        },
+                    );
+                    l.block.set(fast_block);
                     // stores: (reg_offset_base, half) per chunk
                     let src: [(usize, u64); 4] = if bytes == 16 {
                         [(at_rt, 0), (at_rt + 8, 0), (at_rt2, 0), (at_rt2 + 8, 0)]
                     } else {
                         [(at_rt, 0), (at_rt2, 0), (at_rt, 0), (at_rt, 0)]
                     };
-                    let mut hosts: [Option<Value>; 4] = [None; 4];
-                    for i in 0..chunk_count {
-                        let next = l.new_block();
-                        let (hit, host) = l.dtlb_probe(starts[i], Size::Double, store);
-                        l.branch_if(hit, next, slow_block);
-                        l.block.set(next);
-                        hosts[i] = Some(host);
-                    }
                     if store {
-                        for i in 0..chunk_count {
-                            let host = hosts[i].unwrap();
-                            l.store_ptr(host, l.load(l.u64, src[i].0));
+                        for (i, &(off, _)) in src.iter().enumerate().take(chunk_count) {
+                            let h = if i == 0 {
+                                host
+                            } else {
+                                l.imm(l.ptr, B::Add, host, (i * 8) as u64)
+                            };
+                            l.store_ptr(h, l.load(l.u64, off));
                         }
                     } else {
-                        for i in 0..chunk_count {
-                            let host = hosts[i].unwrap();
-                            l.store(src[i].0, l.load_ptr(l.u64, host));
+                        for (i, &(off, _)) in src.iter().enumerate().take(chunk_count) {
+                            let h = if i == 0 {
+                                host
+                            } else {
+                                l.imm(l.ptr, B::Add, host, (i * 8) as u64)
+                            };
+                            l.store(off, l.load_ptr(l.u64, h));
                         }
                         // zero the untransferred half of each 128-bit register
                         if bytes == 8 {
@@ -2106,11 +2635,6 @@ pub fn translate_block(
                     if let Some((rn, value)) = post {
                         l.put_sp(rn, value);
                     }
-                    // slow path, built last so every fast edge into it exists.
-                    let resume = l.block.get();
-                    l.block.set(slow_block);
-                    l.simd_trap_access(address, bytes as u64, a.rt, Some(a.rt2), post, pc, trap);
-                    l.block.set(resume);
                 }
             }
             Instruction::SimdMemory(a) => {
@@ -2123,8 +2647,9 @@ pub fn translate_block(
                 if !inline_memory {
                     l.simd_trap_access(address, a.bytes as u64, a.rt, None, post, pc, trap);
                 } else {
+                    l.flush_dirty_regs();
+                    l.flush_flags();
                     let at_rt = offset_of!(Cpu, v) + a.rt as usize * 16;
-                    let slow_block = l.new_block();
                     let store = a.op == MemoryOp::Store;
                     // One chunk for widths up to 8 bytes, two 8-byte chunks for 16.
                     let wide = a.bytes == 16;
@@ -2134,27 +2659,62 @@ pub fn translate_block(
                         4 => Size::Word,
                         _ => Size::Double,
                     };
+                    let (hit, host) = l.dtlb_probe(address, size, store);
+                    let fast_block = l.new_block();
+                    if wide {
+                        let br1 = l.branch_if_deferred(hit, fast_block);
+                        l.block.set(fast_block);
+                        let page_off = l.imm(l.u64, B::BitAnd, address, 0xfff);
+                        let fits = l.cmp(C::Le, page_off, l.k(l.u64, 4096 - 16));
+                        let copy_block = l.new_block();
+                        let br2 = l.branch_if_deferred(fits, copy_block);
+                        l.defer_slow(
+                            [Some(br1), Some(br2)],
+                            pc,
+                            SlowKind::SimdMemory {
+                                rn: a.rn,
+                                addressing: a.addressing,
+                                bytes: a.bytes,
+                                rt: a.rt,
+                                trap,
+                            },
+                        );
+                        l.block.set(copy_block);
+                    } else {
+                        let br1 = l.branch_if_deferred(hit, fast_block);
+                        l.defer_slow(
+                            [Some(br1), None],
+                            pc,
+                            SlowKind::SimdMemory {
+                                rn: a.rn,
+                                addressing: a.addressing,
+                                bytes: a.bytes,
+                                rt: a.rt,
+                                trap,
+                            },
+                        );
+                        l.block.set(fast_block);
+                    }
                     let chunk_count = if wide { 2 } else { 1 };
-                    let starts: [Value; 2] = [address, l.imm(l.u64, B::Add, address, 8)];
                     let chunk_ty = l.uint((a.bytes.min(8) as u16) * 8);
                     let src: [usize; 2] = [at_rt, at_rt + 8];
-                    let mut hosts: [Option<Value>; 2] = [None; 2];
-                    for i in 0..chunk_count {
-                        let next = l.new_block();
-                        let (hit, host) = l.dtlb_probe(starts[i], size, store);
-                        l.branch_if(hit, next, slow_block);
-                        l.block.set(next);
-                        hosts[i] = Some(host);
-                    }
                     if store {
-                        for i in 0..chunk_count {
-                            let host = hosts[i].unwrap();
-                            l.store_ptr(host, l.cv(chunk_ty, l.load(l.u64, src[i])));
+                        for (i, &off) in src.iter().enumerate().take(chunk_count) {
+                            let h = if i == 0 {
+                                host
+                            } else {
+                                l.imm(l.ptr, B::Add, host, (i * 8) as u64)
+                            };
+                            l.store_ptr(h, l.cv(chunk_ty, l.load(l.u64, off)));
                         }
                     } else {
-                        for i in 0..chunk_count {
-                            let host = hosts[i].unwrap();
-                            l.store(src[i], l.cv(l.u64, l.load_ptr(chunk_ty, host)));
+                        for (i, &off) in src.iter().enumerate().take(chunk_count) {
+                            let h = if i == 0 {
+                                host
+                            } else {
+                                l.imm(l.ptr, B::Add, host, (i * 8) as u64)
+                            };
+                            l.store(off, l.cv(l.u64, l.load_ptr(chunk_ty, h)));
                         }
                         // Scalar loads zero the whole upper register, not just the
                         // untransferred half.
@@ -2170,10 +2730,6 @@ pub fn translate_block(
                     if let Some((rn, value)) = post {
                         l.put_sp(rn, value);
                     }
-                    let resume = l.block.get();
-                    l.block.set(slow_block);
-                    l.simd_trap_access(address, a.bytes as u64, a.rt, None, post, pc, trap);
-                    l.block.set(resume);
                 }
             }
             Instruction::Nop
@@ -2183,11 +2739,44 @@ pub fn translate_block(
             | Instruction::Yield => {}
             Instruction::Wfe => l.trap(pc.wrapping_add(4), Trap::Wfe),
             Instruction::Trap => l.trap(pc, Trap::Brk),
-            Instruction::Isb => l.trap(pc.wrapping_add(4), Trap::Isb),
+            Instruction::Isb => {
+                if inline_memory {
+                    l.flush_dirty_regs();
+                    l.flush_flags();
+                    let has_faulted = l.load(l.u8, offset_of!(Cpu, tlb_has_faulted));
+                    let clean = l.cmp(C::Eq, has_faulted, l.k(l.u8, 0));
+                    let fast_block = l.new_block();
+                    let br = l.branch_if_deferred(clean, fast_block);
+                    l.defer_slow([Some(br), None], pc, SlowKind::Isb);
+                    l.block.set(fast_block);
+                } else {
+                    l.trap(pc.wrapping_add(4), Trap::Isb);
+                }
+            }
             Instruction::Tlbi => l.trap(pc.wrapping_add(4), Trap::Tlbi),
             Instruction::DcZva(rt) => {
-                l.store(offset_of!(Cpu, address), l.reg(l.u64, rt, true));
-                l.trap(pc.wrapping_add(4), Trap::DcZva)
+                let aligned = l.imm(l.u64, B::BitAnd, l.reg(l.u64, rt, true), !63u64);
+                if inline_memory {
+                    l.flush_dirty_regs();
+                    l.flush_flags();
+                    let (hit, host) = l.dtlb_probe(aligned, Size::Double, true);
+                    let fast_block = l.new_block();
+                    let br = l.branch_if_deferred(hit, fast_block);
+                    l.defer_slow([Some(br), None], pc, SlowKind::DcZva { rt });
+                    l.block.set(fast_block);
+                    let zero = l.k(l.u64, 0);
+                    for off in (0..64).step_by(8) {
+                        let p = if off == 0 {
+                            host
+                        } else {
+                            l.imm(l.ptr, B::Add, host, off)
+                        };
+                        l.store_ptr(p, zero);
+                    }
+                } else {
+                    l.store(offset_of!(Cpu, address), aligned);
+                    l.trap(pc.wrapping_add(4), Trap::DcZva);
+                }
             }
             Instruction::Eret => l.trap(pc.wrapping_add(4), Trap::Eret),
             Instruction::Svc => l.trap(pc.wrapping_add(4), Trap::Svc),
@@ -2202,7 +2791,96 @@ pub fn translate_block(
     if !ended {
         l.ret(l.k(l.u64, pc))
     }
-    Ok(l.f.into_inner())
+    let slows = l.deferred_slows.replace(Vec::new());
+    for slow in slows {
+        l.clear_reg_cache();
+        l.flags_state.set(FlagsState::Clean);
+        let slow_block = l.new_block();
+        {
+            let mut f = l.f.borrow_mut();
+            for inst in slow.branches.into_iter().flatten() {
+                if let Opcode::If(cf) = f.opcode_mut(inst) {
+                    cf.else_.target = slow_block;
+                }
+            }
+        }
+        l.block.set(slow_block);
+        l.pending.set(slow.pending);
+        match slow.kind {
+            SlowKind::Memory {
+                rn,
+                addressing,
+                size,
+                rt,
+                signed,
+                op,
+                trap,
+            } => {
+                let (address, post) = l.address_split(rn, addressing);
+                setup_memory(&l, address, size, rt, signed, op);
+                if let Some((rn, value)) = post {
+                    l.store(offset_of!(Cpu, writeback_value), value);
+                    l.byte(offset_of!(Cpu, writeback_dest), rn as u64);
+                    l.byte(offset_of!(Cpu, writeback), 1);
+                }
+                l.trap(slow.pc.wrapping_add(4), trap);
+            }
+            SlowKind::Literal { address, size, rt } => {
+                let addr = l.k(l.u64, address);
+                setup_memory(&l, addr, size, rt, SignExtend::None, MemoryOp::Load);
+                l.trap(slow.pc.wrapping_add(4), Trap::Load);
+            }
+            SlowKind::Pair {
+                rn,
+                addressing,
+                pair,
+                trap,
+            } => {
+                let (address, post) = l.address_split(rn, addressing);
+                setup_pair(&l, address, pair);
+                if let Some((rn, value)) = post {
+                    l.store(offset_of!(Cpu, writeback_value), value);
+                    l.byte(offset_of!(Cpu, writeback_dest), rn as u64);
+                    l.byte(offset_of!(Cpu, writeback), 1);
+                }
+                l.trap(slow.pc.wrapping_add(4), trap);
+            }
+            SlowKind::SimdMemory {
+                rn,
+                addressing,
+                bytes,
+                rt,
+                trap,
+            } => {
+                let (address, post) = l.address_split(rn, addressing);
+                l.simd_trap_access(address, bytes as u64, rt, None, post, slow.pc, trap);
+            }
+            SlowKind::SimdPair {
+                rn,
+                addressing,
+                bytes,
+                rt,
+                rt2,
+                trap,
+            } => {
+                let (address, post) = l.address_split(rn, addressing);
+                l.simd_trap_access(address, bytes as u64, rt, Some(rt2), post, slow.pc, trap);
+            }
+            SlowKind::DcZva { rt } => {
+                let aligned = l.imm(l.u64, B::BitAnd, l.reg(l.u64, rt, true), !63u64);
+                l.store(offset_of!(Cpu, address), aligned);
+                l.trap(slow.pc.wrapping_add(4), Trap::DcZva);
+            }
+            SlowKind::Isb => {
+                l.trap(slow.pc.wrapping_add(4), Trap::Isb);
+            }
+        }
+    }
+    let meta = BlockMeta {
+        modifies_mmu: l.modifies_mmu.get(),
+        modifies_sys: l.modifies_sys.get(),
+    };
+    Ok((l.f.into_inner(), meta))
 }
 /// Describe a GPR pair access to the machine: the first access in the usual
 /// request fields, the second as `second_*`, completed after the first.
@@ -2504,6 +3182,24 @@ fn system_offset(r: SystemRegister) -> Option<usize> {
 }
 fn lower_system(l: &Lower, a: System) {
     use SystemRegister::*;
+    if !a.read {
+        if matches!(a.register, SctlrEl1 | TcrEl1 | Ttbr0El1 | Ttbr1El1) {
+            l.modifies_mmu.set(true);
+            l.modifies_sys.set(true);
+        } else if matches!(
+            a.register,
+            CntvCtlEl0
+                | CntvCvalEl0
+                | CntvTvalEl0
+                | Daif
+                | DaifSet
+                | DaifClear
+                | IccIgrpen0El1
+                | IccPmrEl1
+        ) {
+            l.modifies_sys.set(true);
+        }
+    }
     l.flush_counter();
     let at = offset_of!(Cpu, system);
     let level = match a.register {
@@ -2513,6 +3209,7 @@ fn lower_system(l: &Lower, a: System) {
         _ => None,
     };
     if let Some(level) = level {
+        l.flush_and_clear_regs();
         let current = l.cv(l.u64, l.load(l.u8, at + offset_of!(CpuSystem, el)));
         let at_level = l.cmp(C::Eq, current, l.k(l.u64, level));
         let live = if level <= 1 {
@@ -2572,6 +3269,7 @@ fn lower_system(l: &Lower, a: System) {
             }
         }
         SpSel | SpSelSet => {
+            l.flush_and_clear_regs();
             let selected = l.load(l.u8, at + offset_of!(CpuSystem, spsel));
             if a.read {
                 l.put(a.rt, l.cv(l.u64, selected));
@@ -2622,8 +3320,10 @@ fn lower_system(l: &Lower, a: System) {
         }
         Nzcv => {
             if a.read {
+                l.flush_flags();
                 l.put(a.rt, l.cv(l.u64, l.load(l.u32, offset_of!(Cpu, flags))))
             } else {
+                l.flags_state.set(FlagsState::Clean);
                 l.store(
                     offset_of!(Cpu, flags),
                     l.imm(
@@ -2980,9 +3680,120 @@ mod tests {
         assert_eq!(cpu.trap, Trap::Load);
         let mut cpu2 = Cpu::default();
         map_page(&mut cpu2, &mut ram, true);
-        cpu2.x[0] = 0x10000 + 0x1000 * 256; // same dtlb index, different page
+        cpu2.x[0] = 0x10000 + 0x1000 * DTLB_ENTRIES as u64; // same dtlb index, different page
         run_inline(&mut cpu2, &[0xf9400001, SVC]);
         assert_eq!(cpu2.trap, Trap::Load);
+    }
+    #[test]
+    fn inline_dc_zva_zeroes_cache_line_on_hit_and_traps_on_miss() {
+        let mut ram = [0xaa; 4096];
+        let mut cpu = Cpu::default();
+        map_page(&mut cpu, &mut ram, true);
+        cpu.x[0] = 0x10090; // inside 0x10080..0x100c0 cache line
+        run_inline(&mut cpu, &[0xd50b7420, SVC]); // dc zva, x0; svc
+        assert_eq!(cpu.trap, Trap::Svc, "dc zva hit stays in block");
+        assert!(ram[0x80..0xc0].iter().all(|&b| b == 0));
+        assert_eq!(ram[0x7f], 0xaa);
+        assert_eq!(ram[0xc0], 0xaa);
+
+        let mut cpu2 = Cpu::default();
+        cpu2.x[0] = 0x10090;
+        run_inline(&mut cpu2, &[0xd50b7420, SVC]);
+        assert_eq!(cpu2.trap, Trap::DcZva);
+        assert_eq!(cpu2.address, 0x10080);
+    }
+    #[test]
+    fn inline_isb_continues_when_tlb_clean_and_traps_when_faulted() {
+        let mut cpu = Cpu::default();
+        cpu.tlb_has_faulted = 0;
+        run_inline(&mut cpu, &[0xd5033fdf, SVC]); // isb; svc
+        assert_eq!(cpu.trap, Trap::Svc);
+        assert_eq!(cpu.pc, 0x2008);
+
+        let mut cpu2 = Cpu::default();
+        cpu2.tlb_has_faulted = 1;
+        run_inline(&mut cpu2, &[0xd5033fdf, SVC]); // isb; svc
+        assert_eq!(cpu2.trap, Trap::Isb);
+        assert_eq!(cpu2.pc, 0x2004);
+    }
+    #[test]
+    fn reg_cache_flushes_before_slow_path_miss_and_survives_hits() {
+        let mut ram = [0u8; 4096];
+        ram[0..8].copy_from_slice(&42u64.to_le_bytes());
+        let mut cpu = Cpu::default();
+        map_page(&mut cpu, &mut ram, true);
+        cpu.x[0] = 0x10000;
+        // add x1, x0, #8; ldr x2, [x0]; add x3, x1, x2; ldr x4, [x1, #0x1000] (misses!)
+        run_inline(
+            &mut cpu,
+            &[
+                0x91002001, // add x1, x0, #8
+                0xf9400002, // ldr x2, [x0]
+                0x8b020023, // add x3, x1, x2
+                0xf9480024, // ldr x4, [x1, #0x1000] -> miss!
+            ],
+        );
+        assert_eq!(cpu.trap, Trap::Load);
+        assert_eq!(cpu.x[1], 0x10008);
+        assert_eq!(cpu.x[2], 42);
+        assert_eq!(cpu.x[3], 0x10008 + 42);
+        assert_eq!(cpu.address, 0x11008);
+    }
+    #[test]
+    fn lazy_and_fast_flags_match_architectural_conditions() {
+        // Test signed/unsigned/overflow/negative across subs, adds, ands, sbcs, adcs.
+        // cmp x0, x1 -> cset x2, <cond> for all 14 non-trivial conditions.
+        let mut cpu = Cpu::default();
+        let cases = [
+            (0u64, 0u64),
+            (5, 3),
+            (3, 5),
+            (i64::MAX as u64, i64::MIN as u64), // signed overflow on sub
+            (i64::MIN as u64, 1),               // signed overflow on sub
+            (u64::MAX, 1),
+        ];
+        for (a, b) in cases {
+            for (cond, expected) in [
+                (0u32, a == b),                         // eq
+                (1, a != b),                            // ne
+                (2, a >= b),                            // cs
+                (3, a < b),                             // cc
+                (4, ((a.wrapping_sub(b)) as i64) < 0),  // mi
+                (5, ((a.wrapping_sub(b)) as i64) >= 0), // pl
+                (8, a > b),                             // hi
+                (9, a <= b),                            // ls
+                (10, (a as i64) >= (b as i64)),         // ge
+                (11, (a as i64) < (b as i64)),          // lt
+                (12, (a as i64) > (b as i64)),          // gt
+                (13, (a as i64) <= (b as i64)),         // le
+            ] {
+                let mut words = Vec::new();
+                words.push(0xeb01001f); // cmp x0, x1
+                // b.<cond> +8; movz x2, #0; b +8; movz x2, #1
+                words.push(0x54000040 | cond);
+                words.push(0xd2800002); // mov x2, #0
+                words.push(0x14000002); // b +8
+                let b1 = compile(0x1000, &bytes(&words[..3])).unwrap();
+                cpu.x[0] = a;
+                cpu.x[1] = b;
+                let next = b1.run(&mut cpu);
+                assert_eq!(next == 0x100c, expected, "cmp {a:#x}, {b:#x} cond={cond}");
+            }
+            // Verify overflow (V) bit via mrs x2, nzcv after adds / subs.
+            let b2 = compile(0x1000, &bytes(&[0xeb01001f, 0xd53b4202])).unwrap();
+            cpu.x[0] = a;
+            cpu.x[1] = b;
+            b2.run(&mut cpu);
+            let (_, v_sub) = (a as i64).overflowing_sub(b as i64);
+            assert_eq!((cpu.x[2] >> 28) & 1 != 0, v_sub, "sub V for {a:#x}, {b:#x}");
+
+            let b3 = compile(0x1000, &bytes(&[0xab01001f, 0xd53b4202])).unwrap();
+            cpu.x[0] = a;
+            cpu.x[1] = b;
+            b3.run(&mut cpu);
+            let (_, v_add) = (a as i64).overflowing_add(b as i64);
+            assert_eq!((cpu.x[2] >> 28) & 1 != 0, v_add, "add V for {a:#x}, {b:#x}");
+        }
     }
     #[test]
     fn simd_compare_zero_masks_each_lane() {

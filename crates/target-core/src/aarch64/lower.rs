@@ -143,6 +143,22 @@ enum Fusion {
         rhs: Value,
         op: CmpOp,
     },
+    CompareImm {
+        lhs: Value,
+        imm: u16,
+        op: CmpOp,
+    },
+    CompareZero {
+        lhs: Value,
+        eq_zero: bool,
+    },
+    SelectCompare {
+        lhs: Value,
+        rhs: Value,
+        op: CmpOp,
+        then: Value,
+        else_: Value,
+    },
 }
 struct Model {
     classes: Vec<RegClass>,
@@ -154,46 +170,49 @@ struct Model {
     skipped: Vec<bool>,
 }
 impl Model {
-    fn new(f: &Function, caps: &ModelCaps) -> Self {
-        let classes = vec![
-            RegClass {
-                name: "gpr",
-                allocatable: (9..13).chain(19..29).collect(),
-                callee_saved: (19..29).collect(),
-                slot_bytes: 16,
-                narrow_preserved: vec![],
-            },
-            RegClass {
+    fn new(f: &Function, caps: &ModelCaps, plain: bool) -> Self {
+        let mut classes = Vec::with_capacity(if plain { 1 } else { 2 });
+        classes.push(RegClass {
+            name: "gpr",
+            allocatable: (9..13).chain(19..29).collect(),
+            callee_saved: (19..29).collect(),
+            slot_bytes: 16,
+            narrow_preserved: vec![],
+        });
+        if !plain {
+            classes.push(RegClass {
                 name: "fpr",
                 allocatable: (16..24).chain(28..32).chain(8..16).collect(),
                 callee_saved: (8..16).collect(),
                 slot_bytes: 16,
                 narrow_preserved: (8..16).collect(),
-            },
-        ];
+            });
+        }
         let mut calls = Vec::new();
-        let mut pos = 0;
-        for bi in 0..f.block_count() {
-            pos += 1;
-            for i in f.block_insts(Block(bi as u32)) {
-                if matches!(f.opcode_ref(*i), Opcode::Call(_) | Opcode::CallIndirect(_)) {
-                    calls.push(CallSite {
-                        pos,
-                        clobbered: vec![
-                            ClassRegs {
-                                class: 0,
-                                regs: (0..18).collect(),
-                            },
-                            ClassRegs {
-                                class: 1,
-                                regs: (0..32).collect(),
-                            },
-                        ],
-                    });
+        if !plain {
+            let mut pos = 0;
+            for bi in 0..f.block_count() {
+                pos += 1;
+                for i in f.block_insts(Block(bi as u32)) {
+                    if matches!(f.opcode_ref(*i), Opcode::Call(_) | Opcode::CallIndirect(_)) {
+                        calls.push(CallSite {
+                            pos,
+                            clobbered: vec![
+                                ClassRegs {
+                                    class: 0,
+                                    regs: (0..18).collect(),
+                                },
+                                ClassRegs {
+                                    class: 1,
+                                    regs: (0..32).collect(),
+                                },
+                            ],
+                        });
+                    }
+                    pos += 1;
                 }
                 pos += 1;
             }
-            pos += 1;
         }
         let mut uses = vec![0usize; f.value_count()];
         for bi in 0..f.block_count() {
@@ -222,12 +241,68 @@ impl Model {
                     && f.block_args(cf.then).len() + f.block_args(cf.else_).len() <= 2
                 {
                     skipped.push(p);
+                    if let Some(rhs_def) = f.defining_inst(c.rhs)
+                        && let Opcode::Iconst(imm) = f.opcode_ref(rhs_def)
+                    {
+                        let k = canonical_constant(f, c.lhs, *imm as u64);
+                        if matches!(c.op, CmpOp::Eq | CmpOp::Ne) && k == 0 {
+                            if uses[c.rhs.index()] == 1 {
+                                skipped.push(rhs_def);
+                            }
+                            fused.push((
+                                i,
+                                Fusion::CompareZero {
+                                    lhs: c.lhs,
+                                    eq_zero: c.op == CmpOp::Eq,
+                                },
+                            ));
+                            continue;
+                        }
+                        if k <= 4095 {
+                            if uses[c.rhs.index()] == 1 {
+                                skipped.push(rhs_def);
+                            }
+                            fused.push((
+                                i,
+                                Fusion::CompareImm {
+                                    lhs: c.lhs,
+                                    imm: k as u16,
+                                    op: c.op,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
                     fused.push((
                         i,
                         Fusion::Compare {
                             lhs: c.lhs,
                             rhs: c.rhs,
                             op: c.op,
+                        },
+                    ));
+                    continue;
+                }
+                if caps.fuse_cmp_arith
+                    && uses[v.index()] == 1
+                    && let (Opcode::Icmp(c), Opcode::Select(s)) = (f.opcode_ref(p), f.opcode_ref(i))
+                    && s.cond == v
+                    && s.then != v
+                    && s.else_ != v
+                    && class(f, c.lhs) == 0
+                    && let Some(res) = f.inst_result(i)
+                    && !vector(f, res)
+                    && !quad(f, res)
+                {
+                    skipped.push(p);
+                    fused.push((
+                        i,
+                        Fusion::SelectCompare {
+                            lhs: c.lhs,
+                            rhs: c.rhs,
+                            op: c.op,
+                            then: s.then,
+                            else_: s.else_,
                         },
                     ));
                     continue;
@@ -331,10 +406,10 @@ impl RegDescription<Function> for Model {
         &self.calls
     }
     fn scratch(&self) -> &[u16] {
-        &[17, 27]
+        &[17, 27][..self.classes.len()]
     }
     fn scratch2(&self) -> &[u16] {
-        &[16, 26]
+        &[16, 26][..self.classes.len()]
     }
     fn is_narrow(&self, f: &Function, v: Value) -> bool {
         class(f, v) == 1 && !quad(f, v) && !vector(f, v)
@@ -377,6 +452,30 @@ impl RegDescription<Function> for Model {
                     }
                 }
                 Some(n as u8)
+            }
+            Fusion::CompareImm { lhs, .. } | Fusion::CompareZero { lhs, .. } => {
+                out[0] = lhs;
+                let mut n = 1;
+                if let Opcode::If(cf) = f.opcode_ref(i) {
+                    for v in f.block_args(cf.then).iter().chain(f.block_args(cf.else_)) {
+                        out[n] = *v;
+                        n += 1;
+                    }
+                }
+                Some(n as u8)
+            }
+            Fusion::SelectCompare {
+                lhs,
+                rhs,
+                then,
+                else_,
+                ..
+            } => {
+                out[0] = lhs;
+                out[1] = rhs;
+                out[2] = then;
+                out[3] = else_;
+                Some(4)
             }
         }
     }
@@ -709,6 +808,43 @@ impl Emitter<'_> {
         });
         self.push(word);
     }
+    fn has_edge_moves(&self, target: Block) -> bool {
+        self.alloc
+            .edge_moves
+            .iter()
+            .any(|em| em.pred == self.block && em.succ == target && !em.moves.is_empty())
+    }
+    fn branch_if_cond(
+        &mut self,
+        cf: &volt_ir::function::If,
+        true_word: u32,
+        false_word: u32,
+    ) -> Result<(), Error> {
+        let next = self.block.0 + 1;
+        if self.caps.fetch_align <= 4 {
+            if cf.then.target.0 == next && !self.has_edge_moves(cf.then.target) {
+                if !self.has_edge_moves(cf.else_.target) {
+                    self.branch(cf.else_.target.0, false_word);
+                    return Ok(());
+                }
+                self.branch(cf.then.target.0, true_word);
+                return self.edge(cf.else_);
+            }
+            if cf.else_.target.0 == next && !self.has_edge_moves(cf.else_.target) {
+                if !self.has_edge_moves(cf.then.target) {
+                    self.branch(cf.then.target.0, true_word);
+                    return Ok(());
+                }
+                self.branch(cf.else_.target.0, false_word);
+                return self.edge(cf.then);
+            }
+        }
+        let other = self.local_label();
+        self.branch(other, false_word);
+        self.edge(cf.then)?;
+        self.bind(other);
+        self.edge(cf.else_)
+    }
     fn edge(&mut self, j: Jump) -> Result<(), Error> {
         if let Some(em) = self
             .alloc
@@ -720,6 +856,9 @@ impl Emitter<'_> {
             for m in moves {
                 self.move_one(m)?;
             }
+        }
+        if self.caps.fetch_align <= 4 && j.target.0 == self.block.0 + 1 {
+            return Ok(());
         }
         self.branch(j.target.0, e::b(0));
         Ok(())
@@ -911,7 +1050,36 @@ impl Emitter<'_> {
                     }) | if wide(self.f, v) { 1 << 31 } else { 0 },
                 );
             }
-            Fusion::Compare { .. } => return Err(Error::Unsupported),
+            Fusion::SelectCompare {
+                lhs,
+                rhs,
+                op,
+                then,
+                else_,
+            } => {
+                let fp = class(self.f, v) == 1;
+                let a = self.read(lhs, reg(13))?;
+                let b = self.read(rhs, reg(14))?;
+                self.push(if wide(self.f, lhs) {
+                    e::cmp64(a, b)
+                } else {
+                    e::cmp(a, b)
+                });
+                let t = self.read(then, reg(if fp { 24 } else { 13 }))?;
+                let el = self.read(else_, reg(if fp { 25 } else { 14 }))?;
+                let cond = int_cond(op, signed(self.f, lhs));
+                self.push(if fp {
+                    e::fcsel(rd, t, el, cond, fkind(self.f, v, self.caps))
+                } else {
+                    e::csel(rd, t, el, cond) | if wide(self.f, v) { 1 << 31 } else { 0 }
+                });
+                if !fp && !signed(self.f, v) && !vector(self.f, v) {
+                    return self.finish_normal(v, rd);
+                }
+            }
+            Fusion::Compare { .. } | Fusion::CompareImm { .. } | Fusion::CompareZero { .. } => {
+                return Err(Error::Unsupported);
+            }
         }
         self.finish(v, rd)
     }
@@ -1114,29 +1282,59 @@ impl Emitter<'_> {
             return Ok(false);
         }
         if let Some(fusion) = self.model.fusion(inst) {
-            if let Fusion::Compare { lhs, rhs, op } = fusion {
-                let a = self.read(lhs, reg(13))?;
-                let b = self.read(rhs, reg(14))?;
-                self.push(if wide(self.f, lhs) {
-                    e::cmp64(a, b)
-                } else {
-                    e::cmp(a, b)
-                });
-                let Opcode::If(cf) = self.f.opcode_ref(inst) else {
-                    return Err(Error::Unsupported);
-                };
-                let other = self.local_label();
-                self.branch(
-                    other,
-                    e::bcc(e::invert(int_cond(op, signed(self.f, lhs))), 0),
-                );
-                self.edge(cf.then)?;
-                self.bind(other);
-                self.edge(cf.else_)?;
-                return Ok(true);
+            match fusion {
+                Fusion::Compare { lhs, rhs, op } => {
+                    let a = self.read(lhs, reg(13))?;
+                    let b = self.read(rhs, reg(14))?;
+                    self.push(if wide(self.f, lhs) {
+                        e::cmp64(a, b)
+                    } else {
+                        e::cmp(a, b)
+                    });
+                    let Opcode::If(cf) = self.f.opcode_ref(inst) else {
+                        return Err(Error::Unsupported);
+                    };
+                    let cond = int_cond(op, signed(self.f, lhs));
+                    self.branch_if_cond(cf, e::bcc(cond, 0), e::bcc(e::invert(cond), 0))?;
+                    return Ok(true);
+                }
+                Fusion::CompareImm { lhs, imm, op } => {
+                    let a = self.read(lhs, reg(13))?;
+                    self.push(if wide(self.f, lhs) {
+                        e::subs_imm64(Reg::Zr, a, imm)
+                    } else {
+                        e::subs_imm(Reg::Zr, a, imm)
+                    });
+                    let Opcode::If(cf) = self.f.opcode_ref(inst) else {
+                        return Err(Error::Unsupported);
+                    };
+                    let cond = int_cond(op, signed(self.f, lhs));
+                    self.branch_if_cond(cf, e::bcc(cond, 0), e::bcc(e::invert(cond), 0))?;
+                    return Ok(true);
+                }
+                Fusion::CompareZero { lhs, eq_zero } => {
+                    let a = self.read(lhs, reg(13))?;
+                    let Opcode::If(cf) = self.f.opcode_ref(inst) else {
+                        return Err(Error::Unsupported);
+                    };
+                    let (cbz_w, cbnz_w) = if wide(self.f, lhs) {
+                        (e::cbz64(a, 0), e::cbnz64(a, 0))
+                    } else {
+                        (e::cbz(a, 0), e::cbnz(a, 0))
+                    };
+                    let (true_w, false_w) = if eq_zero {
+                        (cbz_w, cbnz_w)
+                    } else {
+                        (cbnz_w, cbz_w)
+                    };
+                    self.branch_if_cond(cf, true_w, false_w)?;
+                    return Ok(true);
+                }
+                _ => {
+                    self.fusion(result.ok_or(Error::Unsupported)?, fusion)?;
+                    return Ok(false);
+                }
             }
-            self.fusion(result.ok_or(Error::Unsupported)?, fusion)?;
-            return Ok(false);
         }
         match self.f.opcode_ref(inst) {
             Opcode::Iconst(n) => {
@@ -1525,11 +1723,7 @@ impl Emitter<'_> {
             Opcode::VaEnd(_) => {}
             Opcode::If(cf) => {
                 let c = self.read(cf.cond, reg(13))?;
-                let other = self.local_label();
-                self.branch(other, e::cbz(c, 0));
-                self.edge(cf.then)?;
-                self.bind(other);
-                self.edge(cf.else_)?;
+                self.branch_if_cond(cf, e::cbnz(c, 0), e::cbz(c, 0))?;
                 return Ok(true);
             }
             // GPU-only memory synchronization/atomics and unexpanded matrix ops
@@ -1736,7 +1930,7 @@ pub(super) fn compile_owned(
         f.block_insts_mut(Block(bi as u32))
             .retain(|i| !fold.is_dead_add(*i));
     }
-    let mut model = Model::new(&f, caps);
+    let mut model = Model::new(&f, caps, plain);
     // Straight-line translator output (forward edges, no block parameters,
     // integer values) skips the general scan. Every register here is free for
     // allocation in a function without calls: x0 holds the one incoming
@@ -1757,27 +1951,29 @@ pub(super) fn compile_owned(
                 // The general allocator wants the CFG normalized first.
                 volt_ir::critical_edge::split_critical_edges(&mut f);
                 volt_ir::reachable::neutralize_unreachable(&mut f);
-                model = Model::new(&f, caps);
+                model = Model::new(&f, caps, false);
             }
             wimmer::allocate(&f, &model).map_err(|_| Error::Unsupported)?
         }
     };
     let mut outgoing = 0;
     let mut leaf = true;
-    for bi in 0..f.block_count() {
-        for i in f.block_insts(Block(bi as u32)) {
-            match f.opcode_ref(*i) {
-                Opcode::Call(c) => {
-                    leaf = false;
-                    outgoing =
-                        outgoing.max(arg_locations(&f, f.value_list(c.args), c.sret, caps.abi)?.1);
+    if !plain {
+        for bi in 0..f.block_count() {
+            for i in f.block_insts(Block(bi as u32)) {
+                match f.opcode_ref(*i) {
+                    Opcode::Call(c) => {
+                        leaf = false;
+                        outgoing = outgoing
+                            .max(arg_locations(&f, f.value_list(c.args), c.sret, caps.abi)?.1);
+                    }
+                    Opcode::CallIndirect(c) => {
+                        leaf = false;
+                        outgoing = outgoing
+                            .max(arg_locations(&f, f.value_list(c.args), c.sret, caps.abi)?.1);
+                    }
+                    _ => {}
                 }
-                Opcode::CallIndirect(c) => {
-                    leaf = false;
-                    outgoing =
-                        outgoing.max(arg_locations(&f, f.value_list(c.args), c.sret, caps.abi)?.1);
-                }
-                _ => {}
             }
         }
     }
@@ -1801,14 +1997,20 @@ pub(super) fn compile_owned(
             .iter()
             .map(|n| *n as usize)
             .sum::<usize>();
-    let mut alloca = vec![None; f.value_count()];
-    for bi in 0..f.block_count() {
-        for i in f.block_insts(Block(bi as u32)) {
-            if let Opcode::Alloca(a) = f.opcode_ref(*i) {
-                let (sz, al) = layout(&f, a.elem)?;
-                cursor = align(cursor, al);
-                alloca[f.inst_result(*i).ok_or(Error::Unsupported)?.index()] = Some(cursor);
-                cursor += sz;
+    let mut alloca = if plain {
+        Vec::new()
+    } else {
+        vec![None; f.value_count()]
+    };
+    if !plain {
+        for bi in 0..f.block_count() {
+            for i in f.block_insts(Block(bi as u32)) {
+                if let Opcode::Alloca(a) = f.opcode_ref(*i) {
+                    let (sz, al) = layout(&f, a.elem)?;
+                    cursor = align(cursor, al);
+                    alloca[f.inst_result(*i).ok_or(Error::Unsupported)?.index()] = Some(cursor);
+                    cursor += sz;
+                }
             }
         }
     }
@@ -1820,7 +2022,7 @@ pub(super) fn compile_owned(
         symbol_resolver,
         model: &model,
         alloc,
-        code: Vec::new(),
+        code: Vec::with_capacity(f.inst_count() * 2 + 16),
         relocs: Vec::new(),
         lines: Vec::new(),
         labels: vec![0; f.block_count()],
@@ -1873,6 +2075,7 @@ pub(super) fn compile_owned(
         }
         em.finish(*v, rd)?;
     }
+    let has_attrs = !f.attribute_entries().is_empty();
     let mut action = 0;
     for bi in 0..f.block_count() {
         let b = Block(bi as u32);
@@ -1906,19 +2109,21 @@ pub(super) fn compile_owned(
         let mut terminated = false;
         for i in f.block_insts(b) {
             em.actions(&mut action)?;
-            let mut attrs = f.attributes_of(AttrTarget::Inst(*i));
-            while let Some(a) = attrs.next_attr() {
-                if let Attribute::Custom(c) = a
-                    && c.namespace == "debug"
-                    && c.key == "line"
-                    && let AttrValue::Int(line) = c.value
-                    && line >= 0
-                    && em.lines.last().is_none_or(|l| l.line != line as u32)
-                {
-                    em.lines.push(LineEntry {
-                        offset: (em.code.len() * 4) as u32,
-                        line: line as u32,
-                    });
+            if has_attrs {
+                let mut attrs = f.attributes_of(AttrTarget::Inst(*i));
+                while let Some(a) = attrs.next_attr() {
+                    if let Attribute::Custom(c) = a
+                        && c.namespace == "debug"
+                        && c.key == "line"
+                        && let AttrValue::Int(line) = c.value
+                        && line >= 0
+                        && em.lines.last().is_none_or(|l| l.line != line as u32)
+                    {
+                        em.lines.push(LineEntry {
+                            offset: (em.code.len() * 4) as u32,
+                            line: line as u32,
+                        });
+                    }
                 }
             }
             terminated |= em.instruction(*i)?;

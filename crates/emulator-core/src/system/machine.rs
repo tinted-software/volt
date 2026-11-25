@@ -159,6 +159,12 @@ impl<M: GuestMemory> crate::aarch64::cache::Fetch for SystemFetch<'_, M> {
     fn page_version(&self, page: u64) -> Option<u32> {
         self.memory.code_tracker()?.version(page)
     }
+    fn write_epoch(&self) -> Option<u64> {
+        Some(self.memory.code_tracker()?.write_epoch())
+    }
+    fn write_epoch_relaxed(&self) -> Option<u64> {
+        Some(self.memory.code_tracker()?.write_epoch_relaxed())
+    }
 }
 
 pub struct Machine<M, E: ExecMemory> {
@@ -264,7 +270,11 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
     }
     pub fn run_with_devices(&mut self, devices: &mut impl DeviceIo) -> Result<Exit, Error> {
         self.stalled = None;
+        let mut total_blocks = 0usize;
         for _ in 0..64 {
+            if total_blocks >= 4096 {
+                break;
+            }
             if self.timer_edge() {
                 return Ok(Exit::Timer);
             }
@@ -289,49 +299,63 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
                 );
             }
             self.sync_dtlb();
-            self.trace[self.blocks_run as usize % self.trace.len()] = TraceEntry {
-                pc: self.cpu.pc,
-                sp: self.cpu.sp,
-            };
+            let timer_armed = self.cpu.system.cntv_ctl_el0 & 3 == 1;
+            let watch_timer = timer_armed
+                && (!self.timer_fired
+                    || (self.vtimer_fiq.is_some()
+                        && self.cpu.system.daif & 1 == 0
+                        && !self.fiq_asserted()));
             let mut source = SystemFetch {
                 tlb: &mut self.tlb,
                 memory: &mut self.memory,
                 fault: None,
             };
-            let result = self.cache.run_block_with(&mut self.cpu, &mut source);
+            let result = self.cache.run_burst(
+                &mut self.cpu,
+                &mut source,
+                &mut self.trace,
+                &mut self.blocks_run,
+                watch_timer,
+                (4096 - total_blocks).min(512),
+            );
             let fetch_fault = source.fault;
-            if let Err(error) = result {
-                if let (Some((address, permission)), crate::aarch64::compile::Error::Memory(_)) =
-                    (fetch_fault, &error)
-                {
-                    // Cache executes a valid lookahead prefix first. An error here means
-                    // the failing instruction itself is now the architectural PC.
-                    self.cpu.pc = address;
-                    self.abort(address, permission, true, false);
-                    continue;
+            let ran = match result {
+                Ok(ran) => ran,
+                Err(error) => {
+                    if let (
+                        Some((address, permission)),
+                        crate::aarch64::compile::Error::Memory(_),
+                    ) = (fetch_fault, &error)
+                    {
+                        // Cache executes a valid lookahead prefix first. An error here means
+                        // the failing instruction itself is now the architectural PC.
+                        self.cpu.pc = address;
+                        self.abort(address, permission, true, false);
+                        continue;
+                    }
+                    if let crate::aarch64::compile::Error::Decode { word, pc } = &error
+                        && crate::aarch64::decode::is_undefined(*word)
+                    {
+                        // An Undefined Instruction exception (EC 0, 32-bit instruction).
+                        self.cpu.pc = *pc;
+                        exception::take(
+                            &mut self.cpu,
+                            exception::Reason {
+                                ec: 0,
+                                instruction: true,
+                                status: 0,
+                                ..Default::default()
+                            },
+                            0,
+                        );
+                        continue;
+                    }
+                    self.stalled_at = self.cpu.pc;
+                    self.stalled = Some(format!("{error:?}"));
+                    return Err(Error::Compile(error));
                 }
-                if let crate::aarch64::compile::Error::Decode { word, pc } = &error
-                    && crate::aarch64::decode::is_undefined(*word)
-                {
-                    // An Undefined Instruction exception (EC 0, 32-bit instruction).
-                    self.cpu.pc = *pc;
-                    exception::take(
-                        &mut self.cpu,
-                        exception::Reason {
-                            ec: 0,
-                            instruction: true,
-                            status: 0,
-                            ..Default::default()
-                        },
-                        0,
-                    );
-                    continue;
-                }
-                self.stalled_at = self.cpu.pc;
-                self.stalled = Some(format!("{error:?}"));
-                return Err(Error::Compile(error));
-            }
-            self.blocks_run += 1;
+            };
+            total_blocks += ran;
             match self.cpu.trap {
                 Trap::None => {}
                 Trap::Wfi => {
@@ -357,14 +381,14 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
                 Trap::DcZva => {
                     self.cpu.trap = Trap::None;
                     let virtual_address = self.cpu.address & !63;
-                    let physical = match translate::translate(
+                    let (physical, page_shift) = match translate::translate_with_shift(
                         &mut self.tlb,
                         &self.cpu,
                         &mut self.memory,
                         virtual_address,
                         translate::Access::Write,
                     ) {
-                        Ok(physical) => physical,
+                        Ok(res) => res,
                         Err(error) => {
                             self.abort(
                                 virtual_address,
@@ -378,6 +402,9 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
                     self.memory
                         .write(physical, &[0; 64])
                         .map_err(Error::Memory)?;
+                    if self.cache.inline_memory() {
+                        self.fill_dtlb(virtual_address, physical, true, page_shift);
+                    }
                 }
                 Trap::Eret => {
                     self.cpu.trap = Trap::None;
@@ -416,10 +443,12 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
                 }
                 Trap::Isb => {
                     self.tlb.purge_faults();
+                    self.cpu.tlb_has_faulted = 0;
                     self.cpu.trap = Trap::None;
                 }
                 Trap::Tlbi => {
                     self.tlb.flush();
+                    self.cpu.tlb_has_faulted = 0;
                     self.cpu.trap = Trap::None;
                 }
                 Trap::Host => {
@@ -573,6 +602,7 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
         // Context changes (TTBR/TCR/SCTLR writes, exception entry and return)
         // are noticed lazily by `translate`; do it eagerly instead.
         self.tlb.update_context(&self.cpu);
+        self.cpu.tlb_has_faulted = u8::from(self.tlb.has_faulted());
         if self.tlb.generation != self.dtlb_generation {
             self.dtlb_generation = self.tlb.generation;
             self.cpu.dtlb.flush();
@@ -588,31 +618,44 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
         }
     }
     /// Remember a completed RAM access in the inline data TLB so later accesses
-    /// to the same page skip the machine entirely.
-    fn fill_dtlb(&mut self, address: u64, physical: u64, write: bool) {
-        let page = address & !0xfff;
-        let physical_page = physical & !0xfff;
-        let Some(host) = self.memory.host_page(physical_page) else {
-            return;
-        };
-        let addend = (host as u64).wrapping_sub(page);
-        let writable = write
-            && self
-                .memory
-                .code_tracker()
-                .and_then(|tracker| tracker.version(physical_page >> 12))
-                .is_none_or(|version| version & 1 == 0);
-        let entry = &mut self.cpu.dtlb.entries[crate::aarch64::cpu::Dtlb::index(address)];
-        if entry.addend != addend || (entry.read != page && entry.write != page) {
-            *entry = Default::default();
-        }
-        entry.addend = addend;
-        if write {
-            if writable {
-                entry.write = page;
-            }
+    /// to the same page (or enclosing 16 KiB block/page) skip the machine entirely.
+    fn fill_dtlb(&mut self, address: u64, physical: u64, write: bool, page_shift: u8) {
+        let subpages = if page_shift >= 14 { 4u64 } else { 1u64 };
+        let base_va = if page_shift >= 14 {
+            address & !0x3fff
         } else {
-            entry.read = page;
+            address & !0xfff
+        };
+        let base_pa = if page_shift >= 14 {
+            physical & !0x3fff
+        } else {
+            physical & !0xfff
+        };
+        for i in 0..subpages {
+            let page = base_va + i * 0x1000;
+            let physical_page = base_pa + i * 0x1000;
+            let Some(host) = self.memory.host_page(physical_page) else {
+                continue;
+            };
+            let addend = (host as u64).wrapping_sub(page);
+            let writable = write
+                && self
+                    .memory
+                    .code_tracker()
+                    .and_then(|tracker| tracker.version(physical_page >> 12))
+                    .is_none_or(|version| version & 1 == 0);
+            let entry = &mut self.cpu.dtlb.entries[crate::aarch64::cpu::Dtlb::index(page)];
+            if entry.addend != addend || (entry.read != page && entry.write != page) {
+                *entry = Default::default();
+            }
+            entry.addend = addend;
+            if write {
+                if writable {
+                    entry.write = page;
+                }
+            } else {
+                entry.read = page;
+            }
         }
     }
     fn abort(&mut self, address: u64, permission: bool, instruction: bool, write: bool) {
@@ -900,20 +943,24 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
         } else {
             translate::Access::Write
         };
-        let physical =
-            match translate::translate(&mut self.tlb, &self.cpu, &mut self.memory, address, access)
-            {
-                Ok(physical) => physical,
-                Err(error) => {
-                    self.abort(
-                        address,
-                        matches!(error, translate::TranslateError::PermissionFault),
-                        false,
-                        !load,
-                    );
-                    return Ok(());
-                }
-            };
+        let (physical, page_shift) = match translate::translate_with_shift(
+            &mut self.tlb,
+            &self.cpu,
+            &mut self.memory,
+            address,
+            access,
+        ) {
+            Ok(res) => res,
+            Err(error) => {
+                self.abort(
+                    address,
+                    matches!(error, translate::TranslateError::PermissionFault),
+                    false,
+                    !load,
+                );
+                return Ok(());
+            }
+        };
         let mut bytes = [0u8; 16];
         if !load {
             if self.cpu.vector_dest {
@@ -1053,7 +1100,7 @@ impl<M: GuestMemory, E: ExecMemory> Machine<M, E> {
             Err(error) => return Err(Error::Memory(error)),
         }
         if first == width as usize && !self.device_access && self.cache.inline_memory() {
-            self.fill_dtlb(address, physical, !load);
+            self.fill_dtlb(address, physical, !load, page_shift);
         }
         if load {
             if self.cpu.vector_dest {

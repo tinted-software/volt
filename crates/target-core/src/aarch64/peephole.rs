@@ -146,6 +146,21 @@ pub fn pair_memory(
     lines: &mut [LineEntry],
 ) {
     let len = words.len();
+    if len < 2 {
+        return;
+    }
+    let mut has_pair = false;
+    for i in 0..len - 1 {
+        if let (Some(a), Some(b)) = (decode_mem(words[i]), decode_mem(words[i + 1]))
+            && try_fuse(a, b).is_some()
+        {
+            has_pair = true;
+            break;
+        }
+    }
+    if !has_pair {
+        return;
+    }
     let mut is_block_start = vec![false; len];
     for &bs in block_starts.iter() {
         debug_assert!(bs <= len);

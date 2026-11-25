@@ -42,7 +42,7 @@ pub enum Trap {
 }
 
 /// Number of data-TLB entries. The JIT indexes with `(va >> 12) & (DTLB_ENTRIES - 1)`.
-pub const DTLB_ENTRIES: usize = 256;
+pub const DTLB_ENTRIES: usize = 1024;
 /// Tag that never matches a lookup: real tags are page aligned, and a lookup
 /// value is `va & (!0xfff | (size - 1))`, which is never `u64::MAX`.
 pub const DTLB_INVALID: u64 = u64::MAX;
@@ -112,6 +112,9 @@ pub struct Cpu {
     pub dest: u8,
     pub load_signed: SignExtend,
     pub vector_dest: bool,
+    /// Non-zero when `Tlb` has cached translation faults (`tlb.has_faulted()`),
+    /// allowing inline `ISB` fast path to skip trapping to the machine.
+    pub tlb_has_faulted: u8,
     /// LSE atomic in flight (`Trap::Atomic`): the operation, with `address`,
     /// `width` and `dest` as for a load. `atomic_operands` is `[Rs]` for the memory
     /// ops, `[Rs, Rt]` for CAS and `[Rs, Rs+1, Rt, Rt+1]` for CASP.

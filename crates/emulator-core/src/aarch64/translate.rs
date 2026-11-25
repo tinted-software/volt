@@ -25,6 +25,7 @@ pub struct Entry {
     pub physical: u64,
     pub generation: u64,
     pub ap: u8,
+    pub page_shift: u8,
     pub executable: bool,
     pub faulted: bool,
 }
@@ -47,9 +48,10 @@ impl Context {
         }
     }
 }
+const TLB_ENTRIES: usize = 2048;
 #[derive(Clone, Debug)]
 pub struct Tlb {
-    pub entries: [Entry; 256],
+    pub entries: [Entry; TLB_ENTRIES],
     pub generation: u64,
     context: Option<Context>,
     /// Some entry caches a translation fault.
@@ -58,7 +60,7 @@ pub struct Tlb {
 impl Default for Tlb {
     fn default() -> Self {
         Self {
-            entries: [Entry::default(); 256],
+            entries: [Entry::default(); TLB_ENTRIES],
             generation: 1,
             context: None,
             has_faulted: false,
@@ -69,11 +71,14 @@ impl Tlb {
     pub fn new() -> Self {
         Self::default()
     }
+    pub fn has_faulted(&self) -> bool {
+        self.has_faulted
+    }
     pub fn flush(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.has_faulted = false;
         if self.generation <= 1 {
-            self.entries = [Entry::default(); 256];
+            self.entries = [Entry::default(); TLB_ENTRIES];
         }
     }
     /// Drop cached translation faults, keeping every valid translation (and so
@@ -93,7 +98,7 @@ impl Tlb {
         }
     }
     fn slot(virtual_address: u64) -> usize {
-        ((virtual_address >> 12) & 255) as usize
+        ((virtual_address >> 12) & (TLB_ENTRIES as u64 - 1)) as usize
     }
     /// Flush if the translation context (regime, tables, EL) changed. Called
     /// eagerly each dispatch because inline data-TLB hits never reach `translate`.
@@ -137,8 +142,18 @@ pub fn translate<M: GuestMemory + ?Sized>(
     virtual_address: u64,
     access: Access,
 ) -> Result<u64, TranslateError> {
+    translate_with_shift(tlb, cpu, memory, virtual_address, access).map(|(pa, _)| pa)
+}
+
+pub fn translate_with_shift<M: GuestMemory + ?Sized>(
+    tlb: &mut Tlb,
+    cpu: &Cpu,
+    memory: &mut M,
+    virtual_address: u64,
+    access: Access,
+) -> Result<(u64, u8), TranslateError> {
     if !enabled(cpu)? {
-        return Ok(virtual_address);
+        return Ok((virtual_address, 12));
     }
     let tcr = cpu.system.tcr_el1;
     let t1sz = ((tcr >> 16) & 63) as u32;
@@ -187,7 +202,10 @@ pub fn translate<M: GuestMemory + ?Sized>(
         // descriptor may have been upgraded since it was cached, which
         // hardware also resolves by retrying the walk.
         if permitted(entry.ap, entry.executable, access, cpu.system.el).is_ok() {
-            return Ok(entry.physical | (virtual_address & PAGE_MASK));
+            return Ok((
+                entry.physical | (virtual_address & PAGE_MASK),
+                entry.page_shift,
+            ));
         }
     }
     let found = match walk(cpu, memory, effective_va, access, upper) {
@@ -212,7 +230,7 @@ pub fn translate<M: GuestMemory + ?Sized>(
         generation: tlb.generation,
         ..found
     };
-    Ok(found.physical)
+    Ok((found.physical, found.page_shift))
 }
 fn walk<M: GuestMemory + ?Sized>(
     cpu: &Cpu,
@@ -310,6 +328,7 @@ fn walk<M: GuestMemory + ?Sized>(
         let found = Entry {
             physical: (descriptor & address_mask & !mask) | (virtual_address & mask),
             ap,
+            page_shift: shift.max(12) as u8,
             executable,
             ..Entry::default()
         };
@@ -753,7 +772,7 @@ mod tests {
         // 48-bit VA with 16K granule uses 4 levels: top_bits=1 (level 0), stride=11 (levels 1..3).
         // Test bit 47=1 (index 1 at root) and non-zero lower indices.
         let lower_va = (1u64 << 47) | (3u64 << 36) | (2u64 << 25) | (5u64 << 14) | 0x1234;
-        memory.put(0x0000 + 1 * 8, 0x4000 | 3);
+        memory.put(8, 0x4000 | 3);
         memory.put(0x4000 + 3 * 8, 0x8000 | 3);
         memory.put(0x8000 + 2 * 8, 0xc000 | 3);
         memory.put(0xc000 + 5 * 8, 0x8000_0000 | 3);
@@ -764,8 +783,8 @@ mod tests {
 
         let upper_va = 0xffff_0000_0000_0000 | (2u64 << 25) | (4u64 << 14) | 0x3abc;
         cpu.system.ttbr1_el1 = 0x10000;
-        memory.put(0x10000 + 0 * 8, 0x14000 | 3);
-        memory.put(0x14000 + 0 * 8, 0x18000 | 3);
+        memory.put(0x10000, 0x14000 | 3);
+        memory.put(0x14000, 0x18000 | 3);
         memory.put(0x18000 + 2 * 8, 0x1c000 | 3);
         memory.put(0x1c000 + 4 * 8, 0x9000_0000 | 3);
         assert_eq!(

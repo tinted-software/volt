@@ -61,6 +61,9 @@ pub struct CodeTracker {
     /// at dispatch to drop cached write permission for pages that just became
     /// code.
     watch_epoch: AtomicU64,
+    /// Bumped whenever a watched code page is written. Lets the dispatch fast
+    /// path skip per-page `ranges` lookups when no watched page has changed.
+    write_epoch: AtomicU64,
 }
 
 struct PageRange {
@@ -87,6 +90,7 @@ impl CodeTracker {
         Self {
             ranges,
             watch_epoch: AtomicU64::new(0),
+            write_epoch: AtomicU64::new(0),
         }
     }
 
@@ -118,6 +122,17 @@ impl CodeTracker {
         self.watch_epoch.load(Ordering::Acquire)
     }
 
+    /// Changes whenever any watched code page is written.
+    pub fn write_epoch(&self) -> u64 {
+        self.write_epoch.load(Ordering::Acquire)
+    }
+
+    /// Relaxed read of `write_epoch` for the hot dispatch burst loop.
+    #[inline(always)]
+    pub fn write_epoch_relaxed(&self) -> u64 {
+        self.write_epoch.load(Ordering::Relaxed)
+    }
+
     /// The page's current version, or `None` if it is not tracked RAM.
     pub fn version(&self, page: u64) -> Option<u32> {
         Some(self.word(page)?.load(Ordering::Acquire))
@@ -130,12 +145,17 @@ impl CodeTracker {
         }
         let first = address >> PAGE_SHIFT;
         let last = address.saturating_add(len as u64 - 1) >> PAGE_SHIFT;
+        let mut any_watched = false;
         for page in first..=last {
             if let Some(word) = self.word(page)
                 && word.load(Ordering::Relaxed) & 1 != 0
             {
                 word.fetch_add(2, Ordering::Release);
+                any_watched = true;
             }
+        }
+        if any_watched {
+            self.write_epoch.fetch_add(1, Ordering::Release);
         }
     }
 }

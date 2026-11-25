@@ -169,6 +169,8 @@ impl Ahead {
         }
         // The same cut rules as `Cache::run_block_with`, so the bytes match.
         let mut count = 0usize;
+        let mut decoded = [Instruction::Nop; MAX_INSNS];
+        let mut decoded_len = 0usize;
         let mut last = None;
         let mut complete = false;
         for n in 0..MAX_INSNS {
@@ -179,6 +181,8 @@ impl Ahead {
             let Ok(instruction) = decode(word) else {
                 return;
             };
+            decoded[decoded_len] = instruction;
+            decoded_len += 1;
             last = Some((instruction, job.pc + count as u64));
             count += 4;
             if instruction.terminates_with(shared.inline_memory())
@@ -200,8 +204,10 @@ impl Ahead {
         // Speculative code may be data or an encoding the translator does not
         // expect. A panic there must not take the worker down with it.
         let bytes = &page[..count];
-        let _ =
-            std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| shared.get(job.pc, bytes)));
+        let decoded = &decoded[..decoded_len];
+        let _ = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            shared.get_decoded(job.pc, bytes, decoded)
+        }));
     }
 }
 
@@ -228,7 +234,8 @@ pub fn default_threads() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use core::time::Duration;
+    use std::time::Instant;
 
     struct Ram(Vec<u8>);
     impl CodeReader for Ram {

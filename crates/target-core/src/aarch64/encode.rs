@@ -303,6 +303,14 @@ pub fn cbz(rt: Reg, off: i32) -> u32 {
     0x34000000 | (imm19 << 5) | n(rt)
 }
 
+pub fn cbz64(rt: Reg, off: i32) -> u32 {
+    SF64 | cbz(rt, off)
+}
+
+pub fn cbnz64(rt: Reg, off: i32) -> u32 {
+    SF64 | cbnz(rt, off)
+}
+
 pub fn bcc(cond: Cond, off: i32) -> u32 {
     let imm19: u32 = ((off >> 2) as u32) & 0x7FFFF;
     0x54000000 | (imm19 << 5) | (cond as u32)

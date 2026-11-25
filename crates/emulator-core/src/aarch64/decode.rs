@@ -866,6 +866,8 @@ impl Instruction {
                     | Instruction::Literal(_)
                     | Instruction::SimdMemory(_)
                     | Instruction::SimdPair(_)
+                    | Instruction::DcZva(_)
+                    | Instruction::Isb
             )
         {
             return false;
