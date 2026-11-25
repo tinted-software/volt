@@ -140,20 +140,34 @@ pub fn translate<M: GuestMemory + ?Sized>(
     if !enabled(cpu)? {
         return Ok(virtual_address);
     }
-    let t1sz = ((cpu.system.tcr_el1 >> 16) & 63) as u32;
+    let tcr = cpu.system.tcr_el1;
+    let t1sz = ((tcr >> 16) & 63) as u32;
     if t1sz == 0 {
         return Err(TranslateError::MalformedTables);
     }
-    if ((virtual_address >> 55) & 1 != 0 && virtual_address >> 48 != 0xffff)
-        || ((virtual_address >> 55) & 1 == 0 && virtual_address >> 48 != 0)
-    {
+    let bit55 = (virtual_address >> 55) & 1 != 0;
+    let tbi = if bit55 {
+        (tcr >> 38) & 1 != 0 && (access != Access::Execute || (tcr >> 52) & 1 == 0)
+    } else {
+        (tcr >> 37) & 1 != 0 && (access != Access::Execute || (tcr >> 51) & 1 == 0)
+    };
+    let effective_va = if tbi {
+        if bit55 {
+            virtual_address | 0xff00_0000_0000_0000
+        } else {
+            virtual_address & 0x00ff_ffff_ffff_ffff
+        }
+    } else {
+        virtual_address
+    };
+    if (bit55 && effective_va >> 48 != 0xffff) || (!bit55 && effective_va >> 48 != 0) {
         return Err(TranslateError::TranslationFault);
     }
-    let lower_bits = 64 - (cpu.system.tcr_el1 & 63) as u32;
+    let lower_bits = 64 - (tcr & 63) as u32;
     let upper_bits = 64 - t1sz;
-    let upper = if virtual_address >> lower_bits == 0 {
+    let upper = if effective_va >> lower_bits == 0 {
         false
-    } else if virtual_address >> upper_bits == u64::MAX >> upper_bits {
+    } else if effective_va >> upper_bits == u64::MAX >> upper_bits {
         true
     } else {
         return Err(TranslateError::TranslationFault);
@@ -176,7 +190,7 @@ pub fn translate<M: GuestMemory + ?Sized>(
             return Ok(entry.physical | (virtual_address & PAGE_MASK));
         }
     }
-    let found = match walk(cpu, memory, virtual_address, access, upper) {
+    let found = match walk(cpu, memory, effective_va, access, upper) {
         Ok(found) => found,
         Err(fault) => {
             // Only access-independent failures may be cached as unmapped.
@@ -274,9 +288,9 @@ fn walk<M: GuestMemory + ?Sized>(
             table = descriptor & address_mask;
             continue;
         }
-        // Level 0 blocks and 64KB level 1 blocks are architecturally reserved.
+        // Level 0 blocks, 16KB level 1 blocks, and 64KB level 1 blocks are architecturally reserved.
         let architectural_level = 3 - level;
-        let block_allowed = architectural_level >= if granule == 16 { 2 } else { 1 };
+        let block_allowed = architectural_level >= if granule >= 14 { 2 } else { 1 };
         if !((kind == 3 && level == 0) || (kind == 1 && level != 0 && block_allowed)) {
             return Err(TranslateError::TranslationFault);
         }
@@ -727,6 +741,85 @@ mod tests {
         assert_eq!(
             translate(&mut tlb, &cpu, &mut memory, 0, Access::Read),
             Err(TranslateError::PermissionFault)
+        );
+    }
+    #[test]
+    fn sixteen_kilobyte_four_level_walk_for_lower_and_upper_addresses() {
+        let mut cpu = cpu();
+        // T0SZ=16, T1SZ=16, TG0=2 (16K), TG1=1 (16K)
+        cpu.system.tcr_el1 = 16 | (16 << 16) | (2 << 14) | (1 << 30) | (4 << 32);
+        let mut memory = Memory::new();
+        let mut tlb = Tlb::new();
+        // 48-bit VA with 16K granule uses 4 levels: top_bits=1 (level 0), stride=11 (levels 1..3).
+        // Test bit 47=1 (index 1 at root) and non-zero lower indices.
+        let lower_va = (1u64 << 47) | (3u64 << 36) | (2u64 << 25) | (5u64 << 14) | 0x1234;
+        memory.put(0x0000 + 1 * 8, 0x4000 | 3);
+        memory.put(0x4000 + 3 * 8, 0x8000 | 3);
+        memory.put(0x8000 + 2 * 8, 0xc000 | 3);
+        memory.put(0xc000 + 5 * 8, 0x8000_0000 | 3);
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, lower_va, Access::Read),
+            Ok(0x8000_1234)
+        );
+
+        let upper_va = 0xffff_0000_0000_0000 | (2u64 << 25) | (4u64 << 14) | 0x3abc;
+        cpu.system.ttbr1_el1 = 0x10000;
+        memory.put(0x10000 + 0 * 8, 0x14000 | 3);
+        memory.put(0x14000 + 0 * 8, 0x18000 | 3);
+        memory.put(0x18000 + 2 * 8, 0x1c000 | 3);
+        memory.put(0x1c000 + 4 * 8, 0x9000_0000 | 3);
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, upper_va, Access::Read),
+            Ok(0x9000_3abc)
+        );
+    }
+    #[test]
+    fn tbi_ignores_top_byte_for_data_and_honors_tbid_for_execute() {
+        let mut cpu = cpu();
+        let mut memory = Memory::new();
+        let mut tlb = Tlb::new();
+        memory.chain(0, 0x1000, 12, 4, 0, 0x8000_0003);
+        memory.chain(0x5000, 0xffff_8000_0000_1000, 12, 4, 0, 0x4000_0003);
+        cpu.system.ttbr1_el1 = 0x5000;
+
+        let tagged_low = 0xab00_0000_0000_1234;
+        let tagged_high = 0xabff_8000_0000_1234;
+
+        // Without TBI, non-canonical tags fault.
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, tagged_low, Access::Read),
+            Err(TranslateError::TranslationFault)
+        );
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, tagged_high, Access::Read),
+            Err(TranslateError::TranslationFault)
+        );
+
+        // Enable TBI0 (bit 37) and TBI1 (bit 38).
+        cpu.system.tcr_el1 |= (1 << 37) | (1 << 38);
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, tagged_low, Access::Read),
+            Ok(0x8000_0234)
+        );
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, tagged_high, Access::Read),
+            Ok(0x4000_0234)
+        );
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, tagged_low, Access::Execute),
+            Ok(0x8000_0234)
+        );
+
+        // TBID0 (bit 51) disables TBI0 for instruction fetch.
+        cpu.system.tcr_el1 |= 1 << 51;
+        tlb.flush();
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, tagged_low, Access::Execute),
+            Err(TranslateError::TranslationFault)
+        );
+        assert_eq!(
+            translate(&mut tlb, &cpu, &mut memory, tagged_low, Access::Read),
+            Ok(0x8000_0234)
         );
     }
 }

@@ -28,7 +28,7 @@ pub fn value(register: SystemRegister) -> Option<u64> {
         CntfrqEl0 => counter_hz,
         IdAa64pfr0El1 => (0xf << 20) | (0xf << 16) | (1 << 4) | 1,
         IdAa64dfr0El1 => 6,
-        IdAa64mmfr0El1 => (0xf << 24) | 2,
+        IdAa64mmfr0El1 => (0xf << 24) | (1 << 20) | 2,
         IdAa64isar0El1 => 2 << 20,
         IdAa64isar1El1 => 1 << 20,
         ClidrEl1 => CLIDR,
@@ -54,7 +54,7 @@ mod tests {
         let mmfr0 = value(IdAa64mmfr0El1).unwrap();
         assert_eq!(mmfr0 & 15, 2);
         assert_eq!((mmfr0 >> 24) & 15, 15);
-        assert_eq!((mmfr0 >> 20) & 15, 0);
+        assert_eq!((mmfr0 >> 20) & 15, 1);
         // FEAT_LSE (Atomics = 2) and FEAT_LRCPC (LDAPR) are implemented.
         assert_eq!(value(IdAa64isar0El1), Some(2 << 20));
         assert_eq!(value(IdAa64isar1El1), Some(1 << 20));
